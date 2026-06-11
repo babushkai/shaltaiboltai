@@ -418,9 +418,24 @@ impl App {
         match event {
             ChatEvent::TextDelta(text) => {
                 self.streaming_text.push_str(&text);
-                if let Some(Entry::Assistant(buf)) = self.transcript.last_mut() {
-                    buf.push_str(&text);
+                // Append to the current assistant block, or start a new one if
+                // a sub-agent's tool activity interrupted it.
+                match self.transcript.last_mut() {
+                    Some(Entry::Assistant(buf)) => buf.push_str(&text),
+                    _ => self.transcript.push(Entry::Assistant(text)),
                 }
+            }
+            ChatEvent::ToolActivity { summary, is_error } => {
+                // Sub-agent tools have already run inside the CLI; this is
+                // display-only and never enters our approval flow.
+                if matches!(self.transcript.last(), Some(Entry::Assistant(t)) if t.is_empty()) {
+                    self.transcript.pop();
+                }
+                self.transcript.push(Entry::Tool {
+                    summary,
+                    result: String::new(),
+                    is_error,
+                });
             }
             ChatEvent::Completed {
                 tool_calls,
@@ -842,11 +857,17 @@ impl App {
         self.streaming_text.clear();
         self.transcript.push(Entry::Assistant(String::new()));
 
+        // Sub-agent providers run their own tool loop, so we don't send ours.
+        let tools = if model.provider.is_sub_agent() {
+            Vec::new()
+        } else {
+            tools::definitions()
+        };
         let request = ChatRequest {
             model,
             system: system_prompt(),
             messages: self.history.clone(),
-            tools: tools::definitions(),
+            tools,
         };
         let gen = self.gen;
         let config = self.config.clone();
@@ -1216,7 +1237,7 @@ impl App {
                 match event {
                     ChatEvent::TextDelta(t) => text.push_str(&t),
                     ChatEvent::Error(e) => error = Some(e),
-                    ChatEvent::Completed { .. } => {}
+                    ChatEvent::Completed { .. } | ChatEvent::ToolActivity { .. } => {}
                 }
             }
             let result = match error {

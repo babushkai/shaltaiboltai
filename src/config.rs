@@ -18,6 +18,10 @@ pub struct Config {
     pub ollama_num_ctx: usize,
     /// Initial theme name; a theme picked at runtime (/theme) takes precedence.
     pub theme: Option<String>,
+    /// When the Claude Code subscription provider runs as a sub-agent, allow it
+    /// to run shell commands and other permissioned tools unsupervised. Off by
+    /// default: it may read and edit files but shell commands are auto-denied.
+    pub claude_code_bypass_permissions: bool,
 }
 
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 80_000;
@@ -33,6 +37,7 @@ struct FileConfig {
     compact_threshold_chars: Option<usize>,
     ollama_num_ctx: Option<usize>,
     theme: Option<String>,
+    claude_code_bypass_permissions: Option<bool>,
 }
 
 impl Config {
@@ -59,6 +64,7 @@ impl Config {
                 .unwrap_or(DEFAULT_COMPACT_THRESHOLD_CHARS),
             ollama_num_ctx: file.ollama_num_ctx.unwrap_or(DEFAULT_OLLAMA_NUM_CTX),
             theme: file.theme,
+            claude_code_bypass_permissions: file.claude_code_bypass_permissions.unwrap_or(false),
         }
     }
 
