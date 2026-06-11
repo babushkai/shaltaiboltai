@@ -1,6 +1,8 @@
 use crate::config::Config;
+use crate::images;
 use crate::providers::{
-    self, ChatEvent, ChatRequest, Message, ModelEntry, ProviderKind, ToolCall, Usage,
+    self, ChatEvent, ChatRequest, ImageData, Message, ModelEntry, ProviderKind, ToolCall, Usage,
+    UserContent,
 };
 use crate::session;
 use crate::theme::{self, Theme};
@@ -182,6 +184,9 @@ pub struct App {
     pub cwd_display: String,
     pub git_branch: Option<String>,
 
+    /// Images staged for the next message: (display name, encoded data).
+    pub pending_images: Vec<(String, ImageData)>,
+
     /// Diff preview for the tool call currently awaiting approval.
     pub approval_preview: Option<Vec<(char, String)>>,
 
@@ -235,6 +240,7 @@ impl App {
             slash_dismissed: false,
             cwd_display: String::new(),
             git_branch: None,
+            pending_images: Vec::new(),
             approval_preview: None,
             render_cache: Vec::new(),
             render_cache_width: 0,
@@ -590,8 +596,30 @@ impl App {
             ));
             return;
         }
+        // Attach staged images plus any image paths referenced in the text
+        // (typed or drag-and-dropped onto the terminal).
+        let mut images = std::mem::take(&mut self.pending_images);
+        for path in images::extract_image_paths(&text) {
+            match images::load_image(&path) {
+                Ok(attachment) => images.push(attachment),
+                Err(e) => self.transcript.push(Entry::Error(format!("{e:#}"))),
+            }
+        }
         self.transcript.push(Entry::User(text.clone()));
-        self.history.push(Message::User(text));
+        if !images.is_empty() {
+            let names: Vec<&str> = images.iter().map(|(n, _)| n.as_str()).collect();
+            self.transcript
+                .push(Entry::Info(format!("attached: {}", names.join(", "))));
+        }
+        let content = if images.is_empty() {
+            UserContent::Text(text)
+        } else {
+            UserContent::Rich {
+                text,
+                images: images.into_iter().map(|(_, data)| data).collect(),
+            }
+        };
+        self.history.push(Message::User(content));
         self.scroll_from_bottom = 0;
         self.agent_turns = 0;
         self.start_request();
@@ -601,6 +629,31 @@ impl App {
         if self.mode == Mode::Input {
             self.textarea
                 .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+        }
+    }
+
+    // ---- image attachments ----
+
+    /// Ctrl+V: stage an image from the system clipboard for the next message.
+    pub fn attach_clipboard_image(&mut self) {
+        match images::clipboard_image() {
+            Ok(image) => {
+                let name = format!("clipboard-{}.png", self.pending_images.len() + 1);
+                self.pending_images.push((name, image));
+                self.transcript.push(Entry::Info(format!(
+                    "image staged from clipboard ({} attached) — Esc clears",
+                    self.pending_images.len()
+                )));
+            }
+            Err(e) => self.transcript.push(Entry::Info(format!("{e:#}"))),
+        }
+    }
+
+    pub fn clear_attachments(&mut self) {
+        if !self.pending_images.is_empty() {
+            self.pending_images.clear();
+            self.transcript
+                .push(Entry::Info("attachments cleared".into()));
         }
     }
 
@@ -953,8 +1006,9 @@ impl App {
             .history
             .iter()
             .find_map(|m| match m {
-                Message::User(t) => Some(
-                    t.lines()
+                Message::User(c) => Some(
+                    c.text()
+                        .lines()
                         .next()
                         .unwrap_or("")
                         .chars()
@@ -1059,7 +1113,7 @@ impl App {
         self.history
             .iter()
             .map(|m| match m {
-                Message::User(t) => t.len(),
+                Message::User(c) => c.text().len() + c.images().len() * 4_000,
                 Message::Assistant { text, tool_calls } => {
                     text.len()
                         + tool_calls
@@ -1125,12 +1179,12 @@ impl App {
         let request = ChatRequest {
             model,
             system: "You compress coding-assistant conversations into handoff summaries.".into(),
-            messages: vec![Message::User(format!(
+            messages: vec![Message::User(UserContent::Text(format!(
                 "Summarize the conversation below so a successor agent can continue seamlessly. \
                  Capture: the user's goals, decisions made, files created or modified and their \
                  current state, commands run with relevant outcomes, and unresolved tasks. \
                  Output only the summary.\n\n<conversation>\n{flat}\n</conversation>"
-            ))],
+            )))],
             tools: Vec::new(),
         };
         let session_id = self.session_id.clone();
@@ -1161,10 +1215,10 @@ impl App {
         match result {
             Ok(summary) => {
                 let before = self.history_chars();
-                self.history = vec![Message::User(format!(
+                self.history = vec![Message::User(UserContent::Text(format!(
                     "Context summary of our conversation so far (earlier messages were compacted):\n\n{}",
                     summary.trim()
-                ))];
+                )))];
                 self.last_usage = None;
                 self.transcript.push(Entry::Info(format!(
                     "context compacted: ~{}k → ~{}k chars",
@@ -1203,7 +1257,13 @@ fn flatten_history(history: &[Message]) -> String {
     let mut flat = String::new();
     for msg in history {
         match msg {
-            Message::User(t) => flat.push_str(&format!("[user]\n{}\n\n", cap(t))),
+            Message::User(c) => {
+                flat.push_str(&format!("[user]\n{}\n", cap(c.text())));
+                for _ in c.images() {
+                    flat.push_str("[image attached]\n");
+                }
+                flat.push('\n');
+            }
             Message::Assistant { text, tool_calls } => {
                 flat.push_str(&format!("[assistant]\n{}\n", cap(text)));
                 for call in tool_calls {

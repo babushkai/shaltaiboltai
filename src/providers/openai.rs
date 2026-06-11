@@ -144,7 +144,23 @@ fn to_wire_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     let mut wire = vec![json!({"role": "system", "content": system})];
     for msg in messages {
         match msg {
-            Message::User(text) => wire.push(json!({"role": "user", "content": text})),
+            // Plain text stays a bare string for maximum compatibility with
+            // OpenAI-compatible servers; images switch to the content-parts form.
+            Message::User(content) if content.images().is_empty() => {
+                wire.push(json!({"role": "user", "content": content.text()}))
+            }
+            Message::User(content) => {
+                let mut parts = vec![json!({"type": "text", "text": content.text()})];
+                for image in content.images() {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", image.media_type, image.data),
+                        },
+                    }));
+                }
+                wire.push(json!({"role": "user", "content": parts}));
+            }
             Message::Assistant { text, tool_calls } => {
                 let mut m = json!({"role": "assistant", "content": text});
                 if !tool_calls.is_empty() {
@@ -176,4 +192,36 @@ fn to_wire_messages(system: &str, messages: &[Message]) -> Vec<Value> {
         }
     }
     wire
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{ImageData, UserContent};
+
+    #[test]
+    fn user_images_use_data_url_content_parts() {
+        let wire = to_wire_messages(
+            "sys",
+            &[Message::User(UserContent::Rich {
+                text: "what is this?".into(),
+                images: vec![ImageData {
+                    media_type: "image/png".into(),
+                    data: "QUFBQQ==".into(),
+                }],
+            })],
+        );
+        let parts = wire[1]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,QUFBQQ=="
+        );
+    }
+
+    #[test]
+    fn plain_text_users_stay_a_bare_string() {
+        let wire = to_wire_messages("sys", &[Message::User("hi".into())]);
+        assert_eq!(wire[1]["content"], "hi");
+    }
 }

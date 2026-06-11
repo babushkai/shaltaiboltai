@@ -40,11 +40,58 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// A base64-encoded image attached to a user message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// User message content. Untagged so plain-text messages (de)serialize as a
+/// bare string — sessions saved before image support still load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UserContent {
+    Text(String),
+    Rich {
+        text: String,
+        images: Vec<ImageData>,
+    },
+}
+
+impl UserContent {
+    pub fn text(&self) -> &str {
+        match self {
+            UserContent::Text(t) => t,
+            UserContent::Rich { text, .. } => text,
+        }
+    }
+
+    pub fn images(&self) -> &[ImageData] {
+        match self {
+            UserContent::Text(_) => &[],
+            UserContent::Rich { images, .. } => images,
+        }
+    }
+}
+
+impl From<String> for UserContent {
+    fn from(text: String) -> Self {
+        UserContent::Text(text)
+    }
+}
+
+impl From<&str> for UserContent {
+    fn from(text: &str) -> Self {
+        UserContent::Text(text.to_owned())
+    }
+}
+
 /// Provider-agnostic conversation history. Each provider module converts this
 /// into its own wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
-    User(String),
+    User(UserContent),
     Assistant {
         text: String,
         tool_calls: Vec<ToolCall>,

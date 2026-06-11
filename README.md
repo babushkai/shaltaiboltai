@@ -25,6 +25,7 @@ Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down
 | Key | Action |
 |---|---|
 | `Enter` | send message |
+| `Ctrl+V` | attach an image from the clipboard (macOS) — or just drag/type an image path into the message |
 | `Alt+Enter` | insert newline (multi-line input; pasting multi-line text also works) |
 | `Up` / `Down` | recall previous prompts (when the input is empty), shell-style |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
@@ -35,6 +36,8 @@ Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down
 | `/new` or `/clear` | start a new session (the old one stays saved) |
 | `/compact` | summarize the conversation to shrink context |
 | `Ctrl+C` or `/quit` | exit |
+
+Messages can include images for vision models: press `Ctrl+V` to stage the clipboard image (screenshots, copied images), or reference a `.png`/`.jpg`/`.gif`/`.webp` path in your message (drag-and-drop onto the terminal works — escaped and quoted paths are handled). Staged attachments show in the input border; `Esc` clears them. Images go out as Anthropic image blocks, OpenAI data-URLs, or Ollama's native `images` field, capped at 5MB each.
 
 Assistant responses render markdown (heading hierarchy, bold/italic, accent-bulleted lists, styled blockquotes, and fenced code as full-width surface cards).
 

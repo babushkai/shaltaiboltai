@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod images;
 pub mod markdown;
 pub mod providers;
 pub mod session;

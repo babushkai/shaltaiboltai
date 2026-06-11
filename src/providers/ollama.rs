@@ -129,7 +129,18 @@ fn to_wire_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     let mut wire = vec![json!({"role": "system", "content": system})];
     for msg in messages {
         match msg {
-            Message::User(text) => wire.push(json!({"role": "user", "content": text})),
+            Message::User(content) => {
+                let mut m = json!({"role": "user", "content": content.text()});
+                if !content.images().is_empty() {
+                    // Ollama takes raw base64 strings in a sibling field.
+                    m["images"] = content
+                        .images()
+                        .iter()
+                        .map(|i| Value::String(i.data.clone()))
+                        .collect();
+                }
+                wire.push(m);
+            }
             Message::Assistant { text, tool_calls } => {
                 let mut m = json!({"role": "assistant", "content": text});
                 if !tool_calls.is_empty() {
@@ -150,4 +161,33 @@ fn to_wire_messages(system: &str, messages: &[Message]) -> Vec<Value> {
         }
     }
     wire
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{ImageData, UserContent};
+
+    #[test]
+    fn user_images_fill_the_native_images_field() {
+        let wire = to_wire_messages(
+            "sys",
+            &[Message::User(UserContent::Rich {
+                text: "what is this?".into(),
+                images: vec![ImageData {
+                    media_type: "image/png".into(),
+                    data: "QUFBQQ==".into(),
+                }],
+            })],
+        );
+        assert_eq!(wire[1]["content"], "what is this?");
+        assert_eq!(wire[1]["images"][0], "QUFBQQ==");
+    }
+
+    #[test]
+    fn plain_text_users_have_no_images_field() {
+        let wire = to_wire_messages("sys", &[Message::User("hi".into())]);
+        assert_eq!(wire[1]["content"], "hi");
+        assert!(wire[1].get("images").is_none());
+    }
 }

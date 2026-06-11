@@ -77,11 +77,16 @@ fn legacy_sessions_without_cwd_still_load() {
     let path = dir.join("legacy-1.json");
     std::fs::write(
         &path,
-        r#"{"id":"legacy-1","title":"old session","updated_at":1,"model":null,"history":[],"transcript":[]}"#,
+        r#"{"id":"legacy-1","title":"old session","updated_at":1,"model":null,"history":[{"User":"plain old text"}],"transcript":[]}"#,
     )
     .unwrap();
 
     let loaded = session::load(&path).expect("legacy file should deserialize");
     assert_eq!(loaded.cwd, None);
+    // Pre-image user messages were bare strings; they must still round-trip.
+    assert!(matches!(
+        &loaded.history[0],
+        Message::User(c) if c.text() == "plain old text" && c.images().is_empty()
+    ));
     assert!(session::list().iter().any(|m| m.title == "old session"));
 }

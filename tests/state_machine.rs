@@ -213,3 +213,31 @@ async fn session_picker_orders_current_project_first() {
     let other_pos = titles.iter().position(|t| *t == "other project").unwrap();
     assert!(here_pos < other_pos, "{titles:?}");
 }
+
+#[tokio::test]
+async fn image_paths_in_the_message_become_attachments() {
+    use shaltaiboltai::providers::UserContent;
+    let (mut app, _rx) = test_app();
+    let img = std::env::temp_dir().join(format!("shaltai-sm-img-{}.png", std::process::id()));
+    std::fs::write(&img, b"fake").unwrap();
+
+    // No model configured: the request won't start, but the history entry is
+    // still built — which is what we're asserting on.
+    app.model = Some(shaltaiboltai::providers::ModelEntry {
+        provider: shaltaiboltai::providers::ProviderKind::Ollama,
+        id: "test".into(),
+    });
+    app.textarea
+        .insert_str(format!("describe {}", img.display()));
+    app.submit_input();
+
+    let Some(Message::User(content)) = app.history.iter().find(|m| matches!(m, Message::User(_)))
+    else {
+        panic!("user message missing");
+    };
+    assert!(matches!(content, UserContent::Rich { .. }));
+    assert_eq!(content.images().len(), 1);
+    assert_eq!(content.images()[0].media_type, "image/png");
+    assert!(content.text().contains("describe"));
+    std::fs::remove_file(img).ok();
+}

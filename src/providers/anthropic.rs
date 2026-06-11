@@ -150,10 +150,24 @@ fn to_wire_messages(messages: &[Message]) -> Vec<Value> {
     let mut wire = Vec::new();
     for msg in messages {
         match msg {
-            Message::User(text) => wire.push(json!({
-                "role": "user",
-                "content": [{"type": "text", "text": text}],
-            })),
+            Message::User(content) => {
+                let mut blocks = Vec::new();
+                // Anthropic recommends images before the text that refers to them.
+                for image in content.images() {
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        },
+                    }));
+                }
+                if !content.text().is_empty() || blocks.is_empty() {
+                    blocks.push(json!({"type": "text", "text": content.text()}));
+                }
+                wire.push(json!({"role": "user", "content": blocks}));
+            }
             Message::Assistant { text, tool_calls } => {
                 let mut content = Vec::new();
                 if !text.is_empty() {
@@ -201,4 +215,36 @@ fn to_wire_messages(messages: &[Message]) -> Vec<Value> {
         block["cache_control"] = json!({"type": "ephemeral"});
     }
     wire
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{ImageData, UserContent};
+
+    #[test]
+    fn user_images_become_image_blocks_before_text() {
+        let messages = vec![Message::User(UserContent::Rich {
+            text: "what is this?".into(),
+            images: vec![ImageData {
+                media_type: "image/png".into(),
+                data: "QUFBQQ==".into(),
+            }],
+        })];
+        let wire = to_wire_messages(&messages);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], "QUFBQQ==");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "what is this?");
+    }
+
+    #[test]
+    fn plain_text_users_serialize_as_single_text_block() {
+        let wire = to_wire_messages(&[Message::User("hi".into())]);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], "hi");
+    }
 }

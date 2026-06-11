@@ -87,9 +87,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_input_key(app: &mut App, key: KeyEvent) {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-        app.open_picker();
-        return;
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('p') => {
+                app.open_picker();
+                return;
+            }
+            KeyCode::Char('v') => {
+                app.attach_clipboard_image();
+                return;
+            }
+            _ => {}
+        }
     }
     let menu = app.slash_menu_active();
     match key.code {
@@ -102,6 +111,7 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up if menu => app.slash_move(-1),
         KeyCode::Down if menu => app.slash_move(1),
         KeyCode::Esc if menu => app.dismiss_slash_menu(),
+        KeyCode::Esc => app.clear_attachments(),
         KeyCode::Enter => app.submit_input(),
         // Shell-style prompt recall when the input is empty (or while already
         // navigating history); otherwise Up/Down move the cursor in the editor.

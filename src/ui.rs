@@ -59,6 +59,20 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(border));
+    if !app.pending_images.is_empty() {
+        block = block.title(Line::styled(
+            format!(
+                " ⊞ {} image{} attached — Esc clears ",
+                app.pending_images.len(),
+                if app.pending_images.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+            Style::new().fg(theme.accent2),
+        ));
+    }
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
     }
