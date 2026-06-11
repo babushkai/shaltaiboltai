@@ -15,6 +15,7 @@ fn offline_config() -> Config {
         compact_threshold_chars: 80_000,
         ollama_num_ctx: 16_384,
         theme: None,
+        claude_code_bypass_permissions: false,
     }
 }
 

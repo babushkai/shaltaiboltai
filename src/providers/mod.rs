@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod cli_agent;
 pub mod ollama;
 pub mod openai;
 mod sse;
@@ -13,6 +14,9 @@ pub enum ProviderKind {
     Anthropic,
     OpenAi,
     Ollama,
+    /// Claude Code CLI driven as a sub-agent — billed to the user's Claude
+    /// subscription, not an API key.
+    ClaudeCode,
 }
 
 impl ProviderKind {
@@ -21,7 +25,14 @@ impl ProviderKind {
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::OpenAi => "openai",
             ProviderKind::Ollama => "ollama",
+            ProviderKind::ClaudeCode => "claude-code",
         }
+    }
+
+    /// Sub-agent providers run their own tool loop, so our tool definitions and
+    /// approval flow don't apply to them.
+    pub fn is_sub_agent(&self) -> bool {
+        matches!(self, ProviderKind::ClaudeCode)
     }
 }
 
@@ -126,6 +137,13 @@ pub struct Usage {
 #[derive(Debug)]
 pub enum ChatEvent {
     TextDelta(String),
+    /// A tool the model ran itself (sub-agent providers like Claude Code drive
+    /// their own tool loop). Display-only — it is not executed by us and does
+    /// not enter the approval flow.
+    ToolActivity {
+        summary: String,
+        is_error: bool,
+    },
     Completed {
         tool_calls: Vec<ToolCall>,
         stop_reason: Option<String>,
@@ -146,6 +164,7 @@ pub async fn stream_chat(config: Config, req: ChatRequest, tx: UnboundedSender<C
         ProviderKind::Anthropic => anthropic::stream_chat(&config, &req, &tx).await,
         ProviderKind::OpenAi => openai::stream_chat(&config, &req, &tx).await,
         ProviderKind::Ollama => ollama::stream_chat(&config, &req, &tx).await,
+        ProviderKind::ClaudeCode => cli_agent::stream_chat_claude(&config, &req, &tx).await,
     };
     if let Err(e) = result {
         let _ = tx.send(ChatEvent::Error(format!("{e:#}")));
@@ -191,6 +210,14 @@ pub async fn discover_models(config: Config) -> Vec<ModelEntry> {
             provider: ProviderKind::Ollama,
             id,
         }));
+    }
+    // Subscription-backed sub-agents, available when their CLI is installed
+    // and logged in.
+    if cli_agent::claude_available().await {
+        models.push(ModelEntry {
+            provider: ProviderKind::ClaudeCode,
+            id: "claude-code".into(),
+        });
     }
 
     models
