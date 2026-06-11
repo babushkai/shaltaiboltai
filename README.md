@@ -20,6 +20,8 @@ No keys needed for Ollama — if it's running, its models just show up. Models w
 
 ## Keys & commands
 
+Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). The statusline shows the model, agent state, working directory, git branch, and live context usage with a fill percentage.
+
 | Key | Action |
 |---|---|
 | `Enter` | send message |

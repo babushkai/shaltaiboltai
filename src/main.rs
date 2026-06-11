@@ -86,10 +86,17 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
         app.open_picker();
         return;
     }
+    let menu = app.slash_menu_active();
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
             app.textarea.insert_newline();
         }
+        // The `/` completion menu captures navigation while open.
+        KeyCode::Enter if menu => app.run_selected_slash(),
+        KeyCode::Tab if menu => app.complete_selected_slash(),
+        KeyCode::Up if menu => app.slash_move(-1),
+        KeyCode::Down if menu => app.slash_move(1),
+        KeyCode::Esc if menu => app.dismiss_slash_menu(),
         KeyCode::Enter => app.submit_input(),
         // Shell-style prompt recall when the input is empty (or while already
         // navigating history); otherwise Up/Down move the cursor in the editor.
@@ -102,6 +109,12 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageUp | KeyCode::PageDown => handle_scroll_key(app, key),
         _ => {
             app.textarea.input(key);
+            if matches!(
+                key.code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+            ) {
+                app.note_input_changed();
+            }
         }
     }
 }

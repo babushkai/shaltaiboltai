@@ -24,6 +24,66 @@ const COMPACT_FLATTEN_CAP: usize = 4_000;
 /// Cap on project instruction files injected into the system prompt.
 const PROJECT_CONTEXT_CAP: usize = 8_000;
 
+/// The slash-command registry: drives the `/` completion menu, `/help`, and
+/// dispatch, so the three can never drift apart.
+pub struct SlashCommand {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    pub description: &'static str,
+}
+
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "model",
+        aliases: &["models"],
+        description: "switch model — also Ctrl+P",
+    },
+    SlashCommand {
+        name: "theme",
+        aliases: &["themes"],
+        description: "choose a color theme (live preview)",
+    },
+    SlashCommand {
+        name: "resume",
+        aliases: &["sessions"],
+        description: "resume a saved session",
+    },
+    SlashCommand {
+        name: "new",
+        aliases: &["clear"],
+        description: "start a new session (current one stays saved)",
+    },
+    SlashCommand {
+        name: "compact",
+        aliases: &[],
+        description: "summarize the conversation to shrink context",
+    },
+    SlashCommand {
+        name: "help",
+        aliases: &[],
+        description: "show commands and keys",
+    },
+    SlashCommand {
+        name: "quit",
+        aliases: &["exit"],
+        description: "exit shaltaiboltai",
+    },
+];
+
+/// Prefix-match commands (name first, then aliases) for the `/` menu.
+pub fn match_commands(filter: &str) -> Vec<&'static SlashCommand> {
+    let mut by_name: Vec<_> = SLASH_COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(filter))
+        .collect();
+    let by_alias = SLASH_COMMANDS
+        .iter()
+        .filter(|c| !c.name.starts_with(filter))
+        .filter(|c| c.aliases.iter().any(|a| a.starts_with(filter)));
+    by_name.extend(by_alias);
+    by_name
+}
+
 /// Events delivered to the UI loop from background tasks. `gen` ties an event
 /// to the request generation that spawned it; events from a cancelled
 /// generation are dropped instead of resurrecting the agent loop.
@@ -106,6 +166,12 @@ pub struct App {
     input_history: Vec<String>,
     input_history_pos: Option<usize>,
     input_draft: String,
+    pub slash_index: usize,
+    slash_dismissed: bool,
+
+    // Statusline environment, refreshed at startup and after each turn/tool.
+    pub cwd_display: String,
+    pub git_branch: Option<String>,
 
     /// Diff preview for the tool call currently awaiting approval.
     pub approval_preview: Option<Vec<(char, String)>>,
@@ -156,6 +222,10 @@ impl App {
             input_history: session::load_input_history(),
             input_history_pos: None,
             input_draft: String::new(),
+            slash_index: 0,
+            slash_dismissed: false,
+            cwd_display: String::new(),
+            git_branch: None,
             approval_preview: None,
             render_cache: Vec::new(),
             render_cache_width: 0,
@@ -176,12 +246,93 @@ impl App {
                 env!("CARGO_PKG_VERSION"),
             ),
         });
+        app.refresh_environment();
         app.spawn_discovery();
         app
     }
 
     pub fn is_busy(&self) -> bool {
         matches!(self.mode, Mode::Streaming | Mode::RunningTool) || self.compacting
+    }
+
+    /// Cwd and git branch for the statusline. Cheap (one small file read), but
+    /// only refreshed when something could have changed it, not per frame.
+    fn refresh_environment(&mut self) {
+        self.cwd_display = std::env::current_dir()
+            .map(|p| shorten_path(&p))
+            .unwrap_or_default();
+        self.git_branch = std::fs::read_to_string(".git/HEAD")
+            .ok()
+            .and_then(|head| parse_git_head(&head));
+    }
+
+    // ---- slash-command menu ----
+
+    /// The active `/` menu filter: input is a single line starting with `/`
+    /// and no arguments yet. `None` means the menu is closed.
+    pub fn slash_filter(&self) -> Option<String> {
+        if self.mode != Mode::Input || self.slash_dismissed {
+            return None;
+        }
+        let lines = self.textarea.lines();
+        if lines.len() != 1 {
+            return None;
+        }
+        let rest = lines[0].strip_prefix('/')?;
+        if rest.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.to_lowercase())
+    }
+
+    pub fn slash_matches(&self) -> Vec<&'static SlashCommand> {
+        self.slash_filter()
+            .map(|f| match_commands(&f))
+            .unwrap_or_default()
+    }
+
+    pub fn slash_menu_active(&self) -> bool {
+        !self.slash_matches().is_empty()
+    }
+
+    pub fn slash_move(&mut self, delta: i64) {
+        let len = self.slash_matches().len() as i64;
+        if len > 0 {
+            self.slash_index = (self.slash_index as i64 + delta).rem_euclid(len) as usize;
+        }
+    }
+
+    fn selected_slash(&self) -> Option<&'static SlashCommand> {
+        let matches = self.slash_matches();
+        matches
+            .get(self.slash_index.min(matches.len().saturating_sub(1)))
+            .copied()
+    }
+
+    pub fn complete_selected_slash(&mut self) {
+        if let Some(cmd) = self.selected_slash() {
+            self.set_input(&format!("/{}", cmd.name));
+            self.slash_index = 0;
+        }
+    }
+
+    pub fn run_selected_slash(&mut self) {
+        if let Some(cmd) = self.selected_slash() {
+            self.set_input(&format!("/{}", cmd.name));
+        }
+        self.slash_index = 0;
+        self.submit_input();
+    }
+
+    pub fn dismiss_slash_menu(&mut self) {
+        self.slash_dismissed = true;
+    }
+
+    /// Called when the input text changes: reopen a dismissed menu and reset
+    /// the selection, mirroring how Claude Code's completion behaves.
+    pub fn note_input_changed(&mut self) {
+        self.slash_dismissed = false;
+        self.slash_index = 0;
     }
 
     fn spawn_discovery(&self) {
@@ -314,6 +465,7 @@ impl App {
     fn end_turn(&mut self) {
         self.agent_turns = 0;
         self.mode = Mode::Input;
+        self.refresh_environment();
         self.save_session();
         if self.context_over_threshold() && !self.compacting {
             self.transcript.push(Entry::Info(
@@ -361,6 +513,8 @@ impl App {
 
     fn finish_tool(&mut self, call: ToolCall, content: String, is_error: bool) {
         self.tool_task = None;
+        // A command may have switched branches or moved files.
+        self.refresh_environment();
         self.transcript.push(Entry::Tool {
             summary: tools::describe(&call),
             result: content.clone(),
@@ -499,17 +653,25 @@ impl App {
             "resume" | "sessions" => self.open_sessions(),
             "compact" => {
                 if self.history.is_empty() {
-                    self.transcript.push(Entry::Info("nothing to compact".into()));
+                    self.transcript
+                        .push(Entry::Info("nothing to compact".into()));
                 } else {
-                    self.transcript.push(Entry::Info("compacting context…".into()));
+                    self.transcript
+                        .push(Entry::Info("compacting context…".into()));
                     self.start_compaction();
                 }
             }
             "quit" | "exit" => self.should_quit = true,
-            "help" => self.transcript.push(Entry::Info(
-                "commands: /model /theme /resume /new /compact /quit — keys: Ctrl+P models, Alt+Enter newline, Up/Down input history, PgUp/PgDn scroll, Esc cancel, Ctrl+C quit"
-                    .into(),
-            )),
+            "help" => {
+                let commands = SLASH_COMMANDS
+                    .iter()
+                    .map(|c| format!("/{} — {}", c.name, c.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.transcript.push(Entry::Info(format!(
+                    "{commands}\nkeys: Ctrl+P models · Alt+Enter newline · Up/Down input history · PgUp/PgDn scroll · Esc cancel · Ctrl+C quit"
+                )));
+            }
             other => self
                 .transcript
                 .push(Entry::Error(format!("unknown command: /{other}"))),
@@ -822,6 +984,20 @@ impl App {
         self.history_chars() / 4
     }
 
+    /// How full the context is relative to the compaction threshold, for the
+    /// statusline. Uses provider-reported tokens when available.
+    pub fn context_percent(&self) -> Option<u8> {
+        let threshold = self.effective_compact_threshold().max(1);
+        let used = match self.last_usage {
+            Some(u) => (u.input_tokens as usize) * 4,
+            None => self.history_chars(),
+        };
+        if used == 0 {
+            return None;
+        }
+        Some(((used * 100 / threshold).min(100)) as u8)
+    }
+
     /// Ollama models are bounded by the configured num_ctx, which is usually
     /// far smaller than the cloud-model threshold — compact well before it.
     fn effective_compact_threshold(&self) -> usize {
@@ -955,6 +1131,29 @@ fn flatten_history(history: &[Message]) -> String {
     flat
 }
 
+/// `~`-abbreviate the home directory and keep at most the last three
+/// components so the statusline stays short.
+fn shorten_path(path: &std::path::Path) -> String {
+    let display = match dirs::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(|p| (h, p))) {
+        Some((_, rel)) if rel.as_os_str().is_empty() => "~".to_owned(),
+        Some((_, rel)) => format!("~/{}", rel.display()),
+        None => path.display().to_string(),
+    };
+    let parts: Vec<&str> = display.split('/').collect();
+    if parts.len() > 4 {
+        format!("…/{}", parts[parts.len() - 3..].join("/"))
+    } else {
+        display
+    }
+}
+
+/// Branch name from `.git/HEAD` content; `None` for a detached head.
+fn parse_git_head(head: &str) -> Option<String> {
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_owned)
+}
+
 fn provider_count(models: &[ModelEntry]) -> usize {
     let mut kinds: Vec<_> = models.iter().map(|m| m.provider.label()).collect();
     kinds.sort();
@@ -985,4 +1184,49 @@ fn system_prompt() -> String {
         }
     }
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_matching_prefers_names_then_aliases() {
+        let names: Vec<_> = match_commands("").iter().map(|c| c.name).collect();
+        assert_eq!(names.len(), SLASH_COMMANDS.len());
+
+        let m: Vec<_> = match_commands("mo").iter().map(|c| c.name).collect();
+        assert_eq!(m, vec!["model"]);
+
+        // "clear" only matches as an alias of /new.
+        let m: Vec<_> = match_commands("cl").iter().map(|c| c.name).collect();
+        assert_eq!(m, vec!["new"]);
+
+        assert!(match_commands("zzz").is_empty());
+    }
+
+    #[test]
+    fn git_head_parsing() {
+        assert_eq!(
+            parse_git_head("ref: refs/heads/main\n"),
+            Some("main".into())
+        );
+        assert_eq!(
+            parse_git_head("ref: refs/heads/feat/x"),
+            Some("feat/x".into())
+        );
+        assert_eq!(parse_git_head("3f2c1a9deadbeef\n"), None);
+    }
+
+    #[test]
+    fn paths_are_shortened_for_the_statusline() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(shorten_path(&home), "~");
+            let deep = home.join("a/b/c/d/e");
+            let s = shorten_path(&deep);
+            assert!(s.starts_with("…/"), "{s}");
+            assert!(s.ends_with("c/d/e"), "{s}");
+        }
+        assert_eq!(shorten_path(std::path::Path::new("/tmp/x")), "/tmp/x");
+    }
 }

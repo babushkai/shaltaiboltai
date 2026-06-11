@@ -36,6 +36,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_transcript(frame, app, transcript_area);
     draw_status(frame, app, status_area);
     draw_input(frame, app, input_area);
+    if app.mode == Mode::Input && app.slash_menu_active() {
+        draw_slash_menu(frame, app, input_area);
+    }
 
     match app.mode {
         Mode::ModelPicker => draw_model_picker(frame, app),
@@ -341,18 +344,121 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     spans.push(Span::styled(state, Style::new().fg(theme.dim)));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
+    // Right side: cwd · branch · context usage, Claude Code style.
+    let mut right: Vec<Span> = Vec::new();
+    let sep = || Span::styled(" · ", Style::new().fg(theme.border));
+    if !app.cwd_display.is_empty() {
+        right.push(Span::styled(
+            app.cwd_display.clone(),
+            Style::new().fg(theme.dim),
+        ));
+    }
+    if let Some(branch) = &app.git_branch {
+        if !right.is_empty() {
+            right.push(sep());
+        }
+        right.push(Span::styled(
+            format!("⌥ {branch}"),
+            Style::new().fg(theme.accent2),
+        ));
+    }
     let context = match app.last_usage {
-        Some(u) => format!("ctx {} · out {} ", u.input_tokens, u.output_tokens),
-        None if app.approx_tokens() > 0 => format!("ctx ~{} ", app.approx_tokens()),
-        None => String::new(),
+        Some(u) => Some(format!(
+            "ctx {} · out {}",
+            fmt_count(u.input_tokens as usize),
+            fmt_count(u.output_tokens as usize)
+        )),
+        None if app.approx_tokens() > 0 => Some(format!("ctx ~{}", fmt_count(app.approx_tokens()))),
+        None => None,
     };
-    if !context.is_empty() {
+    if let Some(ctx) = context {
+        if !right.is_empty() {
+            right.push(sep());
+        }
+        right.push(Span::styled(ctx, Style::new().fg(theme.dim)));
+        if let Some(pct) = app.context_percent() {
+            let color = match pct {
+                0..=69 => theme.dim,
+                70..=89 => theme.warning,
+                _ => theme.error,
+            };
+            right.push(Span::styled(format!(" {pct}%"), Style::new().fg(color)));
+        }
+    }
+    if !right.is_empty() {
+        right.push(Span::raw(" "));
         frame.render_widget(
-            Paragraph::new(Line::styled(context, Style::new().fg(theme.dim)))
-                .alignment(Alignment::Right),
+            Paragraph::new(Line::from(right)).alignment(Alignment::Right),
             area,
         );
     }
+}
+
+fn fmt_count(n: usize) -> String {
+    if n >= 10_000 {
+        format!("{}k", n / 1000)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Claude Code-style completion popup anchored above the input: appears as
+/// soon as the input is `/…`, filters as you type.
+fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
+    let theme = app.theme;
+    let matches = app.slash_matches();
+    let selected = app.slash_index.min(matches.len().saturating_sub(1));
+
+    let name_width = matches.iter().map(|c| c.name.len()).max().unwrap_or(0) + 2;
+    let height = (matches.len() as u16).min(8) + 2;
+    let width = matches
+        .iter()
+        .map(|c| 4 + name_width + c.description.len())
+        .max()
+        .unwrap_or(20)
+        .min(frame.area().width.saturating_sub(4) as usize) as u16;
+    let area = Rect {
+        x: input_area.x + 1,
+        y: input_area.y.saturating_sub(height),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = matches
+        .iter()
+        .map(|c| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("/{:<width$}", c.name, width = name_width - 1),
+                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(c.description, Style::new().fg(theme.dim)),
+            ]))
+        })
+        .collect();
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.border));
+    if let Some(surface) = theme.surface {
+        block = block.style(Style::new().bg(surface).fg(theme.fg));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::new()
+                .bg(theme.accent)
+                .fg(theme.bg.unwrap_or(Color::Black)),
+        )
+        .highlight_symbol("❯ ");
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_model_picker(frame: &mut Frame, app: &App) {

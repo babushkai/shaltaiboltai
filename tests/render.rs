@@ -71,6 +71,59 @@ async fn theme_switch_restyles_the_frame() {
 }
 
 #[tokio::test]
+async fn slash_input_opens_the_command_menu() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    app.textarea.insert_str("/th");
+    assert!(app.slash_menu_active());
+
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let screen: String = (0..24)
+        .map(|y| {
+            (0..80)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("/theme"), "{screen}");
+    assert!(screen.contains("color theme"), "{screen}");
+
+    // Tab completes the highlighted command into the input.
+    app.complete_selected_slash();
+    assert_eq!(app.textarea.lines().join(""), "/theme");
+}
+
+#[tokio::test]
+async fn statusline_shows_cwd_and_branch() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    // The test process runs inside the repo, so both should be present.
+    assert!(!app.cwd_display.is_empty());
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    // Layout bottom-up: input is 3 rows (1 line + borders), status is the
+    // single row above it: 24 - 3 - 1 = 20.
+    let status_row: String = (0..120)
+        .map(|x| buffer[(x, 20)].symbol().to_owned())
+        .collect();
+    assert!(
+        status_row.contains(app.cwd_display.as_str()),
+        "{status_row}"
+    );
+    if let Some(branch) = &app.git_branch {
+        assert!(status_row.contains(branch.as_str()), "{status_row}");
+    }
+}
+
+#[tokio::test]
 async fn terminal_theme_keeps_default_background() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
