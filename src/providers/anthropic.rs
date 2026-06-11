@@ -17,7 +17,7 @@ pub async fn stream_chat(
         .as_deref()
         .context("ANTHROPIC_API_KEY is not set")?;
 
-    let body = json!({
+    let mut body = json!({
         "model": req.model.id,
         "max_tokens": 8192,
         "stream": true,
@@ -29,6 +29,9 @@ pub async fn stream_chat(
             "input_schema": t.schema,
         })).collect::<Vec<_>>(),
     });
+    if req.tools.is_empty() {
+        body.as_object_mut().unwrap().remove("tools");
+    }
 
     let response = reqwest::Client::new()
         .post(API_URL)

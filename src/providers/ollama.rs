@@ -22,6 +22,9 @@ pub async fn stream_chat(
             },
         })).collect::<Vec<_>>(),
     });
+    if req.tools.is_empty() {
+        body.as_object_mut().unwrap().remove("tools");
+    }
 
     let post = |body: Value| {
         reqwest::Client::new()

@@ -23,12 +23,21 @@ No keys needed for Ollama — if it's running, its models just show up. Models w
 | Key | Action |
 |---|---|
 | `Enter` | send message |
+| `Alt+Enter` | insert newline (multi-line input; pasting multi-line text also works) |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
 | `Esc` | cancel an in-flight response |
 | `y` / `a` / `n` | approve / approve-all / deny a tool call |
 | `PgUp` / `PgDn` | scroll transcript |
-| `/clear` | reset conversation |
+| `/resume` | pick a saved session to continue |
+| `/new` or `/clear` | start a new session (the old one stays saved) |
+| `/compact` | summarize the conversation to shrink context |
 | `Ctrl+C` or `/quit` | exit |
+
+Assistant responses render markdown (headings, bold/italic, lists, blockquotes, fenced code).
+
+## Sessions & compaction
+
+Conversations auto-save after every completed turn to `~/Library/Application Support/shaltaiboltai/sessions/` (or `$SHALTAIBOLTAI_DATA_DIR/sessions`); resume any of them with `/resume`. When the context grows past a threshold (`compact_threshold_chars`, default 80,000 chars ≈ 20k tokens) the conversation is summarized in the background by the current model and replaced with the summary, so long sessions keep working on small-context local models too. `/compact` triggers it manually; the status bar shows the live context size.
 
 ## Tools
 
@@ -40,6 +49,7 @@ The agent has four tools: `read_file`, `list_directory` (auto-approved), `write_
 
 ```toml
 default_model = "qwen3.5:latest"
+# compact_threshold_chars = 80000  # auto-compact context beyond this size
 # anthropic_api_key = "sk-ant-..."
 # openai_api_key = "sk-..."
 # openai_base_url = "https://api.openai.com/v1"   # any OpenAI-compatible server

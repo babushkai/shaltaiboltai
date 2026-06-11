@@ -17,6 +17,8 @@ anyhow = "1"
 toml = "0.8"
 dirs = "5"
 textwrap = "0.16"
+pulldown-cmark = { version = "0.13", default-features = false }
+tui-textarea = "0.7"
 
 [profile.release]
 lto = true

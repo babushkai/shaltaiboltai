@@ -2,13 +2,19 @@ use shaltaiboltai::{app, config, ui};
 
 use app::{App, AppEvent, Mode};
 use config::Config;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
+};
+use crossterm::execute;
 use futures_util::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal).await;
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -23,15 +29,14 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
 
         tokio::select! {
             Some(event) = rx.recv() => app.on_event(event),
-            Some(Ok(event)) = term_events.next() => {
-                if let Event::Key(key) = event {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        handle_key(&mut app, key);
-                    }
-                }
-            }
+            Some(Ok(event)) = term_events.next() => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
+                Event::Paste(text) => app.paste(&text),
+                _ => {}
+            },
         }
     }
+    app.save_session();
     Ok(())
 }
 
@@ -56,41 +61,25 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('n') | KeyCode::Esc => app.deny_pending(),
             _ => handle_scroll_key(app, key),
         },
-        Mode::ModelPicker => handle_picker_key(app, key),
+        Mode::ModelPicker => handle_model_picker_key(app, key),
+        Mode::SessionPicker => handle_session_picker_key(app, key),
     }
 }
 
 fn handle_input_key(app: &mut App, key: KeyEvent) {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('p') => app.open_picker(),
-            KeyCode::Char('u') => {
-                app.input.clear();
-                app.input_cursor = 0;
-            }
-            _ => {}
-        }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        app.open_picker();
         return;
     }
     match key.code {
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.textarea.insert_newline();
+        }
         KeyCode::Enter => app.submit_input(),
-        KeyCode::Char(c) => {
-            let at = byte_index(&app.input, app.input_cursor);
-            app.input.insert(at, c);
-            app.input_cursor += 1;
+        KeyCode::PageUp | KeyCode::PageDown => handle_scroll_key(app, key),
+        _ => {
+            app.textarea.input(key);
         }
-        KeyCode::Backspace => {
-            if app.input_cursor > 0 {
-                app.input_cursor -= 1;
-                let at = byte_index(&app.input, app.input_cursor);
-                app.input.remove(at);
-            }
-        }
-        KeyCode::Left => app.input_cursor = app.input_cursor.saturating_sub(1),
-        KeyCode::Right => app.input_cursor = (app.input_cursor + 1).min(app.input.chars().count()),
-        KeyCode::Home => app.input_cursor = 0,
-        KeyCode::End => app.input_cursor = app.input.chars().count(),
-        _ => handle_scroll_key(app, key),
     }
 }
 
@@ -102,7 +91,7 @@ fn handle_scroll_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_picker_key(app: &mut App, key: KeyEvent) {
+fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
     let count = app.filtered_models().len();
     match key.code {
         KeyCode::Esc => app.mode = Mode::Input,
@@ -125,10 +114,17 @@ fn handle_picker_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Convert a char-based cursor position to a byte index for String edits.
-fn byte_index(s: &str, char_pos: usize) -> usize {
-    s.char_indices()
-        .nth(char_pos)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
+    let count = app.sessions.len();
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Input,
+        KeyCode::Enter => app.pick_session(),
+        KeyCode::Up => app.session_index = app.session_index.saturating_sub(1),
+        KeyCode::Down => {
+            if count > 0 {
+                app.session_index = (app.session_index + 1).min(count - 1);
+            }
+        }
+        _ => {}
+    }
 }

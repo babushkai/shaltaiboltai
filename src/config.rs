@@ -10,7 +10,12 @@ pub struct Config {
     pub openai_base_url: String,
     pub ollama_host: String,
     pub default_model: Option<String>,
+    /// Auto-compact the conversation once its estimated size (in characters)
+    /// exceeds this. ~4 chars per token.
+    pub compact_threshold_chars: usize,
 }
+
+pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 80_000;
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
@@ -19,6 +24,7 @@ struct FileConfig {
     openai_base_url: Option<String>,
     ollama_host: Option<String>,
     default_model: Option<String>,
+    compact_threshold_chars: Option<usize>,
 }
 
 impl Config {
@@ -40,6 +46,9 @@ impl Config {
                 .or(file.ollama_host)
                 .unwrap_or_else(|| "http://localhost:11434".into()),
             default_model: file.default_model,
+            compact_threshold_chars: file
+                .compact_threshold_chars
+                .unwrap_or(DEFAULT_COMPACT_THRESHOLD_CHARS),
         }
     }
 

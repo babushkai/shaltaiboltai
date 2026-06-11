@@ -4,10 +4,11 @@ pub mod openai;
 mod sse;
 
 use crate::config::Config;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderKind {
     Anthropic,
     OpenAi,
@@ -24,7 +25,7 @@ impl ProviderKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub provider: ProviderKind,
     pub id: String,
@@ -32,7 +33,7 @@ pub struct ModelEntry {
 
 /// A tool invocation requested by the model. `id` is provider-assigned where
 /// available (Anthropic/OpenAI) and synthesized for Ollama.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -41,7 +42,7 @@ pub struct ToolCall {
 
 /// Provider-agnostic conversation history. Each provider module converts this
 /// into its own wire format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     User(String),
     Assistant {

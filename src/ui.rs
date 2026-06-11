@@ -1,4 +1,6 @@
 use crate::app::{App, Entry, Mode};
+use crate::markdown;
+use crate::session;
 use crate::tools;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -7,21 +9,24 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
+const MAX_INPUT_LINES: u16 = 8;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    let input_height = (app.textarea.lines().len() as u16).clamp(1, MAX_INPUT_LINES) + 2;
     let [transcript_area, status_area, input_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
     ])
     .areas(frame.area());
 
     draw_transcript(frame, app, transcript_area);
     draw_status(frame, app, status_area);
-    draw_input(frame, app, input_area);
+    frame.render_widget(&app.textarea, input_area);
 
     match app.mode {
-        Mode::ModelPicker => draw_picker(frame, app),
+        Mode::ModelPicker => draw_model_picker(frame, app),
+        Mode::SessionPicker => draw_session_picker(frame, app),
         Mode::Approval => draw_approval(frame, app),
         _ => {}
     }
@@ -46,12 +51,11 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 );
             }
             Entry::Assistant(text) => {
-                let body = if text.is_empty() && app.mode == Mode::Streaming {
-                    "…"
+                if text.is_empty() && app.mode == Mode::Streaming {
+                    lines.push(Line::styled("…", Style::new().fg(Color::DarkGray)));
                 } else {
-                    text
-                };
-                push_wrapped(&mut lines, "", body, width, Style::new().fg(Color::White));
+                    lines.extend(markdown::render(text, width, Style::new().fg(Color::White)));
+                }
             }
             Entry::Tool {
                 summary,
@@ -144,42 +148,36 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|m| format!("{} ({})", m.id, m.provider.label()))
         .unwrap_or_else(|| "no model".into());
-    let state = match app.mode {
-        Mode::Input => "ready",
-        Mode::Streaming => "thinking… (Esc to cancel)",
-        Mode::RunningTool => "running tool…",
-        Mode::Approval => "awaiting approval",
-        Mode::ModelPicker => "selecting model",
+    let state = if app.compacting {
+        "compacting context…"
+    } else {
+        match app.mode {
+            Mode::Input => "ready",
+            Mode::Streaming => "thinking… (Esc to cancel)",
+            Mode::RunningTool => "running tool…",
+            Mode::Approval => "awaiting approval",
+            Mode::ModelPicker => "selecting model",
+            Mode::SessionPicker => "selecting session",
+        }
     };
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {model} "),
             Style::new().fg(Color::Black).bg(Color::Cyan),
         ),
         Span::styled(format!(" {state}"), Style::new().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    ];
+    let tokens = app.approx_tokens();
+    if tokens > 0 {
+        spans.push(Span::styled(
+            format!(" · ~{tokens} ctx tokens"),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::Cyan));
-    // Keep the cursor visible when the input is wider than the box.
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let skip = app
-        .input_cursor
-        .saturating_sub(inner_width.saturating_sub(1));
-    let visible: String = app.input.chars().skip(skip).take(inner_width).collect();
-
-    frame.render_widget(Paragraph::new(visible).block(block), area);
-    frame.set_cursor_position((area.x + 1 + (app.input_cursor - skip) as u16, area.y + 1));
-}
-
-fn draw_picker(frame: &mut Frame, app: &App) {
-    let area = centered(frame.area(), 60, 70);
-    frame.render_widget(Clear, area);
-
+fn draw_model_picker(frame: &mut Frame, app: &App) {
     let models = app.filtered_models();
     let items: Vec<ListItem> = models
         .iter()
@@ -193,21 +191,49 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             ]))
         })
         .collect();
-
     let title = format!(
         " select model — type to filter: {}▏ ({} shown) ",
         app.picker_filter,
         models.len()
     );
+    draw_overlay_list(
+        frame,
+        title,
+        items,
+        app.picker_index.min(models.len().saturating_sub(1)),
+    );
+}
+
+fn draw_session_picker(frame: &mut Frame, app: &App) {
+    let items: Vec<ListItem> = app
+        .sessions
+        .iter()
+        .map(|s| {
+            ListItem::new(Line::from(vec![
+                Span::raw(s.title.clone()),
+                Span::styled(
+                    format!("  ·  {}", session::ago(s.updated_at)),
+                    Style::new().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+    let title = format!(" resume session ({}) ", app.sessions.len());
+    draw_overlay_list(frame, title, items, app.session_index);
+}
+
+fn draw_overlay_list(frame: &mut Frame, title: String, items: Vec<ListItem>, selected: usize) {
+    let area = centered(frame.area(), 60, 70);
+    frame.render_widget(Clear, area);
+
+    let empty = items.is_empty();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().bg(Color::Cyan).fg(Color::Black))
         .highlight_symbol("❯ ");
 
     let mut state = ListState::default();
-    state.select(
-        (!models.is_empty()).then_some(app.picker_index.min(models.len().saturating_sub(1))),
-    );
+    state.select((!empty).then_some(selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 

@@ -14,7 +14,7 @@ pub async fn stream_chat(
         .as_deref()
         .context("OPENAI_API_KEY is not set")?;
 
-    let body = json!({
+    let mut body = json!({
         "model": req.model.id,
         "stream": true,
         "messages": to_wire_messages(&req.system, &req.messages),
@@ -27,6 +27,9 @@ pub async fn stream_chat(
             },
         })).collect::<Vec<_>>(),
     });
+    if req.tools.is_empty() {
+        body.as_object_mut().unwrap().remove("tools");
+    }
 
     let response = reqwest::Client::new()
         .post(format!("{}/chat/completions", config.openai_base_url))
