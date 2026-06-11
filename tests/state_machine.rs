@@ -16,6 +16,7 @@ fn offline_config() -> Config {
         ollama_num_ctx: 16_384,
         theme: None,
         claude_code_bypass_permissions: false,
+        codex_full_access: false,
     }
 }
 

@@ -22,6 +22,9 @@ pub struct Config {
     /// to run shell commands and other permissioned tools unsupervised. Off by
     /// default: it may read and edit files but shell commands are auto-denied.
     pub claude_code_bypass_permissions: bool,
+    /// Run the Codex sub-agent with `danger-full-access` (no sandbox) instead of
+    /// the default OS-sandboxed `workspace-write`. Off by default.
+    pub codex_full_access: bool,
 }
 
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 80_000;
@@ -38,6 +41,7 @@ struct FileConfig {
     ollama_num_ctx: Option<usize>,
     theme: Option<String>,
     claude_code_bypass_permissions: Option<bool>,
+    codex_full_access: Option<bool>,
 }
 
 impl Config {
@@ -65,6 +69,7 @@ impl Config {
             ollama_num_ctx: file.ollama_num_ctx.unwrap_or(DEFAULT_OLLAMA_NUM_CTX),
             theme: file.theme,
             claude_code_bypass_permissions: file.claude_code_bypass_permissions.unwrap_or(false),
+            codex_full_access: file.codex_full_access.unwrap_or(false),
         }
     }
 

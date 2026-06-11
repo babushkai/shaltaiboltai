@@ -15,17 +15,21 @@ Providers are auto-discovered at startup:
 | Anthropic | `ANTHROPIC_API_KEY` | Claude (Fable, Opus, Sonnet, Haiku) |
 | OpenAI | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | fetched from `/v1/models` |
 | Ollama | running locally (`OLLAMA_HOST`, default `http://localhost:11434`) | fetched from `/api/tags` |
-| Claude Code | the `claude` CLI installed and signed in | `claude-code` (uses your subscription) |
+| Claude Code | the `claude` CLI installed and signed in | `claude-code` (uses your Claude subscription) |
+| Codex | the `codex` CLI installed and signed in | `codex` (uses your ChatGPT subscription) |
 
 No keys needed for Ollama — if it's running, its models just show up. Models without tool support automatically fall back to plain chat.
 
-### Claude Code (subscription, no API key)
+### Subscription providers (no API key)
 
-If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) is installed and signed in, a `claude-code` model appears in the picker that runs on your **Claude Pro/Max subscription** instead of a metered API key. We never see or store a token — the `claude` CLI owns its own auth. shaltaiboltai spawns it headless (`claude --print --output-format stream-json`) and renders its stream, so it runs as a **sub-agent**: Claude Code drives its own tool loop (Read/Edit/Bash/Grep) and you watch its activity in the transcript. shaltaiboltai's own tools and approval flow don't apply to this provider — Claude Code's permission model does.
+If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://github.com/openai/codex) is installed and signed in, a `claude-code` / `codex` model appears in the picker that runs on your **subscription** (Claude Pro/Max, ChatGPT Plus/Pro) instead of a metered API key. We never see or store a token — the CLI owns its own auth. shaltaiboltai spawns it headless (`claude --print --output-format stream-json`, `codex exec --json`) and renders its event stream, so it runs as a **sub-agent**: the CLI drives its own tool loop (read/edit/run) and you watch its activity in the transcript. shaltaiboltai's own tools and approval flow don't apply to these providers — the CLI's own permission/sandbox model does.
 
-By default it runs with `--permission-mode acceptEdits` (reads and edits files autonomously, but shell commands are auto-denied since there's no interactive prompt). To let it run shell commands unsupervised, set `claude_code_bypass_permissions = true` in config.toml — only do this if you're comfortable with it executing commands on your machine without confirmation.
+Safe defaults, each opt-out via config.toml:
 
-Continuity across turns uses the CLI's own session (`--continue`); `/new` starts a fresh one. Images aren't forwarded to this provider yet (they work with the API providers).
+- **Claude Code** runs with `--permission-mode acceptEdits` (reads/edits files autonomously; shell commands auto-denied since there's no interactive prompt). `claude_code_bypass_permissions = true` lets it run shell commands unsupervised.
+- **Codex** runs with `--sandbox workspace-write` (OS-sandboxed: edits and commands confined to the working directory, no network). `codex_full_access = true` removes the sandbox (`danger-full-access`).
+
+Continuity across turns rides each CLI's own session (`claude --continue`, `codex exec resume --last`); `/new` starts a fresh one. Images aren't forwarded to these providers yet (they work with the API providers).
 
 ## Keys & commands
 
@@ -80,6 +84,7 @@ default_model = "qwen3.5:latest"
 # openai_base_url = "https://api.openai.com/v1"   # any OpenAI-compatible server
 # ollama_host = "http://localhost:11434"
 # claude_code_bypass_permissions = false          # let the claude-code sub-agent run shell commands unsupervised
+# codex_full_access = false                        # remove the codex sub-agent's OS sandbox (danger-full-access)
 ```
 
 ## Development

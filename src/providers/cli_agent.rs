@@ -61,16 +61,29 @@ pub async fn stream_chat_claude(
     if continue_session {
         cmd.arg("--continue");
     }
+    drive(cmd, "claude", tx, handle_claude_event).await
+}
+
+/// Shared subprocess driver: spawn the CLI, stream its NDJSON stdout through
+/// `handle` (which returns true on the turn's terminal event), drain stderr so
+/// the pipe never blocks, and surface a useful error if the turn never
+/// completed.
+async fn drive(
+    mut cmd: tokio::process::Command,
+    name: &str,
+    tx: &UnboundedSender<ChatEvent>,
+    handle: impl Fn(&Value, &UnboundedSender<ChatEvent>) -> bool,
+) -> Result<()> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = cmd.spawn().context(
-        "failed to launch `claude` — install Claude Code and run `claude` once to sign in",
-    )?;
-    let stdout = child.stdout.take().context("no stdout from claude")?;
-    let stderr = child.stderr.take().context("no stderr from claude")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to launch `{name}` — is it installed and signed in?"))?;
+    let stdout = child.stdout.take().context("no stdout")?;
+    let stderr = child.stderr.take().context("no stderr")?;
 
     // Drain stderr concurrently so the pipe never blocks the child.
     let stderr_task = tokio::spawn(async move {
@@ -90,7 +103,7 @@ pub async fn stream_chat_claude(
             continue;
         }
         if let Ok(event) = serde_json::from_str::<Value>(&line) {
-            if handle_event(&event, tx) {
+            if handle(&event, tx) {
                 saw_result = true;
             }
         }
@@ -101,11 +114,11 @@ pub async fn stream_chat_claude(
     if !saw_result {
         let detail = stderr.trim();
         if status.success() {
-            anyhow::bail!("claude produced no result");
+            anyhow::bail!("{name} produced no result");
         } else if detail.is_empty() {
-            anyhow::bail!("claude exited with {status}");
+            anyhow::bail!("{name} exited with {status}");
         } else {
-            anyhow::bail!("claude error: {detail}");
+            anyhow::bail!("{name} error: {detail}");
         }
     }
     Ok(())
@@ -113,7 +126,7 @@ pub async fn stream_chat_claude(
 
 /// Translate one Claude Code stream-json event. Returns true when this was the
 /// terminal `result` event (so the caller knows the turn completed cleanly).
-fn handle_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
+fn handle_claude_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
     match event["type"].as_str().unwrap_or("") {
         // Assistant turn: text blocks stream as deltas, tool_use blocks show as
         // activity. (The CLI executes the tools itself.)
@@ -224,6 +237,134 @@ fn user_message_count(messages: &[Message]) -> usize {
         .count()
 }
 
+// ---- Codex (ChatGPT subscription) ----
+
+pub async fn codex_available() -> bool {
+    let probe = tokio::process::Command::new("codex")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), probe).await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+pub async fn stream_chat_codex(
+    config: &Config,
+    req: &ChatRequest,
+    tx: &UnboundedSender<ChatEvent>,
+) -> Result<()> {
+    let Some(prompt) = last_user_text(&req.messages) else {
+        anyhow::bail!("no user message to send");
+    };
+    if has_images(&req.messages) {
+        let _ = tx.send(ChatEvent::ToolActivity {
+            summary: "note: images are not yet forwarded to the Codex provider".into(),
+            is_error: false,
+        });
+    }
+
+    let mut cmd = tokio::process::Command::new("codex");
+    cmd.arg("exec");
+    // `resume --last` continues the most recent session in this directory; it
+    // reuses that session's sandbox, so --sandbox is only set on a fresh run.
+    if user_message_count(&req.messages) > 1 {
+        cmd.arg("resume").arg("--last");
+    } else {
+        // workspace-write is OS-sandboxed (no network, confined to the cwd);
+        // danger-full-access removes the sandbox entirely.
+        let sandbox = if config.codex_full_access {
+            "danger-full-access"
+        } else {
+            "workspace-write"
+        };
+        cmd.arg("--sandbox").arg(sandbox);
+    }
+    cmd.arg("--json").arg("--skip-git-repo-check").arg(&prompt);
+
+    drive(cmd, "codex", tx, handle_codex_event).await
+}
+
+/// Translate one `codex exec --json` event. Returns true on `turn.completed`
+/// (the terminal event).
+fn handle_codex_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
+    match event["type"].as_str().unwrap_or("") {
+        "item.completed" | "item.updated" => {
+            let item = &event["item"];
+            match item["type"].as_str().unwrap_or("") {
+                // Only emit finished assistant messages, so item.updated deltas
+                // (if any) don't double up with the completed text.
+                "agent_message" if event["type"] == "item.completed" => {
+                    if let Some(text) = item["text"].as_str() {
+                        if !text.is_empty() {
+                            let _ = tx.send(ChatEvent::TextDelta(text.to_owned()));
+                        }
+                    }
+                }
+                "reasoning" | "agent_message" | "todo_list" => {}
+                "error" => {
+                    let msg = item["message"].as_str().or_else(|| item["text"].as_str());
+                    let _ = tx.send(ChatEvent::Error(
+                        msg.unwrap_or("codex reported an error").to_owned(),
+                    ));
+                }
+                _ if event["type"] == "item.completed" => {
+                    let _ = tx.send(ChatEvent::ToolActivity {
+                        summary: summarize_codex_item(item),
+                        is_error: item["exit_code"].as_i64().is_some_and(|c| c != 0),
+                    });
+                }
+                _ => {}
+            }
+            false
+        }
+        "turn.completed" => {
+            // Codex `input_tokens` already includes the cached portion, so it is
+            // used as-is (unlike Claude's additive cache fields).
+            let usage = event["usage"].as_object().map(|u| Usage {
+                input_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+            });
+            let _ = tx.send(ChatEvent::Completed {
+                tool_calls: Vec::new(),
+                stop_reason: None,
+                usage,
+            });
+            true
+        }
+        "turn.failed" | "error" => {
+            let msg = event["error"]["message"]
+                .as_str()
+                .or_else(|| event["message"].as_str())
+                .unwrap_or("codex turn failed");
+            let _ = tx.send(ChatEvent::Error(msg.to_owned()));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Best-effort one-liner for a non-message Codex item (command_execution,
+/// file_change, web_search, mcp_tool_call, …). Defensive about field names
+/// since these vary by item type and CLI version.
+fn summarize_codex_item(item: &Value) -> String {
+    let kind = item["type"].as_str().unwrap_or("activity");
+    let detail = ["command", "query", "path", "name", "title", "url"]
+        .iter()
+        .find_map(|key| item[*key].as_str());
+    match detail {
+        Some(d) => format!("{kind}: {}", first_line(d)),
+        None => match item["changes"].as_array() {
+            Some(changes) if !changes.is_empty() => {
+                format!("{kind}: {} file(s)", changes.len())
+            }
+            _ => kind.replace('_', " "),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +391,7 @@ mod tests {
                 {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test\n--all"}},
             ]},
         });
-        assert!(!handle_event(&event, &tx));
+        assert!(!handle_claude_event(&event, &tx));
         let events = drain(&mut rx);
         assert!(matches!(&events[0], ChatEvent::TextDelta(t) if t == "Reading the file."));
         assert!(
@@ -271,7 +412,7 @@ mod tests {
             "result": "done",
             "usage": {"input_tokens": 100, "cache_read_input_tokens": 20, "output_tokens": 50},
         });
-        assert!(handle_event(&event, &tx));
+        assert!(handle_claude_event(&event, &tx));
         let events = drain(&mut rx);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -296,7 +437,7 @@ mod tests {
             "is_error": true,
             "result": "Credit balance is too low",
         });
-        assert!(handle_event(&event, &tx));
+        assert!(handle_claude_event(&event, &tx));
         assert!(matches!(&drain(&mut rx)[0], ChatEvent::Error(m) if m.contains("Credit balance")));
     }
 
@@ -313,6 +454,64 @@ mod tests {
         ];
         assert_eq!(user_message_count(&first), 1);
         assert_eq!(user_message_count(&later), 2);
+    }
+
+    #[test]
+    fn codex_agent_message_and_completion_map_to_events() {
+        let (tx, mut rx) = unbounded_channel();
+        assert!(!handle_codex_event(
+            &json!({"type": "thread.started", "thread_id": "x"}),
+            &tx
+        ));
+        assert!(!handle_codex_event(
+            &json!({"type": "item.completed", "item": {"type": "agent_message", "text": "pong"}}),
+            &tx,
+        ));
+        assert!(handle_codex_event(
+            &json!({"type": "turn.completed", "usage": {"input_tokens": 13293, "cached_input_tokens": 2432, "output_tokens": 5}}),
+            &tx,
+        ));
+        let events = drain(&mut rx);
+        assert!(matches!(&events[0], ChatEvent::TextDelta(t) if t == "pong"));
+        match &events[1] {
+            // Codex input_tokens already includes the cached portion: used as-is.
+            ChatEvent::Completed { usage: Some(u), .. } => {
+                assert_eq!(u.input_tokens, 13293);
+                assert_eq!(u.output_tokens, 5);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_tool_items_become_activity_lines() {
+        let (tx, mut rx) = unbounded_channel();
+        handle_codex_event(
+            &json!({"type": "item.completed", "item": {"type": "command_execution", "command": "cargo test\n--all", "exit_code": 0}}),
+            &tx,
+        );
+        handle_codex_event(
+            &json!({"type": "item.completed", "item": {"type": "command_execution", "command": "false", "exit_code": 1}}),
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            matches!(&events[0], ChatEvent::ToolActivity { summary, is_error: false } if summary == "command_execution: cargo test")
+        );
+        assert!(matches!(
+            &events[1],
+            ChatEvent::ToolActivity { is_error: true, .. }
+        ));
+    }
+
+    #[test]
+    fn codex_reasoning_items_are_silent() {
+        let (tx, mut rx) = unbounded_channel();
+        handle_codex_event(
+            &json!({"type": "item.completed", "item": {"type": "reasoning", "text": "thinking hard"}}),
+            &tx,
+        );
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]

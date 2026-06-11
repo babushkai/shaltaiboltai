@@ -17,6 +17,9 @@ pub enum ProviderKind {
     /// Claude Code CLI driven as a sub-agent — billed to the user's Claude
     /// subscription, not an API key.
     ClaudeCode,
+    /// Codex CLI driven as a sub-agent — billed to the user's ChatGPT
+    /// subscription, not an API key.
+    Codex,
 }
 
 impl ProviderKind {
@@ -26,13 +29,14 @@ impl ProviderKind {
             ProviderKind::OpenAi => "openai",
             ProviderKind::Ollama => "ollama",
             ProviderKind::ClaudeCode => "claude-code",
+            ProviderKind::Codex => "codex",
         }
     }
 
     /// Sub-agent providers run their own tool loop, so our tool definitions and
     /// approval flow don't apply to them.
     pub fn is_sub_agent(&self) -> bool {
-        matches!(self, ProviderKind::ClaudeCode)
+        matches!(self, ProviderKind::ClaudeCode | ProviderKind::Codex)
     }
 }
 
@@ -165,6 +169,7 @@ pub async fn stream_chat(config: Config, req: ChatRequest, tx: UnboundedSender<C
         ProviderKind::OpenAi => openai::stream_chat(&config, &req, &tx).await,
         ProviderKind::Ollama => ollama::stream_chat(&config, &req, &tx).await,
         ProviderKind::ClaudeCode => cli_agent::stream_chat_claude(&config, &req, &tx).await,
+        ProviderKind::Codex => cli_agent::stream_chat_codex(&config, &req, &tx).await,
     };
     if let Err(e) = result {
         let _ = tx.send(ChatEvent::Error(format!("{e:#}")));
@@ -217,6 +222,12 @@ pub async fn discover_models(config: Config) -> Vec<ModelEntry> {
         models.push(ModelEntry {
             provider: ProviderKind::ClaudeCode,
             id: "claude-code".into(),
+        });
+    }
+    if cli_agent::codex_available().await {
+        models.push(ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
         });
     }
 
