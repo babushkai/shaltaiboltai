@@ -16,6 +16,8 @@ pub struct Config {
     /// Context window requested from Ollama (its server-side default is ~4k
     /// regardless of what the model supports).
     pub ollama_num_ctx: usize,
+    /// Initial theme name; a theme picked at runtime (/theme) takes precedence.
+    pub theme: Option<String>,
 }
 
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 80_000;
@@ -30,6 +32,7 @@ struct FileConfig {
     default_model: Option<String>,
     compact_threshold_chars: Option<usize>,
     ollama_num_ctx: Option<usize>,
+    theme: Option<String>,
 }
 
 impl Config {
@@ -55,6 +58,7 @@ impl Config {
                 .compact_threshold_chars
                 .unwrap_or(DEFAULT_COMPACT_THRESHOLD_CHARS),
             ollama_num_ctx: file.ollama_num_ctx.unwrap_or(DEFAULT_OLLAMA_NUM_CTX),
+            theme: file.theme,
         }
     }
 

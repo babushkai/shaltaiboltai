@@ -40,6 +40,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
                 Event::Paste(text) => app.paste(&text),
                 _ => {}
             },
+            // Keep the status-bar spinner animating while the agent works.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(120)), if app.is_busy() => {}
         }
     }
     app.save_session();
@@ -69,6 +71,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         },
         Mode::ModelPicker => handle_model_picker_key(app, key),
         Mode::SessionPicker => handle_session_picker_key(app, key),
+        Mode::ThemePicker => match key.code {
+            KeyCode::Esc => app.revert_theme(),
+            KeyCode::Enter => app.pick_theme(),
+            KeyCode::Up => app.theme_move(-1),
+            KeyCode::Down => app.theme_move(1),
+            _ => {}
+        },
     }
 }
 

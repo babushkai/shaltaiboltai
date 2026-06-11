@@ -3,10 +3,10 @@ use crate::providers::{
     self, ChatEvent, ChatRequest, Message, ModelEntry, ProviderKind, ToolCall, Usage,
 };
 use crate::session;
+use crate::theme::{self, Theme};
 use crate::tools;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc::UnboundedSender;
@@ -53,6 +53,7 @@ pub enum Mode {
     Approval,
     ModelPicker,
     SessionPicker,
+    ThemePicker,
 }
 
 /// What the transcript pane renders. Kept separate from the provider history
@@ -60,6 +61,10 @@ pub enum Mode {
 /// the conversation sent to the model.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Entry {
+    Banner {
+        title: String,
+        subtitle: String,
+    },
     User(String),
     Assistant(String),
     Tool {
@@ -76,6 +81,9 @@ pub struct App {
     pub mode: Mode,
     pub should_quit: bool,
     pub compacting: bool,
+    pub theme: Theme,
+    pub theme_index: usize,
+    theme_revert: Option<Theme>,
 
     pub models: Vec<ModelEntry>,
     pub model: Option<ModelEntry>,
@@ -87,8 +95,8 @@ pub struct App {
     session_id: String,
 
     pub transcript: Vec<Entry>,
-    /// Bumped on structural transcript changes (clear/replace/pop) so the
-    /// renderer knows its per-entry cache is stale.
+    /// Bumped on structural transcript changes (clear/replace/pop) and theme
+    /// switches so the renderer knows its per-entry cache is stale.
     pub transcript_rev: u64,
     pub history: Vec<Message>,
     pub scroll_from_bottom: usize,
@@ -120,11 +128,18 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
+        let theme = session::load_theme_name()
+            .or_else(|| config.theme.clone())
+            .and_then(|name| theme::by_name(&name))
+            .unwrap_or(theme::DEFAULT);
         let mut app = App {
             config,
             mode: Mode::Input,
             should_quit: false,
             compacting: false,
+            theme,
+            theme_index: 0,
+            theme_revert: None,
             models: Vec::new(),
             model: None,
             picker_index: 0,
@@ -137,7 +152,7 @@ impl App {
             history: Vec::new(),
             scroll_from_bottom: 0,
             last_usage: None,
-            textarea: make_textarea(),
+            textarea: make_textarea(&theme),
             input_history: session::load_input_history(),
             input_history_pos: None,
             input_draft: String::new(),
@@ -154,12 +169,19 @@ impl App {
             tool_task: None,
             tx,
         };
-        app.transcript.push(Entry::Info(
-            "shaltaiboltai — Enter to send, Alt+Enter for newline, Ctrl+P to pick a model, /help for commands"
-                .into(),
-        ));
+        app.transcript.push(Entry::Banner {
+            title: "shaltaiboltai".into(),
+            subtitle: format!(
+                "v{} · multi-provider coding agent — Enter send · Alt+Enter newline · Ctrl+P models · /theme · /help",
+                env!("CARGO_PKG_VERSION"),
+            ),
+        });
         app.spawn_discovery();
         app
+    }
+
+    pub fn is_busy(&self) -> bool {
+        matches!(self.mode, Mode::Streaming | Mode::RunningTool) || self.compacting
     }
 
     fn spawn_discovery(&self) {
@@ -387,7 +409,7 @@ impl App {
             ));
             return;
         }
-        self.textarea = make_textarea();
+        self.textarea = make_textarea(&self.theme);
         self.remember_input(&text);
 
         if let Some(command) = text.strip_prefix('/') {
@@ -465,13 +487,14 @@ impl App {
     }
 
     fn set_input(&mut self, text: &str) {
-        self.textarea = make_textarea();
+        self.textarea = make_textarea(&self.theme);
         self.textarea.insert_str(text);
     }
 
     fn run_slash_command(&mut self, command: &str) {
         match command.trim() {
             "model" | "models" => self.open_picker(),
+            "theme" | "themes" => self.open_themes(),
             "clear" | "new" => self.reset_session(),
             "resume" | "sessions" => self.open_sessions(),
             "compact" => {
@@ -484,7 +507,7 @@ impl App {
             }
             "quit" | "exit" => self.should_quit = true,
             "help" => self.transcript.push(Entry::Info(
-                "commands: /model /resume /new /compact /quit — keys: Ctrl+P models, Alt+Enter newline, Up/Down input history, PgUp/PgDn scroll, Esc cancel, Ctrl+C quit"
+                "commands: /model /theme /resume /new /compact /quit — keys: Ctrl+P models, Alt+Enter newline, Up/Down input history, PgUp/PgDn scroll, Esc cancel, Ctrl+C quit"
                     .into(),
             )),
             other => self
@@ -626,6 +649,51 @@ impl App {
             self.model = Some(model);
         }
         self.mode = Mode::Input;
+    }
+
+    // ---- theme picker (live preview) ----
+
+    pub fn open_themes(&mut self) {
+        self.theme_revert = Some(self.theme);
+        self.theme_index = theme::all()
+            .iter()
+            .position(|t| t.name == self.theme.name)
+            .unwrap_or(0);
+        self.mode = Mode::ThemePicker;
+    }
+
+    pub fn theme_move(&mut self, delta: i64) {
+        let themes = theme::all();
+        let len = themes.len() as i64;
+        let idx = (self.theme_index as i64 + delta).rem_euclid(len) as usize;
+        self.theme_index = idx;
+        self.theme = themes[idx];
+        self.apply_theme();
+    }
+
+    pub fn pick_theme(&mut self) {
+        self.theme_revert = None;
+        session::save_theme_name(self.theme.name);
+        self.transcript
+            .push(Entry::Info(format!("theme: {}", self.theme.name)));
+        self.mode = Mode::Input;
+    }
+
+    pub fn revert_theme(&mut self) {
+        if let Some(previous) = self.theme_revert.take() {
+            self.theme = previous;
+            self.apply_theme();
+        }
+        self.mode = Mode::Input;
+    }
+
+    /// Re-style live widgets and invalidate cached rendered lines after a
+    /// theme change.
+    fn apply_theme(&mut self) {
+        let text = self.textarea.lines().join("\n");
+        self.textarea = make_textarea(&self.theme);
+        self.textarea.insert_str(text);
+        self.transcript_rev += 1;
     }
 
     // ---- sessions ----
@@ -844,15 +912,14 @@ impl App {
     }
 }
 
-fn make_textarea() -> TextArea<'static> {
+fn make_textarea(theme: &Theme) -> TextArea<'static> {
+    // The block (border + surface background) is restyled every frame by
+    // ui::draw_input, since it doubles as the focus indicator.
     let mut textarea = TextArea::default();
+    textarea.set_style(Style::new().fg(theme.fg));
     textarea.set_cursor_line_style(Style::default());
     textarea.set_placeholder_text("type a message — Enter send, Alt+Enter newline, /help");
-    textarea.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(Color::Cyan)),
-    );
+    textarea.set_placeholder_style(Style::new().fg(theme.dim));
     textarea
 }
 

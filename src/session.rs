@@ -119,6 +119,24 @@ pub fn ago(updated_at: u64) -> String {
     }
 }
 
+// ---- persisted UI state ----
+
+const THEME_FILE: &str = "theme";
+
+/// Theme chosen at runtime via /theme; takes precedence over config.toml.
+pub fn load_theme_name() -> Option<String> {
+    let root = data_root().ok()?;
+    let name = std::fs::read_to_string(root.join(THEME_FILE)).ok()?;
+    let name = name.trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+pub fn save_theme_name(name: &str) {
+    if let Ok(root) = data_root() {
+        let _ = std::fs::write(root.join(THEME_FILE), name);
+    }
+}
+
 // ---- prompt input history (shell-style Up-arrow recall) ----
 
 /// Stored as JSON-encoded strings, one per line, so multi-line inputs

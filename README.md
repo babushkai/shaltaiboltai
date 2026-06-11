@@ -34,7 +34,11 @@ No keys needed for Ollama — if it's running, its models just show up. Models w
 | `/compact` | summarize the conversation to shrink context |
 | `Ctrl+C` or `/quit` | exit |
 
-Assistant responses render markdown (headings, bold/italic, lists, blockquotes, fenced code).
+Assistant responses render markdown (heading hierarchy, bold/italic, accent-bulleted lists, styled blockquotes, and fenced code as full-width surface cards).
+
+## Themes
+
+`/theme` opens a live-preview picker (Up/Down to try, Enter to keep, Esc to revert) — the choice persists across runs. Built-in palettes: `mocha` (default), `tokyo-night`, `rose-pine`, `nord`, `gruvbox`, `latte` (light), and `terminal` (plain ANSI, keeps your terminal's own colors — use this if your emulator lacks truecolor). Each theme defines a base background, an elevated surface tone (input field, status bar, code cards, overlays), and tiered borders, so the UI has depth rather than flat accents. Set an initial theme with `theme = "nord"` in config.toml.
 
 ## Sessions & compaction
 

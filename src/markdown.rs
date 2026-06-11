@@ -1,12 +1,13 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use crate::theme::Theme;
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Render markdown to styled, word-wrapped lines for the transcript pane.
 /// Tolerates incomplete input (e.g. an unclosed code fence mid-stream).
-pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
-    let mut r = Renderer::new(width.max(10), base);
+pub fn render(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let mut r = Renderer::new(width.max(10), *theme);
     for event in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH) {
         r.event(event);
     }
@@ -15,17 +16,19 @@ pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
 
 struct Renderer {
     width: usize,
+    theme: Theme,
     base: Style,
     lines: Vec<Line<'static>>,
     cur: Vec<Span<'static>>,
     cur_w: usize,
     first_prefix: String,
     cont_prefix: String,
+    prefix_style: Style,
     first_line_of_block: bool,
     bold: u32,
     italic: u32,
     strike: u32,
-    heading: bool,
+    heading_level: Option<u8>,
     code_block: Option<String>,
     list_stack: Vec<Option<u64>>,
     in_item: u32,
@@ -34,20 +37,22 @@ struct Renderer {
 }
 
 impl Renderer {
-    fn new(width: usize, base: Style) -> Self {
+    fn new(width: usize, theme: Theme) -> Self {
         Renderer {
             width,
-            base,
+            theme,
+            base: Style::new().fg(theme.fg),
             lines: Vec::new(),
             cur: Vec::new(),
             cur_w: 0,
             first_prefix: String::new(),
             cont_prefix: String::new(),
+            prefix_style: Style::new().fg(theme.dim),
             first_line_of_block: true,
             bold: 0,
             italic: 0,
             strike: 0,
-            heading: false,
+            heading_level: None,
             code_block: None,
             list_stack: Vec::new(),
             in_item: 0,
@@ -74,7 +79,10 @@ impl Renderer {
                 }
             }
             Event::Code(t) => {
-                let style = self.base.fg(Color::Yellow);
+                let mut style = Style::new().fg(self.theme.code);
+                if let Some(surface) = self.theme.surface {
+                    style = style.bg(surface);
+                }
                 self.push_token(&t, style);
             }
             Event::SoftBreak => {
@@ -86,12 +94,16 @@ impl Renderer {
                 self.gap();
                 self.lines.push(Line::styled(
                     "─".repeat(self.width),
-                    self.base.add_modifier(Modifier::DIM),
+                    Style::new().fg(self.theme.border),
                 ));
             }
             Event::TaskListMarker(done) => {
-                let style = self.inline_style();
-                self.push_token(if done { "[x] " } else { "[ ] " }, style);
+                let style = if done {
+                    Style::new().fg(self.theme.success)
+                } else {
+                    Style::new().fg(self.theme.dim)
+                };
+                self.push_token(if done { "✓ " } else { "○ " }, style);
             }
             _ => {}
         }
@@ -103,14 +115,24 @@ impl Renderer {
                 if self.in_item == 0 {
                     self.gap();
                     let q = self.quote_prefix();
-                    self.set_block(q.clone(), q);
+                    let style = if self.quote_depth > 0 {
+                        Style::new().fg(self.theme.accent2)
+                    } else {
+                        Style::new().fg(self.theme.dim)
+                    };
+                    self.set_block(q.clone(), q, style);
                 }
             }
-            Tag::Heading { .. } => {
+            Tag::Heading { level, .. } => {
                 self.gap();
                 let q = self.quote_prefix();
-                self.set_block(q.clone(), q);
-                self.heading = true;
+                self.set_block(q.clone(), q, Style::new().fg(self.theme.dim));
+                self.heading_level = Some(match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    _ => 4,
+                });
             }
             Tag::BlockQuote(_) => {
                 self.gap();
@@ -143,7 +165,11 @@ impl Renderer {
                     "  ".repeat(self.list_stack.len().saturating_sub(1))
                 );
                 let cont = format!("{indent}{}", " ".repeat(bullet.chars().count()));
-                self.set_block(format!("{indent}{bullet}"), cont);
+                self.set_block(
+                    format!("{indent}{bullet}"),
+                    cont,
+                    Style::new().fg(self.theme.accent2),
+                );
             }
             Tag::Strong => self.bold += 1,
             Tag::Emphasis => self.italic += 1,
@@ -157,7 +183,7 @@ impl Renderer {
         match tag {
             TagEnd::Paragraph | TagEnd::Heading(_) => {
                 self.flush_line();
-                self.heading = false;
+                self.heading_level = None;
             }
             TagEnd::BlockQuote(_) => self.quote_depth = self.quote_depth.saturating_sub(1),
             TagEnd::CodeBlock => {
@@ -178,7 +204,7 @@ impl Renderer {
             TagEnd::Link => {
                 if let Some((url, autolink)) = self.link.take() {
                     if !autolink && !url.is_empty() {
-                        let style = self.base.add_modifier(Modifier::DIM);
+                        let style = Style::new().fg(self.theme.dim);
                         self.push_words(&format!(" ({url})"), style);
                     }
                 }
@@ -201,10 +227,18 @@ impl Renderer {
     // ---- layout primitives ----
 
     fn inline_style(&self) -> Style {
-        let mut style = if self.heading {
-            self.base.fg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else {
-            self.base
+        let mut style = match self.heading_level {
+            Some(1) => Style::new()
+                .fg(self.theme.accent2)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            Some(2) => Style::new()
+                .fg(self.theme.accent2)
+                .add_modifier(Modifier::BOLD),
+            Some(_) => self.base.add_modifier(Modifier::BOLD),
+            None if self.quote_depth > 0 => Style::new()
+                .fg(self.theme.dim)
+                .add_modifier(Modifier::ITALIC),
+            None => self.base,
         };
         if self.bold > 0 {
             style = style.add_modifier(Modifier::BOLD);
@@ -222,9 +256,10 @@ impl Renderer {
         "▎ ".repeat(self.quote_depth)
     }
 
-    fn set_block(&mut self, first: String, cont: String) {
+    fn set_block(&mut self, first: String, cont: String, prefix_style: Style) {
         self.first_prefix = first;
         self.cont_prefix = cont;
+        self.prefix_style = prefix_style;
         self.first_line_of_block = true;
     }
 
@@ -258,7 +293,7 @@ impl Renderer {
         let mut spans = Vec::new();
         let prefix = self.prefix().to_owned();
         if !prefix.is_empty() {
-            spans.push(Span::styled(prefix, self.base.add_modifier(Modifier::DIM)));
+            spans.push(Span::styled(prefix, self.prefix_style));
         }
         spans.append(&mut self.cur);
         self.lines.push(Line::from(spans));
@@ -320,33 +355,56 @@ impl Renderer {
         }
     }
 
+    /// Code blocks render as full-width "cards" on the surface color when the
+    /// theme has one, falling back to a gutter bar for plain-ANSI themes.
+    /// Code is never word-wrapped; long lines are hard-cut so indentation
+    /// stays intact.
     fn emit_code_block(&mut self, buf: &str) {
-        let style = self.base.fg(Color::Yellow);
-        let border = self.base.add_modifier(Modifier::DIM);
-        let width = self.width.saturating_sub(2).max(4);
-        for line in buf.lines() {
-            // Code is never word-wrapped; hard-cut to keep indentation intact.
-            let mut cut = String::new();
-            let mut w = 0;
-            for ch in line.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if w + cw > width {
-                    break;
+        match self.theme.surface {
+            Some(surface) => {
+                let style = Style::new().fg(self.theme.code).bg(surface);
+                let inner = self.width.saturating_sub(2).max(4);
+                for line in buf.lines() {
+                    let (cut, cut_w) = cut_to_width(line, inner);
+                    let pad = " ".repeat(self.width.saturating_sub(cut_w + 1));
+                    self.lines
+                        .push(Line::from(Span::styled(format!(" {cut}{pad}"), style)));
                 }
-                cut.push(ch);
-                w += cw;
             }
-            self.lines.push(Line::from(vec![
-                Span::styled("▏ ", border),
-                Span::styled(cut, style),
-            ]));
+            None => {
+                let style = Style::new().fg(self.theme.code);
+                let border = Style::new().fg(self.theme.dim);
+                let inner = self.width.saturating_sub(2).max(4);
+                for line in buf.lines() {
+                    let (cut, _) = cut_to_width(line, inner);
+                    self.lines.push(Line::from(vec![
+                        Span::styled("▏ ", border),
+                        Span::styled(cut, style),
+                    ]));
+                }
+            }
         }
     }
+}
+
+fn cut_to_width(line: &str, max: usize) -> (String, usize) {
+    let mut cut = String::new();
+    let mut w = 0;
+    for ch in line.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        cut.push(ch);
+        w += cw;
+    }
+    (cut, w)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{MOCHA, TERMINAL};
 
     fn flat(lines: &[Line]) -> Vec<String> {
         lines
@@ -362,7 +420,7 @@ mod tests {
 
     #[test]
     fn wraps_paragraphs_at_word_boundaries() {
-        let lines = render("alpha beta gamma delta", 12, Style::default());
+        let lines = render("alpha beta gamma delta", 12, &TERMINAL);
         let text = flat(&lines);
         assert!(text.len() > 1, "expected wrapping, got {text:?}");
         assert!(text.iter().all(|l| l.chars().count() <= 12), "{text:?}");
@@ -374,7 +432,7 @@ mod tests {
         let lines = render(
             "日本語のテキストを正しく折り返す必要があります",
             12,
-            Style::default(),
+            &TERMINAL,
         );
         let text = flat(&lines);
         assert!(text.len() > 1, "{text:?}");
@@ -386,11 +444,11 @@ mod tests {
     }
 
     #[test]
-    fn renders_code_blocks_verbatim() {
+    fn renders_code_blocks_verbatim_with_gutter_fallback() {
         let lines = render(
             "text\n\n```rust\nfn main() {}\n    indented\n```",
             40,
-            Style::default(),
+            &TERMINAL,
         );
         let text = flat(&lines);
         assert!(text.contains(&"▏ fn main() {}".to_string()), "{text:?}");
@@ -398,8 +456,25 @@ mod tests {
     }
 
     #[test]
+    fn themed_code_blocks_render_as_full_width_cards() {
+        let lines = render("```rust\nfn main() {}\n```", 40, &MOCHA);
+        let text = flat(&lines);
+        let card_line = text.iter().find(|l| l.contains("fn main() {}")).unwrap();
+        assert_eq!(
+            UnicodeWidthStr::width(card_line.as_str()),
+            40,
+            "{card_line:?}"
+        );
+        let styled = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("fn main()")))
+            .unwrap();
+        assert_eq!(styled.spans[0].style.bg, MOCHA.surface);
+    }
+
+    #[test]
     fn renders_lists_with_bullets_and_numbers() {
-        let lines = render("- one\n- two\n\n1. first\n2. second", 40, Style::default());
+        let lines = render("- one\n- two\n\n1. first\n2. second", 40, &TERMINAL);
         let text = flat(&lines);
         assert!(text.contains(&"• one".to_string()), "{text:?}");
         assert!(text.contains(&"1. first".to_string()), "{text:?}");
@@ -408,14 +483,14 @@ mod tests {
 
     #[test]
     fn tolerates_unclosed_fence_mid_stream() {
-        let lines = render("start\n\n```py\nprint(1)", 40, Style::default());
+        let lines = render("start\n\n```py\nprint(1)", 40, &TERMINAL);
         let text = flat(&lines);
         assert!(text.contains(&"▏ print(1)".to_string()), "{text:?}");
     }
 
     #[test]
     fn inline_code_and_bold_do_not_panic_and_keep_text() {
-        let lines = render("use `cargo build` to **compile** it", 80, Style::default());
+        let lines = render("use `cargo build` to **compile** it", 80, &TERMINAL);
         let text = flat(&lines).join(" ");
         assert!(text.contains("cargo build"));
         assert!(text.contains("compile"));

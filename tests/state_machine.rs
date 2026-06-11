@@ -14,10 +14,14 @@ fn offline_config() -> Config {
         default_model: None,
         compact_threshold_chars: 80_000,
         ollama_num_ctx: 16_384,
+        theme: None,
     }
 }
 
 fn test_app() -> (App, UnboundedReceiver<AppEvent>) {
+    // Never touch the user's real data dir (theme, sessions, input history).
+    let tmp = std::env::temp_dir().join(format!("shaltai-sm-{}", std::process::id()));
+    std::env::set_var("SHALTAIBOLTAI_DATA_DIR", tmp);
     let (tx, rx) = unbounded_channel();
     (App::new(offline_config(), tx), rx)
 }
