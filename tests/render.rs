@@ -93,9 +93,10 @@ async fn slash_input_opens_the_command_menu() {
     assert!(screen.contains("/theme"), "{screen}");
     assert!(screen.contains("color theme"), "{screen}");
 
-    // Tab completes the highlighted command into the input.
+    // Tab completes the highlighted command into the input, with a trailing
+    // space because /theme takes an argument.
     app.complete_selected_slash();
-    assert_eq!(app.textarea.lines().join(""), "/theme");
+    assert_eq!(app.textarea.lines().join(""), "/theme ");
 }
 
 #[tokio::test]

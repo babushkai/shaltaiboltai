@@ -20,7 +20,7 @@ No keys needed for Ollama — if it's running, its models just show up. Models w
 
 ## Keys & commands
 
-Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). The statusline shows the model, agent state, working directory, git branch, and live context usage with a fill percentage.
+Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered. The statusline shows the model, agent state, working directory, git branch (refreshed even while idle), and live context usage with a fill percentage.
 
 | Key | Action |
 |---|---|
@@ -44,7 +44,7 @@ Assistant responses render markdown (heading hierarchy, bold/italic, accent-bull
 
 ## Sessions & compaction
 
-Conversations auto-save after every completed turn to `~/Library/Application Support/shaltaiboltai/sessions/` (or `$SHALTAIBOLTAI_DATA_DIR/sessions`); resume any of them with `/resume`. When the context grows past a threshold (`compact_threshold_chars`, default 80,000 chars ≈ 20k tokens) the conversation is summarized in the background by the current model and replaced with the summary, so long sessions keep working on small-context local models too. `/compact` triggers it manually; the status bar shows the live context size.
+Conversations auto-save after every completed turn to `~/Library/Application Support/shaltaiboltai/sessions/` (or `$SHALTAIBOLTAI_DATA_DIR/sessions`); resume any of them with `/resume`. Sessions are project-scoped: the picker lists the current directory's sessions first, with sessions from other projects badged by their path. When the context grows past a threshold (`compact_threshold_chars`, default 80,000 chars ≈ 20k tokens) the conversation is summarized in the background by the current model and replaced with the summary, so long sessions keep working on small-context local models too. `/compact` triggers it manually; the status bar shows the live context size.
 
 ## Tools & permissions
 

@@ -136,3 +136,80 @@ async fn compaction_result_for_an_old_session_is_discarded() {
     assert_eq!(app.history.len(), before, "history must not be replaced");
     assert!(!app.compacting);
 }
+
+#[tokio::test]
+async fn slash_theme_with_argument_switches_directly() {
+    let (mut app, _rx) = test_app();
+    app.textarea.insert_str("/theme nord");
+    app.submit_input();
+    assert_eq!(app.theme.name, "nord");
+
+    // Unknown names error and keep the current theme.
+    app.textarea.insert_str("/theme nonexistent");
+    app.submit_input();
+    assert_eq!(app.theme.name, "nord");
+}
+
+#[tokio::test]
+async fn slash_model_with_argument_selects_or_prefilters() {
+    use shaltaiboltai::providers::{ModelEntry, ProviderKind};
+    let (mut app, _rx) = test_app();
+    app.models = vec![
+        ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "qwen3.5:latest".into(),
+        },
+        ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "gpt-oss:20b-cloud".into(),
+        },
+    ];
+
+    // Unique substring match selects directly.
+    app.textarea.insert_str("/model qwen");
+    app.submit_input();
+    assert_eq!(
+        app.model.as_ref().map(|m| m.id.as_str()),
+        Some("qwen3.5:latest")
+    );
+    assert_eq!(app.mode, Mode::Input);
+
+    // Ambiguous match opens the picker pre-filtered.
+    app.models.push(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "qwen2:7b".into(),
+    });
+    app.textarea.insert_str("/model qwen");
+    app.submit_input();
+    assert_eq!(app.mode, Mode::ModelPicker);
+    assert_eq!(app.picker_filter, "qwen");
+}
+
+#[tokio::test]
+async fn session_picker_orders_current_project_first() {
+    use shaltaiboltai::session;
+    let (mut app, _rx) = test_app();
+    let here = std::env::current_dir().unwrap().display().to_string();
+    for (id, title, cwd) in [
+        ("scope-other", "other project", "/somewhere/else".to_owned()),
+        ("scope-here", "this project", here),
+    ] {
+        session::save(&session::Session {
+            id: id.into(),
+            title: title.into(),
+            updated_at: session::now_secs(),
+            cwd: Some(cwd),
+            model: None,
+            history: vec![Message::User("x".into())],
+            transcript: Vec::new(),
+        })
+        .unwrap();
+    }
+
+    app.open_sessions();
+    assert_eq!(app.mode, Mode::SessionPicker);
+    let titles: Vec<&str> = app.sessions.iter().map(|s| s.title.as_str()).collect();
+    let here_pos = titles.iter().position(|t| *t == "this project").unwrap();
+    let other_pos = titles.iter().position(|t| *t == "other project").unwrap();
+    assert!(here_pos < other_pos, "{titles:?}");
+}

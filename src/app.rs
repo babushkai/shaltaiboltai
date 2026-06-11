@@ -29,6 +29,8 @@ const PROJECT_CONTEXT_CAP: usize = 8_000;
 pub struct SlashCommand {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
+    /// Argument hint shown in the menu and /help, e.g. `[name]`.
+    pub args: Option<&'static str>,
     pub description: &'static str,
 }
 
@@ -36,36 +38,43 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
         aliases: &["models"],
+        args: Some("[name]"),
         description: "switch model — also Ctrl+P",
     },
     SlashCommand {
         name: "theme",
         aliases: &["themes"],
+        args: Some("[name]"),
         description: "choose a color theme (live preview)",
     },
     SlashCommand {
         name: "resume",
         aliases: &["sessions"],
+        args: None,
         description: "resume a saved session",
     },
     SlashCommand {
         name: "new",
         aliases: &["clear"],
+        args: None,
         description: "start a new session (current one stays saved)",
     },
     SlashCommand {
         name: "compact",
         aliases: &[],
+        args: None,
         description: "summarize the conversation to shrink context",
     },
     SlashCommand {
         name: "help",
         aliases: &[],
+        args: None,
         description: "show commands and keys",
     },
     SlashCommand {
         name: "quit",
         aliases: &["exit"],
+        args: None,
         description: "exit shaltaiboltai",
     },
 ];
@@ -255,9 +264,9 @@ impl App {
         matches!(self.mode, Mode::Streaming | Mode::RunningTool) || self.compacting
     }
 
-    /// Cwd and git branch for the statusline. Cheap (one small file read), but
-    /// only refreshed when something could have changed it, not per frame.
-    fn refresh_environment(&mut self) {
+    /// Cwd and git branch for the statusline. Cheap (one small file read);
+    /// refreshed after turns/tools and on a slow idle tick, not per frame.
+    pub fn refresh_environment(&mut self) {
         self.cwd_display = std::env::current_dir()
             .map(|p| shorten_path(&p))
             .unwrap_or_default();
@@ -311,7 +320,10 @@ impl App {
 
     pub fn complete_selected_slash(&mut self) {
         if let Some(cmd) = self.selected_slash() {
-            self.set_input(&format!("/{}", cmd.name));
+            // Commands that take arguments complete with a trailing space so
+            // the user can keep typing.
+            let suffix = if cmd.args.is_some() { " " } else { "" };
+            self.set_input(&format!("/{}{suffix}", cmd.name));
             self.slash_index = 0;
         }
     }
@@ -557,7 +569,9 @@ impl App {
         if text.is_empty() {
             return;
         }
-        if self.compacting {
+        // Slash commands stay available while compacting; only chat turns
+        // must wait for the new context.
+        if self.compacting && !text.starts_with('/') {
             self.transcript.push(Entry::Error(
                 "context compaction in progress — try again in a moment".into(),
             ));
@@ -646,13 +660,30 @@ impl App {
     }
 
     fn run_slash_command(&mut self, command: &str) {
-        match command.trim() {
-            "model" | "models" => self.open_picker(),
-            "theme" | "themes" => self.open_themes(),
-            "clear" | "new" => self.reset_session(),
-            "resume" | "sessions" => self.open_sessions(),
-            "compact" => {
-                if self.history.is_empty() {
+        let mut parts = command.trim().splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("");
+        let arg = parts.next().map(str::trim).filter(|a| !a.is_empty());
+        let Some(cmd) = SLASH_COMMANDS
+            .iter()
+            .find(|c| c.name == name || c.aliases.contains(&name))
+        else {
+            self.transcript.push(Entry::Error(format!(
+                "unknown command: /{name} — try /help"
+            )));
+            return;
+        };
+        match (cmd.name, arg) {
+            ("model", Some(filter)) => self.select_model_by_filter(filter),
+            ("model", None) => self.open_picker(),
+            ("theme", Some(name)) => self.set_theme_by_name(name),
+            ("theme", None) => self.open_themes(),
+            ("new", _) => self.reset_session(),
+            ("resume", _) => self.open_sessions(),
+            ("compact", _) => {
+                if self.compacting {
+                    self.transcript
+                        .push(Entry::Info("compaction already in progress".into()));
+                } else if self.history.is_empty() {
                     self.transcript
                         .push(Entry::Info("nothing to compact".into()));
                 } else {
@@ -661,20 +692,74 @@ impl App {
                     self.start_compaction();
                 }
             }
-            "quit" | "exit" => self.should_quit = true,
-            "help" => {
+            ("quit", _) => self.should_quit = true,
+            ("help", _) => {
                 let commands = SLASH_COMMANDS
                     .iter()
-                    .map(|c| format!("/{} — {}", c.name, c.description))
+                    .map(|c| {
+                        let args = c.args.map(|a| format!(" {a}")).unwrap_or_default();
+                        format!("/{}{args} — {}", c.name, c.description)
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.transcript.push(Entry::Info(format!(
                     "{commands}\nkeys: Ctrl+P models · Alt+Enter newline · Up/Down input history · PgUp/PgDn scroll · Esc cancel · Ctrl+C quit"
                 )));
             }
-            other => self
-                .transcript
-                .push(Entry::Error(format!("unknown command: /{other}"))),
+            _ => unreachable!("registry and dispatch are matched"),
+        }
+    }
+
+    /// `/model <name>`: select directly on a unique match, open the picker
+    /// pre-filtered when ambiguous.
+    fn select_model_by_filter(&mut self, filter: &str) {
+        let needle = filter.to_lowercase();
+        let matches: Vec<ModelEntry> = self
+            .models
+            .iter()
+            .filter(|m| m.id.to_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+        let exact = matches.iter().find(|m| m.id.to_lowercase() == needle);
+        if let Some(model) = exact.or(if matches.len() == 1 {
+            matches.first()
+        } else {
+            None
+        }) {
+            self.transcript.push(Entry::Info(format!(
+                "model: {} ({})",
+                model.id,
+                model.provider.label()
+            )));
+            self.model = Some(model.clone());
+        } else if matches.is_empty() {
+            self.transcript
+                .push(Entry::Error(format!("no model matches \"{filter}\"")));
+        } else {
+            // Ambiguous: open the picker pre-filtered.
+            self.picker_filter = filter.to_owned();
+            self.picker_index = 0;
+            self.mode = Mode::ModelPicker;
+        }
+    }
+
+    /// `/theme <name>`: switch and persist directly.
+    fn set_theme_by_name(&mut self, name: &str) {
+        match theme::by_name(&name.to_lowercase()) {
+            Some(picked) => {
+                self.theme = picked;
+                self.apply_theme();
+                session::save_theme_name(picked.name);
+                self.transcript
+                    .push(Entry::Info(format!("theme: {}", picked.name)));
+            }
+            None => {
+                let names: Vec<&str> = theme::all().iter().map(|t| t.name).collect();
+                self.transcript.push(Entry::Error(format!(
+                    "unknown theme \"{name}\" — available: {}",
+                    names.join(", ")
+                )));
+            }
         }
     }
 
@@ -883,6 +968,9 @@ impl App {
             id: self.session_id.clone(),
             title,
             updated_at: session::now_secs(),
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string()),
             model: self.model.clone(),
             history: self.history.clone(),
             transcript: self.transcript.clone(),
@@ -911,12 +999,16 @@ impl App {
     }
 
     pub fn open_sessions(&mut self) {
-        let sessions = session::list();
+        let mut sessions = session::list();
         if sessions.is_empty() {
             self.transcript
                 .push(Entry::Info("no saved sessions yet".into()));
             return;
         }
+        // Project-scoped ordering: this directory's sessions first (legacy
+        // sessions without a cwd count as local), then everything else.
+        // The picker badges entries from other directories.
+        sessions.sort_by_key(|s| usize::from(session_is_foreign(s)));
         self.sessions = sessions;
         self.session_index = 0;
         self.mode = Mode::SessionPicker;
@@ -1129,6 +1221,16 @@ fn flatten_history(history: &[Message]) -> String {
         }
     }
     flat
+}
+
+/// Whether a saved session belongs to a different working directory (used
+/// for picker ordering and badges). Legacy sessions without a recorded cwd
+/// count as local.
+pub fn session_is_foreign(meta: &session::Meta) -> bool {
+    let here = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    meta.cwd.as_ref().is_some_and(|cwd| *cwd != here)
 }
 
 /// `~`-abbreviate the home directory and keep at most the last three

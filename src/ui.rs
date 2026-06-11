@@ -342,51 +342,71 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
     spans.push(Span::styled(state, Style::new().fg(theme.dim)));
+    let left_width: usize = spans.iter().map(|s| s.width()).sum();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
-    // Right side: cwd · branch · context usage, Claude Code style.
-    let mut right: Vec<Span> = Vec::new();
-    let sep = || Span::styled(" · ", Style::new().fg(theme.border));
-    if !app.cwd_display.is_empty() {
-        right.push(Span::styled(
-            app.cwd_display.clone(),
-            Style::new().fg(theme.dim),
-        ));
-    }
-    if let Some(branch) = &app.git_branch {
-        if !right.is_empty() {
-            right.push(sep());
+    // Right side: cwd · branch · context usage, Claude Code style. On narrow
+    // terminals, pieces are dropped (cwd first, then branch) instead of
+    // colliding with the left side.
+    let assemble = |with_cwd: bool, with_branch: bool| -> Vec<Span<'static>> {
+        let mut right: Vec<Span> = Vec::new();
+        let sep = || Span::styled(" · ", Style::new().fg(theme.border));
+        if with_cwd && !app.cwd_display.is_empty() {
+            right.push(Span::styled(
+                app.cwd_display.clone(),
+                Style::new().fg(theme.dim),
+            ));
         }
-        right.push(Span::styled(
-            format!("⌥ {branch}"),
-            Style::new().fg(theme.accent2),
-        ));
-    }
-    let context = match app.last_usage {
-        Some(u) => Some(format!(
-            "ctx {} · out {}",
-            fmt_count(u.input_tokens as usize),
-            fmt_count(u.output_tokens as usize)
-        )),
-        None if app.approx_tokens() > 0 => Some(format!("ctx ~{}", fmt_count(app.approx_tokens()))),
-        None => None,
+        if with_branch {
+            if let Some(branch) = &app.git_branch {
+                if !right.is_empty() {
+                    right.push(sep());
+                }
+                right.push(Span::styled(branch.clone(), Style::new().fg(theme.accent2)));
+            }
+        }
+        let context = match app.last_usage {
+            Some(u) => Some(format!(
+                "ctx {} · out {}",
+                fmt_count(u.input_tokens as usize),
+                fmt_count(u.output_tokens as usize)
+            )),
+            None if app.approx_tokens() > 0 => {
+                Some(format!("ctx ~{}", fmt_count(app.approx_tokens())))
+            }
+            None => None,
+        };
+        if let Some(ctx) = context {
+            if !right.is_empty() {
+                right.push(sep());
+            }
+            right.push(Span::styled(ctx, Style::new().fg(theme.dim)));
+            if let Some(pct) = app.context_percent() {
+                let color = match pct {
+                    0..=69 => theme.dim,
+                    70..=89 => theme.warning,
+                    _ => theme.error,
+                };
+                right.push(Span::styled(format!(" {pct}%"), Style::new().fg(color)));
+            }
+        }
+        if !right.is_empty() {
+            right.push(Span::raw(" "));
+        }
+        right
     };
-    if let Some(ctx) = context {
-        if !right.is_empty() {
-            right.push(sep());
-        }
-        right.push(Span::styled(ctx, Style::new().fg(theme.dim)));
-        if let Some(pct) = app.context_percent() {
-            let color = match pct {
-                0..=69 => theme.dim,
-                70..=89 => theme.warning,
-                _ => theme.error,
-            };
-            right.push(Span::styled(format!(" {pct}%"), Style::new().fg(color)));
-        }
-    }
-    if !right.is_empty() {
-        right.push(Span::raw(" "));
+    let fits = |candidate: &[Span]| -> bool {
+        let w: usize = candidate.iter().map(|s| s.width()).sum();
+        !candidate.is_empty() && left_width + w < area.width as usize
+    };
+    let right = [
+        assemble(true, true),
+        assemble(false, true),
+        assemble(false, false),
+    ]
+    .into_iter()
+    .find(|candidate| fits(candidate));
+    if let Some(right) = right {
         frame.render_widget(
             Paragraph::new(Line::from(right)).alignment(Alignment::Right),
             area,
@@ -411,11 +431,14 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
     let matches = app.slash_matches();
     let selected = app.slash_index.min(matches.len().saturating_sub(1));
 
-    let name_width = matches.iter().map(|c| c.name.len()).max().unwrap_or(0) + 2;
+    let label = |c: &crate::app::SlashCommand| -> usize {
+        1 + c.name.len() + c.args.map(|a| a.len() + 1).unwrap_or(0)
+    };
+    let label_width = matches.iter().map(|c| label(c)).max().unwrap_or(0) + 2;
     let height = (matches.len() as u16).min(8) + 2;
     let width = matches
         .iter()
-        .map(|c| 4 + name_width + c.description.len())
+        .map(|c| 4 + label_width + c.description.len())
         .max()
         .unwrap_or(20)
         .min(frame.area().width.saturating_sub(4) as usize) as u16;
@@ -430,13 +453,16 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
     let items: Vec<ListItem> = matches
         .iter()
         .map(|c| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("/{:<width$}", c.name, width = name_width - 1),
-                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(c.description, Style::new().fg(theme.dim)),
-            ]))
+            let mut spans = vec![Span::styled(
+                format!("/{}", c.name),
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            )];
+            if let Some(args) = c.args {
+                spans.push(Span::styled(format!(" {args}"), Style::new().fg(theme.dim)));
+            }
+            spans.push(Span::raw(" ".repeat(label_width.saturating_sub(label(c)))));
+            spans.push(Span::styled(c.description, Style::new().fg(theme.dim)));
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -496,17 +522,37 @@ fn draw_session_picker(frame: &mut Frame, app: &App) {
         .sessions
         .iter()
         .map(|s| {
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(s.title.clone(), Style::new().fg(theme.fg)),
                 Span::styled(
                     format!("  ·  {}", session::ago(s.updated_at)),
                     Style::new().fg(theme.dim),
                 ),
-            ]))
+            ];
+            // Sessions from other working directories are listed after the
+            // current project's, badged with where they came from.
+            if crate::app::session_is_foreign(s) {
+                if let Some(cwd) = &s.cwd {
+                    spans.push(Span::styled(
+                        format!("  ·  {}", short_dir(cwd)),
+                        Style::new().fg(theme.border),
+                    ));
+                }
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let title = format!(" resume session ({}) ", app.sessions.len());
     draw_overlay_list(frame, &theme, title, items, app.session_index);
+}
+
+/// Last two path components, enough to recognize a project in the picker.
+fn short_dir(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [.., a, b] => format!("{a}/{b}"),
+        _ => path.to_owned(),
+    }
 }
 
 fn draw_theme_picker(frame: &mut Frame, app: &App) {

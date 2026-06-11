@@ -42,6 +42,11 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
             },
             // Keep the status-bar spinner animating while the agent works.
             _ = tokio::time::sleep(std::time::Duration::from_millis(120)), if app.is_busy() => {}
+            // Idle: pick up external changes (e.g. a branch switch in another
+            // terminal) for the statusline.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if !app.is_busy() => {
+                app.refresh_environment();
+            }
         }
     }
     app.save_session();

@@ -16,6 +16,10 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub updated_at: u64,
+    /// Working directory the session belongs to. `None` on sessions saved by
+    /// older versions; treated as belonging everywhere.
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub model: Option<ModelEntry>,
     pub history: Vec<Message>,
     pub transcript: Vec<Entry>,
@@ -25,6 +29,7 @@ pub struct Meta {
     pub path: PathBuf,
     pub title: String,
     pub updated_at: u64,
+    pub cwd: Option<String>,
 }
 
 /// Unique even when called repeatedly within the same millisecond or from
@@ -101,6 +106,7 @@ pub fn list() -> Vec<Meta> {
                 path,
                 title: s.title,
                 updated_at: s.updated_at,
+                cwd: s.cwd,
             })
         })
         .collect();
