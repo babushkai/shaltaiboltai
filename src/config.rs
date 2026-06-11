@@ -13,9 +13,13 @@ pub struct Config {
     /// Auto-compact the conversation once its estimated size (in characters)
     /// exceeds this. ~4 chars per token.
     pub compact_threshold_chars: usize,
+    /// Context window requested from Ollama (its server-side default is ~4k
+    /// regardless of what the model supports).
+    pub ollama_num_ctx: usize,
 }
 
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 80_000;
+pub const DEFAULT_OLLAMA_NUM_CTX: usize = 16_384;
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
@@ -25,6 +29,7 @@ struct FileConfig {
     ollama_host: Option<String>,
     default_model: Option<String>,
     compact_threshold_chars: Option<usize>,
+    ollama_num_ctx: Option<usize>,
 }
 
 impl Config {
@@ -49,6 +54,7 @@ impl Config {
             compact_threshold_chars: file
                 .compact_threshold_chars
                 .unwrap_or(DEFAULT_COMPACT_THRESHOLD_CHARS),
+            ollama_num_ctx: file.ollama_num_ctx.unwrap_or(DEFAULT_OLLAMA_NUM_CTX),
         }
     }
 

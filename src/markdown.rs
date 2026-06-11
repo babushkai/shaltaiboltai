@@ -1,6 +1,7 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Render markdown to styled, word-wrapped lines for the transcript pane.
 /// Tolerates incomplete input (e.g. an unclosed code fence mid-stream).
@@ -237,7 +238,7 @@ impl Renderer {
 
     fn avail(&self) -> usize {
         self.width
-            .saturating_sub(self.prefix().chars().count())
+            .saturating_sub(UnicodeWidthStr::width(self.prefix()))
             .max(4)
     }
 
@@ -285,8 +286,9 @@ impl Renderer {
     }
 
     /// Append one unbreakable token, wrapping (or hard-splitting) as needed.
+    /// All measurements use display width, so CJK and emoji wrap correctly.
     fn push_token(&mut self, token: &str, style: Style) {
-        let tw = token.chars().count();
+        let tw = UnicodeWidthStr::width(token);
         if self.cur_w + tw > self.avail() && self.cur_w > 0 {
             self.flush_line();
             if token.trim().is_empty() {
@@ -294,18 +296,23 @@ impl Renderer {
             }
         }
         if tw > self.avail() {
-            let mut rest: Vec<char> = token.chars().collect();
-            while rest.len() > self.avail() {
-                let take = self.avail();
-                let piece: String = rest.drain(..take).collect();
-                self.cur_w += take;
-                self.cur.push(Span::styled(piece, style));
-                self.flush_line();
+            let mut piece = String::new();
+            let mut piece_w = 0;
+            for ch in token.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if piece_w + cw > self.avail() && piece_w > 0 {
+                    self.cur_w += piece_w;
+                    self.cur
+                        .push(Span::styled(std::mem::take(&mut piece), style));
+                    self.flush_line();
+                    piece_w = 0;
+                }
+                piece.push(ch);
+                piece_w += cw;
             }
-            if !rest.is_empty() {
-                self.cur_w += rest.len();
-                self.cur
-                    .push(Span::styled(rest.into_iter().collect::<String>(), style));
+            if !piece.is_empty() {
+                self.cur_w += piece_w;
+                self.cur.push(Span::styled(piece, style));
             }
         } else {
             self.cur_w += tw;
@@ -319,7 +326,16 @@ impl Renderer {
         let width = self.width.saturating_sub(2).max(4);
         for line in buf.lines() {
             // Code is never word-wrapped; hard-cut to keep indentation intact.
-            let cut: String = line.chars().take(width).collect();
+            let mut cut = String::new();
+            let mut w = 0;
+            for ch in line.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if w + cw > width {
+                    break;
+                }
+                cut.push(ch);
+                w += cw;
+            }
             self.lines.push(Line::from(vec![
                 Span::styled("▏ ", border),
                 Span::styled(cut, style),
@@ -351,6 +367,22 @@ mod tests {
         assert!(text.len() > 1, "expected wrapping, got {text:?}");
         assert!(text.iter().all(|l| l.chars().count() <= 12), "{text:?}");
         assert!(!text.iter().any(|l| l.ends_with(' ')), "{text:?}");
+    }
+
+    #[test]
+    fn wraps_cjk_text_by_display_width() {
+        let lines = render(
+            "日本語のテキストを正しく折り返す必要があります",
+            12,
+            Style::default(),
+        );
+        let text = flat(&lines);
+        assert!(text.len() > 1, "{text:?}");
+        assert!(
+            text.iter()
+                .all(|l| UnicodeWidthStr::width(l.as_str()) <= 12),
+            "{text:?}"
+        );
     }
 
     #[test]

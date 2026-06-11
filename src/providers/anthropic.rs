@@ -1,11 +1,12 @@
 use super::sse;
-use super::{ChatEvent, ChatRequest, Config, Message, ToolCall};
+use super::{ChatEvent, ChatRequest, Config, Message, ToolCall, Usage};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
+const MAX_TOKENS: u32 = 32_000;
 
 pub async fn stream_chat(
     config: &Config,
@@ -17,36 +18,52 @@ pub async fn stream_chat(
         .as_deref()
         .context("ANTHROPIC_API_KEY is not set")?;
 
+    // Cache breakpoints: system, the tool definitions, and the tail of the
+    // conversation. In an agent loop each request extends the previous one,
+    // so nearly the whole prompt becomes a cache hit.
     let mut body = json!({
         "model": req.model.id,
-        "max_tokens": 8192,
+        "max_tokens": MAX_TOKENS,
         "stream": true,
-        "system": req.system,
+        "system": [{
+            "type": "text",
+            "text": req.system,
+            "cache_control": {"type": "ephemeral"},
+        }],
         "messages": to_wire_messages(&req.messages),
-        "tools": req.tools.iter().map(|t| json!({
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.schema,
-        })).collect::<Vec<_>>(),
     });
-    if req.tools.is_empty() {
-        body.as_object_mut().unwrap().remove("tools");
+    if !req.tools.is_empty() {
+        let mut tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.schema,
+                })
+            })
+            .collect();
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
+        body["tools"] = Value::Array(tools);
     }
 
-    let response = reqwest::Client::new()
+    let request = reqwest::Client::new()
         .post(API_URL)
         .header("x-api-key", key)
         .header("anthropic-version", API_VERSION)
-        .json(&body)
-        .send()
-        .await?;
-    let response = sse::check_status(response).await?;
+        .json(&body);
+    let response = sse::check_status(sse::send_retrying(request).await?).await?;
 
     // Streaming tool_use inputs arrive as JSON fragments; accumulate per block
     // index and parse once the block closes.
     let mut pending: Vec<(String, String, String)> = Vec::new(); // (id, name, json buffer)
     let mut block_index_to_pending: std::collections::HashMap<u64, usize> = Default::default();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut stop_reason: Option<String> = None;
+    let mut usage = Usage::default();
 
     sse::for_each_data(response, |data| {
         let event: Value = match serde_json::from_str(data) {
@@ -54,6 +71,12 @@ pub async fn stream_chat(
             Err(_) => return Ok(()),
         };
         match event["type"].as_str().unwrap_or("") {
+            "message_start" => {
+                let u = &event["message"]["usage"];
+                usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0)
+                    + u["cache_read_input_tokens"].as_u64().unwrap_or(0)
+                    + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            }
             "content_block_start" => {
                 let block = &event["content_block"];
                 if block["type"] == "tool_use" {
@@ -93,6 +116,19 @@ pub async fn stream_chat(
                     });
                 }
             }
+            "message_delta" => {
+                if let Some(reason) = event["delta"]["stop_reason"].as_str() {
+                    // Normalized: truncation is reported as "length" everywhere.
+                    stop_reason = Some(if reason == "max_tokens" {
+                        "length".into()
+                    } else {
+                        reason.to_owned()
+                    });
+                }
+                if let Some(out) = event["usage"]["output_tokens"].as_u64() {
+                    usage.output_tokens = out;
+                }
+            }
             "error" => {
                 anyhow::bail!("stream error: {}", event["error"]["message"]);
             }
@@ -102,7 +138,11 @@ pub async fn stream_chat(
     })
     .await?;
 
-    let _ = tx.send(ChatEvent::Completed { tool_calls });
+    let _ = tx.send(ChatEvent::Completed {
+        tool_calls,
+        stop_reason,
+        usage: Some(usage),
+    });
     Ok(())
 }
 
@@ -110,7 +150,10 @@ fn to_wire_messages(messages: &[Message]) -> Vec<Value> {
     let mut wire = Vec::new();
     for msg in messages {
         match msg {
-            Message::User(text) => wire.push(json!({"role": "user", "content": text})),
+            Message::User(text) => wire.push(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+            })),
             Message::Assistant { text, tool_calls } => {
                 let mut content = Vec::new();
                 if !text.is_empty() {
@@ -148,6 +191,14 @@ fn to_wire_messages(messages: &[Message]) -> Vec<Value> {
                 }
             }
         }
+    }
+    // Third cache breakpoint on the conversation tail.
+    if let Some(block) = wire
+        .last_mut()
+        .and_then(|m| m["content"].as_array_mut())
+        .and_then(|c| c.last_mut())
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
     }
     wire
 }

@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
                     print!("{t}");
                     text.push_str(&t);
                 }
-                ChatEvent::Completed { tool_calls } => calls = tool_calls,
+                ChatEvent::Completed { tool_calls, .. } => calls = tool_calls,
                 ChatEvent::Error(e) => anyhow::bail!("provider error: {e}"),
             }
         }

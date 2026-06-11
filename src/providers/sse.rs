@@ -56,3 +56,35 @@ pub async fn check_status(response: reqwest::Response) -> Result<reqwest::Respon
     let body = response.text().await.unwrap_or_default();
     anyhow::bail!("API error {status}: {body}")
 }
+
+/// Send a request, retrying transient failures (429, 5xx, network errors)
+/// with backoff. Honors `Retry-After` when present. Only the initial send is
+/// retried — an interrupted stream is surfaced to the caller.
+pub async fn send_retrying(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    const RETRYABLE: [u16; 5] = [429, 500, 502, 503, 529];
+    let mut delay = 1u64;
+
+    for _ in 0..2 {
+        let Some(cloned) = request.try_clone() else {
+            return Ok(request.send().await?);
+        };
+        match cloned.send().await {
+            Ok(response) if !RETRYABLE.contains(&response.status().as_u16()) => {
+                return Ok(response);
+            }
+            Ok(response) => {
+                let wait = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(delay)
+                    .min(30);
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(delay)).await,
+        }
+        delay *= 4;
+    }
+    Ok(request.send().await?)
+}

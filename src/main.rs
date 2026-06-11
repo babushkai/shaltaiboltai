@@ -25,10 +25,16 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
     let mut term_events = EventStream::new();
 
     while !app.should_quit {
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         tokio::select! {
-            Some(event) = rx.recv() => app.on_event(event),
+            Some(event) = rx.recv() => {
+                app.on_event(event);
+                // Coalesce bursts (e.g. stream deltas) into a single redraw.
+                while let Ok(event) = rx.try_recv() {
+                    app.on_event(event);
+                }
+            }
             Some(Ok(event)) = term_events.next() => match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
                 Event::Paste(text) => app.paste(&text),
@@ -76,6 +82,14 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
             app.textarea.insert_newline();
         }
         KeyCode::Enter => app.submit_input(),
+        // Shell-style prompt recall when the input is empty (or while already
+        // navigating history); otherwise Up/Down move the cursor in the editor.
+        KeyCode::Up if app.input_is_empty() || app.history_recall_active() => {
+            app.input_history_prev();
+        }
+        KeyCode::Down if app.history_recall_active() => {
+            app.input_history_next();
+        }
         KeyCode::PageUp | KeyCode::PageDown => handle_scroll_key(app, key),
         _ => {
             app.textarea.input(key);

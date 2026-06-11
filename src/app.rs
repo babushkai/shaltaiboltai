@@ -1,11 +1,14 @@
 use crate::config::Config;
-use crate::providers::{self, ChatEvent, ChatRequest, Message, ModelEntry, ToolCall};
+use crate::providers::{
+    self, ChatEvent, ChatRequest, Message, ModelEntry, ProviderKind, ToolCall, Usage,
+};
 use crate::session;
 use crate::tools;
 use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
@@ -18,19 +21,31 @@ const MAX_AGENT_TURNS: usize = 30;
 /// summary request itself stays small.
 const COMPACT_FLATTEN_CAP: usize = 4_000;
 
-/// Events delivered to the UI loop from background tasks.
+/// Cap on project instruction files injected into the system prompt.
+const PROJECT_CONTEXT_CAP: usize = 8_000;
+
+/// Events delivered to the UI loop from background tasks. `gen` ties an event
+/// to the request generation that spawned it; events from a cancelled
+/// generation are dropped instead of resurrecting the agent loop.
 pub enum AppEvent {
-    Chat(ChatEvent),
+    Chat {
+        gen: u64,
+        event: ChatEvent,
+    },
     ModelsDiscovered(Vec<ModelEntry>),
     ToolFinished {
+        gen: u64,
         call: ToolCall,
         content: String,
         is_error: bool,
     },
-    CompactionDone(Result<String, String>),
+    CompactionDone {
+        session_id: String,
+        result: Result<String, String>,
+    },
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Mode {
     Input,
     Streaming,
@@ -72,16 +87,33 @@ pub struct App {
     session_id: String,
 
     pub transcript: Vec<Entry>,
+    /// Bumped on structural transcript changes (clear/replace/pop) so the
+    /// renderer knows its per-entry cache is stale.
+    pub transcript_rev: u64,
     pub history: Vec<Message>,
     pub scroll_from_bottom: usize,
+    pub last_usage: Option<Usage>,
 
     pub textarea: TextArea<'static>,
+    input_history: Vec<String>,
+    input_history_pos: Option<usize>,
+    input_draft: String,
 
+    /// Diff preview for the tool call currently awaiting approval.
+    pub approval_preview: Option<Vec<(char, String)>>,
+
+    // Renderer cache, managed by ui::draw.
+    pub render_cache: Vec<Vec<Line<'static>>>,
+    pub render_cache_width: usize,
+    pub render_cache_rev: u64,
+
+    gen: u64,
     streaming_text: String,
     pending_calls: VecDeque<ToolCall>,
-    auto_approve: bool,
+    approved_tools: HashSet<String>,
     agent_turns: usize,
     request_task: Option<JoinHandle<()>>,
+    tool_task: Option<JoinHandle<()>>,
 
     tx: UnboundedSender<AppEvent>,
 }
@@ -101,14 +133,25 @@ impl App {
             session_index: 0,
             session_id: session::new_id(),
             transcript: Vec::new(),
+            transcript_rev: 0,
             history: Vec::new(),
             scroll_from_bottom: 0,
+            last_usage: None,
             textarea: make_textarea(),
+            input_history: session::load_input_history(),
+            input_history_pos: None,
+            input_draft: String::new(),
+            approval_preview: None,
+            render_cache: Vec::new(),
+            render_cache_width: 0,
+            render_cache_rev: 0,
+            gen: 0,
             streaming_text: String::new(),
             pending_calls: VecDeque::new(),
-            auto_approve: false,
+            approved_tools: HashSet::new(),
             agent_turns: 0,
             request_task: None,
+            tool_task: None,
             tx,
         };
         app.transcript.push(Entry::Info(
@@ -154,15 +197,29 @@ impl App {
                 }
                 self.models = models;
             }
-            AppEvent::Chat(chat) => self.on_chat_event(chat),
+            AppEvent::Chat { gen, event } => {
+                if gen == self.gen {
+                    self.on_chat_event(event);
+                }
+            }
             AppEvent::ToolFinished {
+                gen,
                 call,
                 content,
                 is_error,
             } => {
-                self.finish_tool(call, content, is_error);
+                if gen == self.gen {
+                    self.finish_tool(call, content, is_error);
+                }
             }
-            AppEvent::CompactionDone(result) => self.finish_compaction(result),
+            AppEvent::CompactionDone { session_id, result } => {
+                self.compacting = false;
+                // A compaction started in another session must not replace
+                // this one's history.
+                if session_id == self.session_id {
+                    self.finish_compaction(result);
+                }
+            }
         }
     }
 
@@ -174,12 +231,24 @@ impl App {
                     buf.push_str(&text);
                 }
             }
-            ChatEvent::Completed { tool_calls } => {
+            ChatEvent::Completed {
+                tool_calls,
+                stop_reason,
+                usage,
+            } => {
                 self.request_task = None;
+                if usage.is_some() {
+                    self.last_usage = usage;
+                }
                 self.history.push(Message::Assistant {
                     text: std::mem::take(&mut self.streaming_text),
                     tool_calls: tool_calls.clone(),
                 });
+                if stop_reason.as_deref() == Some("length") {
+                    self.transcript.push(Entry::Error(
+                        "response was truncated by the output token limit".into(),
+                    ));
+                }
                 if tool_calls.is_empty() {
                     self.end_turn();
                     return;
@@ -189,6 +258,7 @@ impl App {
                     self.transcript.push(Entry::Error(format!(
                         "stopped after {MAX_AGENT_TURNS} consecutive tool rounds"
                     )));
+                    self.repair_dangling_tool_calls();
                     self.end_turn();
                     return;
                 }
@@ -197,7 +267,19 @@ impl App {
             }
             ChatEvent::Error(message) => {
                 self.request_task = None;
-                self.streaming_text.clear();
+                // Keep partial text the user already saw consistent with what
+                // the model will see next turn.
+                let text = std::mem::take(&mut self.streaming_text);
+                if !text.is_empty() {
+                    self.history.push(Message::Assistant {
+                        text,
+                        tool_calls: Vec::new(),
+                    });
+                } else if matches!(self.transcript.last(), Some(Entry::Assistant(t)) if t.is_empty())
+                {
+                    self.transcript.pop();
+                    self.transcript_rev += 1;
+                }
                 self.transcript.push(Entry::Error(message));
                 self.agent_turns = 0;
                 self.mode = Mode::Input;
@@ -211,7 +293,7 @@ impl App {
         self.agent_turns = 0;
         self.mode = Mode::Input;
         self.save_session();
-        if self.history_chars() > self.config.compact_threshold_chars && !self.compacting {
+        if self.context_over_threshold() && !self.compacting {
             self.transcript.push(Entry::Info(
                 "context exceeded threshold — compacting in the background".into(),
             ));
@@ -223,9 +305,14 @@ impl App {
     /// approval where required, execute otherwise, and when the queue is
     /// drained send the results back to the model.
     fn advance_tools(&mut self) {
+        self.approval_preview = None;
         match self.pending_calls.front() {
             None => self.start_request(),
-            Some(call) if tools::requires_approval(&call.name) && !self.auto_approve => {
+            Some(call)
+                if tools::requires_approval(call)
+                    && !self.approved_tools.contains(call.name.as_str()) =>
+            {
+                self.approval_preview = tools::approval_preview(call);
                 self.mode = Mode::Approval;
             }
             Some(_) => {
@@ -237,18 +324,21 @@ impl App {
 
     fn run_tool(&mut self, call: ToolCall) {
         self.mode = Mode::RunningTool;
+        let gen = self.gen;
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.tool_task = Some(tokio::spawn(async move {
             let (content, is_error) = tools::execute(&call).await;
             let _ = tx.send(AppEvent::ToolFinished {
+                gen,
                 call,
                 content,
                 is_error,
             });
-        });
+        }));
     }
 
     fn finish_tool(&mut self, call: ToolCall, content: String, is_error: bool) {
+        self.tool_task = None;
         self.transcript.push(Entry::Tool {
             summary: tools::describe(&call),
             result: content.clone(),
@@ -263,17 +353,19 @@ impl App {
         self.advance_tools();
     }
 
-    pub fn approve_pending(&mut self, all: bool) {
-        if all {
-            self.auto_approve = true;
-        }
+    pub fn approve_pending(&mut self, always: bool) {
         if let Some(call) = self.pending_calls.pop_front() {
+            if always {
+                self.approved_tools.insert(call.name.clone());
+            }
+            self.approval_preview = None;
             self.run_tool(call);
         }
     }
 
     pub fn deny_pending(&mut self) {
         if let Some(call) = self.pending_calls.pop_front() {
+            self.approval_preview = None;
             self.finish_tool(call, "User denied this tool call.".into(), true);
         }
     }
@@ -296,6 +388,7 @@ impl App {
             return;
         }
         self.textarea = make_textarea();
+        self.remember_input(&text);
 
         if let Some(command) = text.strip_prefix('/') {
             self.run_slash_command(command);
@@ -321,6 +414,61 @@ impl App {
         }
     }
 
+    // ---- input history (Up/Down recall) ----
+
+    fn remember_input(&mut self, text: &str) {
+        self.input_history_pos = None;
+        self.input_draft.clear();
+        if self.input_history.last().map(String::as_str) != Some(text) {
+            self.input_history.push(text.to_owned());
+            session::append_input_history(text);
+        }
+    }
+
+    pub fn input_is_empty(&self) -> bool {
+        self.textarea.lines().iter().all(|l| l.is_empty())
+    }
+
+    pub fn history_recall_active(&self) -> bool {
+        self.input_history_pos.is_some()
+    }
+
+    pub fn input_history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let pos = match self.input_history_pos {
+            None => {
+                self.input_draft = self.textarea.lines().join("\n");
+                self.input_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(p) => p - 1,
+        };
+        self.input_history_pos = Some(pos);
+        self.set_input(&self.input_history[pos].clone());
+    }
+
+    pub fn input_history_next(&mut self) {
+        match self.input_history_pos {
+            None => {}
+            Some(p) if p + 1 < self.input_history.len() => {
+                self.input_history_pos = Some(p + 1);
+                self.set_input(&self.input_history[p + 1].clone());
+            }
+            Some(_) => {
+                self.input_history_pos = None;
+                let draft = std::mem::take(&mut self.input_draft);
+                self.set_input(&draft);
+            }
+        }
+    }
+
+    fn set_input(&mut self, text: &str) {
+        self.textarea = make_textarea();
+        self.textarea.insert_str(text);
+    }
+
     fn run_slash_command(&mut self, command: &str) {
         match command.trim() {
             "model" | "models" => self.open_picker(),
@@ -336,7 +484,7 @@ impl App {
             }
             "quit" | "exit" => self.should_quit = true,
             "help" => self.transcript.push(Entry::Info(
-                "commands: /model /resume /new /compact /quit — keys: Ctrl+P models, Alt+Enter newline, PgUp/PgDn scroll, Esc cancel, Ctrl+C quit"
+                "commands: /model /resume /new /compact /quit — keys: Ctrl+P models, Alt+Enter newline, Up/Down input history, PgUp/PgDn scroll, Esc cancel, Ctrl+C quit"
                     .into(),
             )),
             other => self
@@ -347,6 +495,7 @@ impl App {
 
     fn start_request(&mut self) {
         let Some(model) = self.model.clone() else {
+            self.mode = Mode::Input;
             return;
         };
         self.mode = Mode::Streaming;
@@ -359,13 +508,14 @@ impl App {
             messages: self.history.clone(),
             tools: tools::definitions(),
         };
+        let gen = self.gen;
         let config = self.config.clone();
         let tx = self.tx.clone();
         self.request_task = Some(tokio::spawn(async move {
             let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel();
             let stream = tokio::spawn(providers::stream_chat(config, request, chat_tx));
             while let Some(event) = chat_rx.recv().await {
-                if tx.send(AppEvent::Chat(event)).is_err() {
+                if tx.send(AppEvent::Chat { gen, event }).is_err() {
                     break;
                 }
             }
@@ -374,7 +524,12 @@ impl App {
     }
 
     pub fn cancel_request(&mut self) {
+        // Invalidate in-flight work; late events from old generations are dropped.
+        self.gen += 1;
         if let Some(task) = self.request_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.tool_task.take() {
             task.abort();
         }
         // Keep whatever streamed so far as a valid assistant turn.
@@ -386,11 +541,50 @@ impl App {
             });
         } else if matches!(self.transcript.last(), Some(Entry::Assistant(t)) if t.is_empty()) {
             self.transcript.pop();
+            self.transcript_rev += 1;
         }
         self.pending_calls.clear();
+        self.approval_preview = None;
+        self.repair_dangling_tool_calls();
         self.transcript.push(Entry::Info("cancelled".into()));
         self.agent_turns = 0;
         self.mode = Mode::Input;
+    }
+
+    /// Providers reject an assistant tool call that has no matching result.
+    /// After a cancellation mid-round, close any dangling calls with an
+    /// explicit "cancelled" result so the next request is valid.
+    fn repair_dangling_tool_calls(&mut self) {
+        let Some(last_assistant) = self
+            .history
+            .iter()
+            .rposition(|m| matches!(m, Message::Assistant { .. }))
+        else {
+            return;
+        };
+        let Message::Assistant { tool_calls, .. } = &self.history[last_assistant] else {
+            return;
+        };
+        let answered: HashSet<String> = self.history[last_assistant + 1..]
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<(String, String)> = tool_calls
+            .iter()
+            .filter(|c| !answered.contains(&c.id))
+            .map(|c| (c.id.clone(), c.name.clone()))
+            .collect();
+        for (call_id, name) in missing {
+            self.history.push(Message::ToolResult {
+                call_id,
+                name,
+                content: "Cancelled by user.".into(),
+                is_error: true,
+            });
+        }
     }
 
     // ---- model picker ----
@@ -436,7 +630,7 @@ impl App {
 
     // ---- sessions ----
 
-    pub fn save_session(&self) {
+    pub fn save_session(&mut self) {
         if self.history.is_empty() {
             return;
         }
@@ -464,18 +658,24 @@ impl App {
             transcript: self.transcript.clone(),
         };
         if let Err(e) = session::save(&snapshot) {
-            // Persistence is best-effort; the conversation itself still works.
-            eprintln!("failed to save session: {e:#}");
+            // Persistence is best-effort; never write to stderr from a TUI.
+            self.transcript
+                .push(Entry::Error(format!("failed to save session: {e:#}")));
         }
     }
 
     fn reset_session(&mut self) {
         self.save_session();
+        self.gen += 1;
         self.session_id = session::new_id();
         self.history.clear();
         self.transcript.clear();
+        self.transcript_rev += 1;
         self.agent_turns = 0;
         self.scroll_from_bottom = 0;
+        self.last_usage = None;
+        self.pending_calls.clear();
+        self.approval_preview = None;
         self.transcript
             .push(Entry::Info("started a new session".into()));
     }
@@ -500,11 +700,14 @@ impl App {
         match session::load(&meta.path) {
             Ok(loaded) => {
                 self.save_session();
+                self.gen += 1;
                 self.session_id = loaded.id;
                 self.history = loaded.history;
                 self.transcript = loaded.transcript;
+                self.transcript_rev += 1;
                 self.scroll_from_bottom = 0;
                 self.agent_turns = 0;
+                self.last_usage = None;
                 if let Some(saved) = loaded.model {
                     if self
                         .models
@@ -551,6 +754,26 @@ impl App {
         self.history_chars() / 4
     }
 
+    /// Ollama models are bounded by the configured num_ctx, which is usually
+    /// far smaller than the cloud-model threshold — compact well before it.
+    fn effective_compact_threshold(&self) -> usize {
+        let configured = self.config.compact_threshold_chars;
+        match self.model.as_ref().map(|m| m.provider) {
+            Some(ProviderKind::Ollama) => configured.min(self.config.ollama_num_ctx * 3),
+            _ => configured,
+        }
+    }
+
+    fn context_over_threshold(&self) -> bool {
+        let threshold = self.effective_compact_threshold();
+        if self.history_chars() > threshold {
+            return true;
+        }
+        // Prefer the provider-reported context size when we have it.
+        self.last_usage
+            .is_some_and(|u| u.input_tokens as usize > threshold / 4)
+    }
+
     fn start_compaction(&mut self) {
         let Some(model) = self.model.clone() else {
             return;
@@ -574,6 +797,7 @@ impl App {
             ))],
             tools: Vec::new(),
         };
+        let session_id = self.session_id.clone();
         let config = self.config.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -593,12 +817,11 @@ impl App {
                 None if text.trim().is_empty() => Err("empty summary".into()),
                 None => Ok(text),
             };
-            let _ = tx.send(AppEvent::CompactionDone(result));
+            let _ = tx.send(AppEvent::CompactionDone { session_id, result });
         });
     }
 
     fn finish_compaction(&mut self, result: Result<String, String>) {
-        self.compacting = false;
         match result {
             Ok(summary) => {
                 let before = self.history_chars();
@@ -606,6 +829,7 @@ impl App {
                     "Context summary of our conversation so far (earlier messages were compacted):\n\n{}",
                     summary.trim()
                 ))];
+                self.last_usage = None;
                 self.transcript.push(Entry::Info(format!(
                     "context compacted: ~{}k → ~{}k chars",
                     before / 1000,
@@ -675,12 +899,23 @@ fn system_prompt() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "?".into());
-    format!(
+    let mut prompt = format!(
         "You are shaltaiboltai, an agentic coding assistant running in a terminal. \
          The user's working directory is {cwd} on {}. \
          Use the available tools to read and modify files and run commands when the task calls for it. \
+         Prefer edit_file over write_file for existing files, and grep/glob to explore before reading. \
          Prefer small, verifiable steps and report what you did. \
          Format responses in markdown.",
         std::env::consts::OS,
-    )
+    );
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        if let Ok(content) = std::fs::read_to_string(name) {
+            let capped: String = content.chars().take(PROJECT_CONTEXT_CAP).collect();
+            prompt.push_str(&format!(
+                "\n\n# Project instructions (from {name})\n{capped}"
+            ));
+            break;
+        }
+    }
+    prompt
 }

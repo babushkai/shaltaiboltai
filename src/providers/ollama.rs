@@ -1,5 +1,5 @@
 use super::sse;
-use super::{ChatEvent, ChatRequest, Config, Message, ToolCall};
+use super::{ChatEvent, ChatRequest, Config, Message, ToolCall, Usage};
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -13,6 +13,9 @@ pub async fn stream_chat(
         "model": req.model.id,
         "stream": true,
         "messages": to_wire_messages(&req.system, &req.messages),
+        // Ollama's default context window is tiny (~4k); without this, long
+        // agent sessions silently lose the system prompt and tools.
+        "options": {"num_ctx": config.ollama_num_ctx},
         "tools": req.tools.iter().map(|t| json!({
             "type": "function",
             "function": {
@@ -26,21 +29,17 @@ pub async fn stream_chat(
         body.as_object_mut().unwrap().remove("tools");
     }
 
-    let post = |body: Value| {
-        reqwest::Client::new()
-            .post(format!("{}/api/chat", config.ollama_host))
-            .json(&body)
-            .send()
-    };
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/chat", config.ollama_host);
 
-    let mut response = post(body.clone()).await?;
+    let mut response = sse::send_retrying(client.post(&url).json(&body)).await?;
     // Not every local model supports tool calling; degrade to plain chat
     // rather than failing the whole turn.
     if response.status() == reqwest::StatusCode::BAD_REQUEST {
         let text = response.text().await.unwrap_or_default();
         if text.contains("does not support tools") {
             body.as_object_mut().unwrap().remove("tools");
-            response = post(body).await?;
+            response = sse::send_retrying(client.post(&url).json(&body)).await?;
         } else {
             anyhow::bail!("API error 400: {text}");
         }
@@ -49,6 +48,8 @@ pub async fn stream_chat(
 
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut call_seq = 0usize;
+    let mut stop_reason: Option<String> = None;
+    let mut usage: Option<Usage> = None;
 
     sse::for_each_ndjson(response, |line| {
         let event: Value = match serde_json::from_str(line) {
@@ -79,11 +80,24 @@ pub async fn stream_chat(
                 });
             }
         }
+        if event["done"].as_bool() == Some(true) {
+            if let Some(reason) = event["done_reason"].as_str() {
+                stop_reason = Some(reason.to_owned());
+            }
+            usage = Some(Usage {
+                input_tokens: event["prompt_eval_count"].as_u64().unwrap_or(0),
+                output_tokens: event["eval_count"].as_u64().unwrap_or(0),
+            });
+        }
         Ok(())
     })
     .await?;
 
-    let _ = tx.send(ChatEvent::Completed { tool_calls });
+    let _ = tx.send(ChatEvent::Completed {
+        tool_calls,
+        stop_reason,
+        usage,
+    });
     Ok(())
 }
 

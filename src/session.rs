@@ -3,7 +3,11 @@ use crate::providers::{Message, ModelEntry};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const INPUT_HISTORY_FILE: &str = "input_history.jsonl";
+const INPUT_HISTORY_MAX: usize = 500;
 
 /// A persisted conversation. Saved after every completed turn, so a crash
 /// loses at most the in-flight exchange.
@@ -23,8 +27,16 @@ pub struct Meta {
     pub updated_at: u64,
 }
 
+/// Unique even when called repeatedly within the same millisecond or from
+/// concurrent instances: millis + pid + per-process counter.
 pub fn new_id() -> String {
-    format!("{}", now_secs() * 1000 + std::process::id() as u64 % 1000)
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        now_millis(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 pub fn now_secs() -> u64 {
@@ -33,20 +45,31 @@ pub fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn dir() -> Result<PathBuf> {
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn data_root() -> Result<PathBuf> {
     let base = match std::env::var_os("SHALTAIBOLTAI_DATA_DIR") {
         Some(p) => PathBuf::from(p),
         None => dirs::data_dir()
             .context("no data directory on this platform")?
             .join("shaltaiboltai"),
     };
-    let d = base.join("sessions");
+    std::fs::create_dir_all(&base)?;
+    Ok(base)
+}
+
+fn sessions_dir() -> Result<PathBuf> {
+    let d = data_root()?.join("sessions");
     std::fs::create_dir_all(&d)?;
     Ok(d)
 }
 
 pub fn save(session: &Session) -> Result<()> {
-    let path = dir()?.join(format!("{}.json", session.id));
+    let path = sessions_dir()?.join(format!("{}.json", session.id));
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(session)?)?;
     std::fs::rename(&tmp, &path)?;
@@ -60,7 +83,9 @@ pub fn load(path: &Path) -> Result<Session> {
 
 /// All saved sessions, newest first. Unreadable files are skipped.
 pub fn list() -> Vec<Meta> {
-    let Ok(dir) = dir() else { return Vec::new() };
+    let Ok(dir) = sessions_dir() else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -91,5 +116,53 @@ pub fn ago(updated_at: u64) -> String {
         60..=3599 => format!("{}m ago", delta / 60),
         3600..=86_399 => format!("{}h ago", delta / 3600),
         _ => format!("{}d ago", delta / 86_400),
+    }
+}
+
+// ---- prompt input history (shell-style Up-arrow recall) ----
+
+/// Stored as JSON-encoded strings, one per line, so multi-line inputs
+/// round-trip safely.
+pub fn load_input_history() -> Vec<String> {
+    let Ok(root) = data_root() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(root.join(INPUT_HISTORY_FILE)) else {
+        return Vec::new();
+    };
+    let entries: Vec<String> = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<String>(l).ok())
+        .collect();
+    let skip = entries.len().saturating_sub(INPUT_HISTORY_MAX);
+    entries.into_iter().skip(skip).collect()
+}
+
+pub fn append_input_history(entry: &str) {
+    let Ok(root) = data_root() else { return };
+    let Ok(line) = serde_json::to_string(entry) else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(INPUT_HISTORY_FILE))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_unique_in_rapid_succession() {
+        let ids: Vec<String> = (0..100).map(|_| new_id()).collect();
+        let mut deduped = ids.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), ids.len());
     }
 }

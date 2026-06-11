@@ -24,9 +24,10 @@ No keys needed for Ollama — if it's running, its models just show up. Models w
 |---|---|
 | `Enter` | send message |
 | `Alt+Enter` | insert newline (multi-line input; pasting multi-line text also works) |
+| `Up` / `Down` | recall previous prompts (when the input is empty), shell-style |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
-| `Esc` | cancel an in-flight response |
-| `y` / `a` / `n` | approve / approve-all / deny a tool call |
+| `Esc` | cancel an in-flight response or running tool |
+| `y` / `a` / `n` | approve / always-allow-this-tool / deny a tool call |
 | `PgUp` / `PgDn` | scroll transcript |
 | `/resume` | pick a saved session to continue |
 | `/new` or `/clear` | start a new session (the old one stays saved) |
@@ -39,9 +40,14 @@ Assistant responses render markdown (headings, bold/italic, lists, blockquotes, 
 
 Conversations auto-save after every completed turn to `~/Library/Application Support/shaltaiboltai/sessions/` (or `$SHALTAIBOLTAI_DATA_DIR/sessions`); resume any of them with `/resume`. When the context grows past a threshold (`compact_threshold_chars`, default 80,000 chars ≈ 20k tokens) the conversation is summarized in the background by the current model and replaced with the summary, so long sessions keep working on small-context local models too. `/compact` triggers it manually; the status bar shows the live context size.
 
-## Tools
+## Tools & permissions
 
-The agent has four tools: `read_file`, `list_directory` (auto-approved), `write_file`, `run_command` (require approval; `a` auto-approves for the session). Commands time out after 60s and output is capped at 32 KB.
+The agent has seven tools:
+
+- **Read-only** — `read_file`, `list_directory`, `grep` (regex content search, gitignore-aware), `glob` (find files by pattern). Auto-approved **only inside the working directory**; reads outside it (dotfiles, other projects, `/etc`…) always prompt before contents are sent to a provider.
+- **Mutating** — `write_file`, `edit_file` (exact find/replace, must match uniquely), `run_command`. Always prompt; the approval dialog shows a unified diff of what a file change will do. `a` answers "always allow this tool" for the rest of the session.
+
+Commands time out after 60s and tool output is capped at 32 KB. If `AGENTS.md` or `CLAUDE.md` exists in the working directory it is loaded into the system prompt automatically.
 
 ## Config (optional)
 
@@ -50,6 +56,7 @@ The agent has four tools: `read_file`, `list_directory` (auto-approved), `write_
 ```toml
 default_model = "qwen3.5:latest"
 # compact_threshold_chars = 80000  # auto-compact context beyond this size
+# ollama_num_ctx = 16384           # context window requested from Ollama (its default is ~4k)
 # anthropic_api_key = "sk-ant-..."
 # openai_api_key = "sk-..."
 # openai_base_url = "https://api.openai.com/v1"   # any OpenAI-compatible server
@@ -60,4 +67,6 @@ default_model = "qwen3.5:latest"
 
 `cargo run --example smoke [model_id]` exercises the provider layer end-to-end (discovery → streaming → tool call → result → final answer) without the TUI.
 
-Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic/OpenAI, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model; `src/app.rs` owns the agent loop and approval state machine; `src/ui.rs` is pure rendering.
+Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic/OpenAI, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model; `src/app.rs` owns the agent loop and approval state machine; `src/ui.rs` renders with a per-entry line cache so cost stays flat as conversations grow.
+
+Provider details: transient failures (429/5xx) are retried with backoff honoring `Retry-After`; Anthropic requests use prompt caching (system, tools, and conversation tail breakpoints); truncated responses (`max_tokens`/`length`) are surfaced in the transcript; the status bar shows real token usage reported by the provider.

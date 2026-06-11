@@ -19,6 +19,11 @@ dirs = "5"
 textwrap = "0.16"
 pulldown-cmark = { version = "0.13", default-features = false }
 tui-textarea = "0.7"
+unicode-width = "0.2"
+similar = "2"
+regex = "1"
+globset = "0.4"
+ignore = "0.4"
 
 [profile.release]
 lto = true

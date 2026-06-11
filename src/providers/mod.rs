@@ -64,12 +64,26 @@ pub struct ToolDef {
     pub schema: Value,
 }
 
+/// Token counts reported by the provider for one request. `input_tokens`
+/// includes cache reads/writes, i.e. it reflects the full context size.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// Events emitted by a streaming chat request. Text streams incrementally;
 /// tool calls are accumulated by the provider and delivered complete.
+/// `stop_reason` is normalized across providers: `Some("length")` means the
+/// response was truncated by the output-token limit.
 #[derive(Debug)]
 pub enum ChatEvent {
     TextDelta(String),
-    Completed { tool_calls: Vec<ToolCall> },
+    Completed {
+        tool_calls: Vec<ToolCall>,
+        stop_reason: Option<String>,
+        usage: Option<Usage>,
+    },
     Error(String),
 }
 

@@ -1,5 +1,5 @@
 use super::sse;
-use super::{ChatEvent, ChatRequest, Config, Message, ToolCall};
+use super::{ChatEvent, ChatRequest, Config, Message, ToolCall, Usage};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -17,6 +17,7 @@ pub async fn stream_chat(
     let mut body = json!({
         "model": req.model.id,
         "stream": true,
+        "stream_options": {"include_usage": true},
         "messages": to_wire_messages(&req.system, &req.messages),
         "tools": req.tools.iter().map(|t| json!({
             "type": "function",
@@ -31,16 +32,16 @@ pub async fn stream_chat(
         body.as_object_mut().unwrap().remove("tools");
     }
 
-    let response = reqwest::Client::new()
+    let request = reqwest::Client::new()
         .post(format!("{}/chat/completions", config.openai_base_url))
         .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await?;
-    let response = sse::check_status(response).await?;
+        .json(&body);
+    let response = sse::check_status(sse::send_retrying(request).await?).await?;
 
     // Tool call name/arguments arrive as fragments keyed by index.
     let mut pending: Vec<(String, String, String)> = Vec::new(); // (id, name, args buffer)
+    let mut stop_reason: Option<String> = None;
+    let mut usage: Option<Usage> = None;
 
     sse::for_each_data(response, |data| {
         if data == "[DONE]" {
@@ -50,7 +51,17 @@ pub async fn stream_chat(
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
-        let delta = &event["choices"][0]["delta"];
+        if let Some(u) = event["usage"].as_object() {
+            usage = Some(Usage {
+                input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+            });
+        }
+        let choice = &event["choices"][0];
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            stop_reason = Some(reason.to_owned());
+        }
+        let delta = &choice["delta"];
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
                 let _ = tx.send(ChatEvent::TextDelta(text.to_owned()));
@@ -87,7 +98,11 @@ pub async fn stream_chat(
         })
         .collect();
 
-    let _ = tx.send(ChatEvent::Completed { tool_calls });
+    let _ = tx.send(ChatEvent::Completed {
+        tool_calls,
+        stop_reason,
+        usage,
+    });
     Ok(())
 }
 
@@ -118,6 +133,7 @@ pub async fn list_models(config: &Config) -> Result<Vec<String>> {
                 && !id.contains("image")
                 && !id.contains("realtime")
                 && !id.contains("transcribe")
+                && !id.contains("moderation")
         })
         .collect();
     ids.sort();
