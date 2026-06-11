@@ -241,3 +241,21 @@ async fn image_paths_in_the_message_become_attachments() {
     assert!(content.text().contains("describe"));
     std::fs::remove_file(img).ok();
 }
+
+#[tokio::test]
+async fn dropping_a_file_onto_the_terminal_stages_it() {
+    let (mut app, _rx) = test_app();
+    let img = std::env::temp_dir().join(format!("shaltai-drop-{}.png", std::process::id()));
+    std::fs::write(&img, b"fake").unwrap();
+
+    // A drag-and-drop arrives as a paste event containing only the path.
+    app.paste(&img.display().to_string());
+    assert_eq!(app.pending_images.len(), 1);
+    assert!(app.input_is_empty(), "the path must not land in the input");
+
+    // Ordinary pasted text still goes into the editor.
+    app.paste("hello world");
+    assert!(!app.input_is_empty());
+
+    std::fs::remove_file(img).ok();
+}

@@ -8,34 +8,93 @@ use std::path::{Path, PathBuf};
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
-/// Find existing image files referenced in a message. Handles the forms
-/// terminals produce on drag-and-drop: backslash-escaped spaces and
-/// quoted paths, plus `~` expansion.
+/// Find existing image files referenced in a message: whitespace-separated
+/// tokens plus whole lines (filenames can contain unusual whitespace —
+/// macOS screenshots use a narrow no-break space before "PM").
 pub fn extract_image_paths(text: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for candidate in tokenize(text)
+        .iter()
+        .map(String::as_str)
+        .chain(text.lines())
+    {
+        if let Some(path) = as_image_path(candidate) {
+            if !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// A paste that consists solely of existing image paths — what terminals
+/// deliver when files are dragged onto the window. Empty when the paste is
+/// anything else (then it's treated as ordinary text).
+pub fn dropped_images(text: &str) -> Vec<PathBuf> {
+    // Single dropped file first: the whole paste as one path survives any
+    // whitespace inside the filename.
+    if let Some(path) = as_image_path(text) {
+        return vec![path];
+    }
+    // Multiple files: every token must resolve to an existing image.
+    let tokens = tokenize(text);
+    if !tokens.is_empty() {
+        let paths: Vec<PathBuf> = tokens.iter().filter_map(|t| as_image_path(t)).collect();
+        if paths.len() == tokens.len() {
+            return paths;
+        }
+    }
+    Vec::new()
+}
+
+/// Resolve one candidate to an existing image file: trims, strips matching
+/// quotes, unescapes backslash-escapes, expands `~`.
+fn as_image_path(candidate: &str) -> Option<PathBuf> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unquoted = strip_quotes(trimmed);
+    let mut unescaped = String::with_capacity(unquoted.len());
+    let mut chars = unquoted.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+    let path = expand_home(&unescaped);
+    let is_image = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()));
+    (is_image && path.is_file()).then_some(path)
+}
+
+fn strip_quotes(s: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = s.strip_prefix(quote).and_then(|s| s.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    s
+}
+
+/// Shell-style tokens: backslash-escapes and quotes keep whitespace inside
+/// one token.
+fn tokenize(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
     let mut token = String::new();
     let mut quote: Option<char> = None;
     let mut chars = text.chars().peekable();
 
-    let finish = |token: &mut String, out: &mut Vec<PathBuf>| {
-        if token.is_empty() {
-            return;
-        }
-        let path = expand_home(token);
-        if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-            && path.is_file()
-        {
-            out.push(path);
-        }
-        token.clear();
-    };
-
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
+                token.push('\\');
                 if let Some(&next) = chars.peek() {
                     token.push(next);
                     chars.next();
@@ -46,12 +105,18 @@ pub fn extract_image_paths(text: &str) -> Vec<PathBuf> {
                 Some(_) => token.push(c),
                 None => quote = Some(c),
             },
-            c if c.is_whitespace() && quote.is_none() => finish(&mut token, &mut out),
+            c if c.is_whitespace() && quote.is_none() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
             c => token.push(c),
         }
     }
-    finish(&mut token, &mut out);
-    out
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
 }
 
 fn expand_home(token: &str) -> PathBuf {
@@ -187,6 +252,46 @@ mod tests {
 
         std::fs::remove_file(plain).ok();
         std::fs::remove_file(spaced).ok();
+    }
+
+    #[test]
+    fn handles_macos_screenshot_filenames_with_narrow_spaces() {
+        // macOS names screenshots like "Screenshot … at 2.55.01 PM.png" where
+        // the space before "PM" is U+202F — Unicode whitespace, so plain
+        // token-splitting would break the path apart.
+        let name = format!("Screenshot {} at 2.55.01\u{202f}PM.png", std::process::id());
+        let path = std::env::temp_dir().join(&name);
+        std::fs::write(&path, b"x").unwrap();
+
+        // A drop pastes the bare path (whole-paste resolution).
+        assert_eq!(
+            dropped_images(&path.display().to_string()),
+            vec![path.clone()]
+        );
+        // Typed on its own line inside a longer message (line resolution).
+        let msg = format!("what is this?\n{}", path.display());
+        assert_eq!(extract_image_paths(&msg), vec![path.clone()]);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn dropped_images_accepts_only_pure_path_pastes() {
+        let a = temp_image("drop-a.png");
+        let b = temp_image("drop-b.png");
+
+        // Single and multi-file drops are recognized.
+        assert_eq!(dropped_images(&a.display().to_string()), vec![a.clone()]);
+        let multi = format!("{} {}", a.display(), b.display());
+        assert_eq!(dropped_images(&multi), vec![a.clone(), b.clone()]);
+
+        // Prose containing a path is ordinary text, not a drop.
+        let prose = format!("see {} for details", a.display());
+        assert!(dropped_images(&prose).is_empty());
+        assert!(dropped_images("just some pasted text").is_empty());
+
+        std::fs::remove_file(a).ok();
+        std::fs::remove_file(b).ok();
     }
 
     #[test]

@@ -626,10 +626,27 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
-        if self.mode == Mode::Input {
-            self.textarea
-                .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+        if self.mode != Mode::Input {
+            return;
         }
+        // Files dragged onto the terminal arrive as a paste of their paths:
+        // stage them as attachments instead of cluttering the input.
+        let dropped = images::dropped_images(text);
+        if !dropped.is_empty() {
+            for path in dropped {
+                match images::load_image(&path) {
+                    Ok((name, data)) => {
+                        self.transcript
+                            .push(Entry::Info(format!("image staged: {name} — Esc clears")));
+                        self.pending_images.push((name, data));
+                    }
+                    Err(e) => self.transcript.push(Entry::Error(format!("{e:#}"))),
+                }
+            }
+            return;
+        }
+        self.textarea
+            .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
     // ---- image attachments ----
