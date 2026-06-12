@@ -2,11 +2,23 @@
 
 A Claude Code-style agentic coding TUI in Rust. Chat with a model, let it read/write files and run shell commands (with approval), and switch between providers — Anthropic, OpenAI (or any OpenAI-compatible endpoint), and local Ollama — mid-conversation.
 
-## Run
+## Install
+
+Prebuilt binary (macOS arm64/x86_64, Linux x86_64), no Rust toolchain needed:
 
 ```sh
-cargo run --release
+curl -fsSL https://github.com/babushkai/shaltaiboltai/releases/latest/download/install.sh | sh
 ```
+
+It installs to `~/.local/bin`; override with `SHALTAI_INSTALL_DIR`, or pin a tag with `SHALTAI_VERSION=v0.1.0`. Then run `shaltaiboltai`.
+
+From source (any platform with a Rust toolchain):
+
+```sh
+cargo install --git https://github.com/babushkai/shaltaiboltai --locked
+```
+
+Or clone and `cargo run --release`.
 
 Providers are auto-discovered at startup:
 

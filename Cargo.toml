@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Multi-provider agentic coding TUI (Anthropic, OpenAI, Ollama)"
 license = "MIT"
+repository = "https://github.com/babushkai/shaltaiboltai"
+homepage = "https://github.com/babushkai/shaltaiboltai"
+readme = "README.md"
+keywords = ["tui", "llm", "agent", "ai", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 ratatui = "0.29"
