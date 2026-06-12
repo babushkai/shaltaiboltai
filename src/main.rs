@@ -172,11 +172,14 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
 /// Wheel/trackpad scrolling, in any mode. Mouse capture trades away the
 /// terminal's native click-drag selection — hold Shift (Linux/Windows) or
 /// Option (macOS) to select text while the TUI is running.
+///
+/// One line per event: trackpads emit a dense, velocity-scaled event stream,
+/// so larger steps multiply the speed and feel chunky rather than faster.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_from_bottom += 3,
+        MouseEventKind::ScrollUp => app.scroll_from_bottom += 1,
         MouseEventKind::ScrollDown => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(3)
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1)
         }
         _ => {}
     }
