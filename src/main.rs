@@ -132,6 +132,13 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
                 app.attach_clipboard_image();
                 return;
             }
+            // Shell-style line kill; clears the whole input rather than
+            // tui-textarea's default delete-to-line-head.
+            KeyCode::Char('u') => {
+                app.clear_input();
+                app.note_input_changed();
+                return;
+            }
             _ => {}
         }
     }

@@ -53,6 +53,7 @@ Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down
 | `Ctrl+V` | attach an image from the clipboard (macOS) — or just drag/type an image path into the message |
 | `Alt+Enter` | insert newline (multi-line input; pasting multi-line text also works) |
 | `Up` / `Down` | recall previous prompts (when the input is empty), shell-style |
+| `Ctrl+U` | clear the input |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
 | `Esc` | cancel an in-flight response or running tool |
 | `y` / `a` / `n` | approve / always-allow-this-tool / deny a tool call |
