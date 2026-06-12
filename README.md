@@ -56,11 +56,13 @@ Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
 | `Esc` | cancel an in-flight response or running tool |
 | `y` / `a` / `n` | approve / always-allow-this-tool / deny a tool call |
-| `PgUp` / `PgDn` | scroll transcript |
+| `PgUp` / `PgDn` or mouse wheel | scroll transcript |
 | `/resume` | pick a saved session to continue |
 | `/new` or `/clear` | start a new session (the old one stays saved) |
 | `/compact` | summarize the conversation to shrink context |
 | `Ctrl+C` or `/quit` | exit |
+
+The trackpad / mouse wheel scrolls the transcript. Because the TUI captures mouse reporting for this, hold `Option` (macOS) or `Shift` (Linux/Windows) while dragging to use the terminal's native text selection.
 
 Messages can include images for vision models: press `Ctrl+V` to stage the clipboard image (screenshots, copied images), or reference a `.png`/`.jpg`/`.gif`/`.webp` path in your message (drag-and-drop onto the terminal works — escaped and quoted paths are handled). Staged attachments show in the input border; `Esc` clears them. Images go out as Anthropic image blocks, OpenAI data-URLs, or Ollama's native `images` field, capped at 5MB each.
 

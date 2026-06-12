@@ -788,7 +788,7 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.transcript.push(Entry::Info(format!(
-                    "{commands}\nkeys: Ctrl+P models · Alt+Enter newline · Up/Down input history · PgUp/PgDn scroll · Esc cancel · Ctrl+C quit"
+                    "{commands}\nkeys: Ctrl+P models · Alt+Enter newline · Up/Down input history · PgUp/PgDn or mouse wheel scroll · Esc cancel · Ctrl+C quit"
                 )));
             }
             _ => unreachable!("registry and dispatch are matched"),

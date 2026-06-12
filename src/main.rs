@@ -3,8 +3,8 @@ use shaltaiboltai::{app, config, ui};
 use app::{App, AppEvent, Mode};
 use config::Config;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use futures_util::StreamExt;
@@ -42,9 +42,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     let result = run(&mut terminal).await;
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -67,6 +71,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
             }
             Some(Ok(event)) = term_events.next() => match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
+                Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 Event::Paste(text) => app.paste(&text),
                 _ => {}
             },
@@ -161,6 +166,19 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
                 app.note_input_changed();
             }
         }
+    }
+}
+
+/// Wheel/trackpad scrolling, in any mode. Mouse capture trades away the
+/// terminal's native click-drag selection — hold Shift (Linux/Windows) or
+/// Option (macOS) to select text while the TUI is running.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_from_bottom += 3,
+        MouseEventKind::ScrollDown => {
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(3)
+        }
+        _ => {}
     }
 }
 
