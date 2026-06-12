@@ -9,8 +9,38 @@ use crossterm::event::{
 use crossterm::execute;
 use futures_util::StreamExt;
 
+const HELP: &str = "\
+shaltaiboltai — a multi-provider agentic coding TUI
+
+USAGE:
+    shaltaiboltai [OPTIONS]
+
+OPTIONS:
+    -h, --help       Print this help and exit
+    -V, --version    Print version and exit
+
+With no options it launches the interactive TUI. Configure providers via
+ANTHROPIC_API_KEY / OPENAI_API_KEY / a running Ollama, or a logged-in
+`claude` / `codex` CLI for subscription use. See the README for details.";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Handle non-interactive flags before touching the terminal, so the binary
+    // behaves like a normal CLI in pipes and scripts.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{HELP}");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if let Some(unknown) = args.first() {
+        eprintln!("error: unrecognized argument `{unknown}`\n\n{HELP}");
+        std::process::exit(2);
+    }
+
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal).await;
