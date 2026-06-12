@@ -261,3 +261,18 @@ async fn dropping_a_file_onto_the_terminal_stages_it() {
 
     std::fs::remove_file(img).ok();
 }
+
+#[tokio::test]
+async fn clear_input_wipes_the_text_and_exits_history_recall() {
+    let (mut app, _rx) = test_app();
+
+    app.textarea.insert_str("first prompt");
+    app.submit_input(); // remembered into input history (no model → no request)
+    app.input_history_prev();
+    assert!(!app.input_is_empty());
+    assert!(app.history_recall_active());
+
+    app.clear_input();
+    assert!(app.input_is_empty());
+    assert!(!app.history_recall_active());
+}

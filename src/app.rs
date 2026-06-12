@@ -704,6 +704,14 @@ impl App {
         self.textarea.lines().iter().all(|l| l.is_empty())
     }
 
+    /// Ctrl+U: wipe the whole input and leave history recall, so a subsequent
+    /// Up starts from the most recent entry again.
+    pub fn clear_input(&mut self) {
+        self.textarea = make_textarea(&self.theme);
+        self.input_history_pos = None;
+        self.input_draft.clear();
+    }
+
     pub fn history_recall_active(&self) -> bool {
         self.input_history_pos.is_some()
     }
@@ -788,7 +796,7 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.transcript.push(Entry::Info(format!(
-                    "{commands}\nkeys: Ctrl+P models · Alt+Enter newline · Up/Down input history · PgUp/PgDn or mouse wheel scroll · Esc cancel · Ctrl+C quit"
+                    "{commands}\nkeys: Ctrl+P models · Alt+Enter newline · Up/Down input history · Ctrl+U clear input · PgUp/PgDn or mouse wheel scroll · Esc cancel · Ctrl+C quit"
                 )));
             }
             _ => unreachable!("registry and dispatch are matched"),
