@@ -1,5 +1,8 @@
 # shaltaiboltai
 
+> [!NOTE]
+> This project is built along with Claude Fable, which is now regulated by US government. 
+
 A Claude Code-style agentic coding TUI in Rust. Chat with a model, let it read/write files and run shell commands (with approval), and switch between providers — Anthropic, OpenAI (or any OpenAI-compatible endpoint), and local Ollama — mid-conversation.
 
 ## Install
