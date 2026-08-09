@@ -34,7 +34,7 @@ pub const MOCHA: Theme = Theme {
     surface: Some(rgb(0x313244)),
     border: rgb(0x45475a),
     fg: rgb(0xcdd6f4),
-    dim: rgb(0x9399b2),
+    dim: rgb(0xa6adc8),
     accent: rgb(0xcba6f7),
     accent2: rgb(0x89b4fa),
     success: rgb(0xa6e3a1),
@@ -49,7 +49,7 @@ pub const TOKYO_NIGHT: Theme = Theme {
     surface: Some(rgb(0x292e42)),
     border: rgb(0x3b4261),
     fg: rgb(0xc0caf5),
-    dim: rgb(0x787c99),
+    dim: rgb(0x9aa5ce),
     accent: rgb(0x7aa2f7),
     accent2: rgb(0xbb9af7),
     success: rgb(0x9ece6a),
@@ -64,7 +64,7 @@ pub const ROSE_PINE: Theme = Theme {
     surface: Some(rgb(0x26233a)),
     border: rgb(0x403d52),
     fg: rgb(0xe0def4),
-    dim: rgb(0x908caa),
+    dim: rgb(0xa19bbd),
     accent: rgb(0xebbcba),
     accent2: rgb(0xc4a7e7),
     success: rgb(0x9ccfd8),
@@ -79,7 +79,7 @@ pub const NORD: Theme = Theme {
     surface: Some(rgb(0x3b4252)),
     border: rgb(0x4c566a),
     fg: rgb(0xd8dee9),
-    dim: rgb(0x8a92a5),
+    dim: rgb(0xaeb6c4),
     accent: rgb(0x88c0d0),
     accent2: rgb(0x81a1c1),
     success: rgb(0xa3be8c),
@@ -94,7 +94,7 @@ pub const GRUVBOX: Theme = Theme {
     surface: Some(rgb(0x3c3836)),
     border: rgb(0x504945),
     fg: rgb(0xebdbb2),
-    dim: rgb(0xa89984),
+    dim: rgb(0xbdae93),
     accent: rgb(0x83a598),
     accent2: rgb(0xd3869b),
     success: rgb(0xb8bb26),
@@ -109,7 +109,7 @@ pub const LATTE: Theme = Theme {
     surface: Some(rgb(0xe6e9ef)),
     border: rgb(0xbcc0cc),
     fg: rgb(0x4c4f69),
-    dim: rgb(0x8c8fa1),
+    dim: rgb(0x5c5f77),
     accent: rgb(0x8839ef),
     accent2: rgb(0x1e66f5),
     success: rgb(0x40a02b),
@@ -180,6 +180,38 @@ mod tests {
             // A theme either keeps the terminal's colors entirely or defines
             // both the base and the elevated surface.
             assert_eq!(t.bg.is_some(), t.surface.is_some(), "{}", t.name);
+        }
+    }
+
+    #[test]
+    fn muted_text_remains_readable_on_elevated_surfaces() {
+        fn luminance(color: Color) -> Option<f64> {
+            let Color::Rgb(r, g, b) = color else {
+                return None;
+            };
+            let channel = |value: u8| {
+                let value = f64::from(value) / 255.0;
+                if value <= 0.039_28 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            Some(0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b))
+        }
+
+        for theme in all() {
+            let (Some(surface), Some(dim)) =
+                (theme.surface.and_then(luminance), luminance(theme.dim))
+            else {
+                continue;
+            };
+            let ratio = (surface.max(dim) + 0.05) / (surface.min(dim) + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "{} muted contrast is {ratio:.2}:1",
+                theme.name
+            );
         }
     }
 }

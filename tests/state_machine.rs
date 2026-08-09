@@ -21,11 +21,15 @@ fn offline_config() -> Config {
 }
 
 fn test_app() -> (App, UnboundedReceiver<AppEvent>) {
+    test_app_with_config(offline_config())
+}
+
+fn test_app_with_config(config: Config) -> (App, UnboundedReceiver<AppEvent>) {
     // Never touch the user's real data dir (theme, sessions, input history).
     let tmp = std::env::temp_dir().join(format!("shaltai-sm-{}", std::process::id()));
     std::env::set_var("SHALTAIBOLTAI_DATA_DIR", tmp);
     let (tx, rx) = unbounded_channel();
-    (App::new(offline_config(), tx), rx)
+    (App::new(config, tx), rx)
 }
 
 fn write_call(id: &str) -> ToolCall {
@@ -129,6 +133,7 @@ async fn compaction_result_for_an_old_session_is_discarded() {
 
     app.history.push(Message::User("current work".into()));
     let before = app.history.len();
+    app.compacting = true;
 
     app.on_event(AppEvent::CompactionDone {
         session_id: "some-old-session".into(),
@@ -136,7 +141,10 @@ async fn compaction_result_for_an_old_session_is_discarded() {
     });
 
     assert_eq!(app.history.len(), before, "history must not be replaced");
-    assert!(!app.compacting);
+    assert!(
+        app.compacting,
+        "an old completion must not clear the current session's busy state"
+    );
 }
 
 #[tokio::test]
@@ -265,9 +273,13 @@ async fn dropping_a_file_onto_the_terminal_stages_it() {
 #[tokio::test]
 async fn clear_input_wipes_the_text_and_exits_history_recall() {
     let (mut app, _rx) = test_app();
+    app.model = Some(shaltaiboltai::providers::ModelEntry {
+        provider: shaltaiboltai::providers::ProviderKind::Ollama,
+        id: "test".into(),
+    });
 
     app.textarea.insert_str("first prompt");
-    app.submit_input(); // remembered into input history (no model → no request)
+    app.submit_input(); // successfully submitted prompts enter recall history
     app.input_history_prev();
     assert!(!app.input_is_empty());
     assert!(app.history_recall_active());
@@ -275,4 +287,198 @@ async fn clear_input_wipes_the_text_and_exits_history_recall() {
     app.clear_input();
     assert!(app.input_is_empty());
     assert!(!app.history_recall_active());
+}
+
+#[tokio::test]
+async fn draft_survives_model_discovery() {
+    let (mut app, _rx) = test_app();
+    app.discovering = true;
+    app.textarea
+        .insert_str("keep this carefully written prompt");
+
+    app.submit_input();
+
+    assert_eq!(
+        app.textarea.lines().join("\n"),
+        "keep this carefully written prompt"
+    );
+    assert!(app.history.is_empty());
+    assert!(app
+        .transcript
+        .iter()
+        .any(|entry| matches!(entry, shaltaiboltai::app::Entry::Error(text) if text.contains("draft is safe"))));
+}
+
+#[tokio::test]
+async fn refreshed_models_replace_an_unavailable_selection() {
+    use shaltaiboltai::providers::{ModelEntry, ProviderKind};
+    let (mut app, _rx) = test_app();
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "removed-model".into(),
+    });
+    app.discovering = true;
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: vec![ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
+        }],
+        finished: true,
+    });
+
+    assert!(!app.discovering);
+    assert_eq!(
+        app.model.as_ref().map(|model| model.id.as_str()),
+        Some("codex")
+    );
+}
+
+#[tokio::test]
+async fn dynamic_default_replaces_only_the_provisional_model() {
+    use shaltaiboltai::providers::{ModelEntry, ProviderKind};
+
+    let mut config = offline_config();
+    config.anthropic_api_key = Some("test-key".into());
+    config.default_model = Some("codex".into());
+    let (mut app, _rx) = test_app_with_config(config.clone());
+    assert!(
+        app.model.is_none(),
+        "an undiscovered explicit default must win"
+    );
+    assert!(
+        app.models
+            .iter()
+            .all(|model| model.provider == ProviderKind::Anthropic),
+        "static providers should be selectable immediately"
+    );
+
+    let discovered = vec![
+        app.models.first().cloned().unwrap(),
+        ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
+        },
+    ];
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: discovered.clone(),
+        finished: true,
+    });
+    assert_eq!(
+        app.model.as_ref().map(|model| model.id.as_str()),
+        Some("codex")
+    );
+
+    let (mut explicitly_selected, _rx) = test_app_with_config(config);
+    explicitly_selected.models = discovered.clone();
+    explicitly_selected.open_picker();
+    explicitly_selected.pick_model();
+    let picked = explicitly_selected.model.clone();
+    explicitly_selected.on_event(AppEvent::ModelsDiscovered {
+        models: discovered,
+        finished: true,
+    });
+    assert_eq!(
+        explicitly_selected
+            .model
+            .as_ref()
+            .map(|model| (model.id.as_str(), model.provider)),
+        picked
+            .as_ref()
+            .map(|model| (model.id.as_str(), model.provider))
+    );
+}
+
+#[tokio::test]
+async fn first_dynamic_provider_is_selectable_before_discovery_finishes() {
+    use shaltaiboltai::providers::{ModelEntry, ProviderKind};
+
+    let (mut app, _rx) = test_app();
+    assert!(app.discovering);
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: vec![ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
+        }],
+        finished: false,
+    });
+
+    assert!(app.discovering);
+    assert_eq!(
+        app.model.as_ref().map(|model| model.id.as_str()),
+        Some("codex")
+    );
+    assert!(app.models.iter().any(|model| model.id == "codex"));
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: Vec::new(),
+        finished: true,
+    });
+    assert!(!app.discovering);
+}
+
+#[tokio::test]
+async fn discovery_never_switches_provider_mid_agent_turn() {
+    use shaltaiboltai::providers::{ModelEntry, ProviderKind};
+
+    let mut config = offline_config();
+    config.anthropic_api_key = Some("test-key".into());
+    config.default_model = Some("codex".into());
+    let (mut app, _rx) = test_app_with_config(config);
+    let anthropic = app.models.first().cloned().unwrap();
+    app.model = Some(anthropic.clone());
+    app.mode = Mode::Streaming;
+    app.transcript
+        .push(shaltaiboltai::app::Entry::Assistant(String::new()));
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: vec![ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
+        }],
+        finished: false,
+    });
+    assert_eq!(
+        app.model.as_ref().map(|model| model.provider),
+        Some(ProviderKind::Anthropic)
+    );
+
+    app.on_event(AppEvent::Chat {
+        gen: 0,
+        event: completed(vec![write_call("same-turn-tool")]),
+    });
+    assert_eq!(app.mode, Mode::Approval);
+    app.deny_pending();
+    assert_eq!(app.mode, Mode::Streaming);
+    assert_eq!(
+        app.model.as_ref().map(|model| model.provider),
+        Some(ProviderKind::Anthropic),
+        "the tool follow-up must stay on the turn's original provider"
+    );
+
+    app.cancel_request();
+    assert_eq!(
+        app.model.as_ref().map(|model| model.provider),
+        Some(ProviderKind::Codex),
+        "the discovered default may apply once the turn ends"
+    );
+}
+
+#[tokio::test]
+async fn quitting_during_approval_repairs_the_tool_turn() {
+    let (mut app, _rx) = test_app();
+    app.on_event(AppEvent::Chat {
+        gen: 0,
+        event: completed(vec![write_call("quit-call")]),
+    });
+    assert_eq!(app.mode, Mode::Approval);
+
+    app.request_quit();
+
+    assert!(app.should_quit);
+    assert_eq!(app.mode, Mode::Input);
+    assert!(app.history.iter().any(|message| matches!(
+        message,
+        Message::ToolResult { call_id, is_error: true, .. } if call_id == "quit-call"
+    )));
 }

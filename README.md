@@ -48,7 +48,7 @@ Continuity across turns rides each CLI's own session (`claude --continue`, `code
 
 ## Keys & commands
 
-Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered. The statusline shows the model, agent state, working directory, git branch (refreshed even while idle), and live context usage with a fill percentage.
+Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered, and `/refresh` rediscovers providers. The statusline prioritizes the active state on narrow terminals, then adds the model, project, linked-worktree branch, and live context usage as space allows.
 
 | Key | Action |
 |---|---|
@@ -58,19 +58,23 @@ Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down
 | `Up` / `Down` | recall previous prompts (when the input is empty), shell-style |
 | `Ctrl+U` | clear the input |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
-| `Esc` | cancel an in-flight response or running tool |
-| `y` / `a` / `n` | approve / always-allow-this-tool / deny a tool call |
+| `F1` or `/help` | focused keyboard guide |
+| `Esc` | cancel an in-flight response or running tool (including CLI sub-agents) |
+| `y` / `a` / `n` | approve once / allow only this path, search, or exact command for the current session / deny |
+| `Up` / `Down`, `PgUp` / `PgDn` | scroll a tool approval preview while its actions stay pinned |
 | `PgUp` / `PgDn` or mouse wheel | scroll transcript |
+| `Ctrl+Home` / `Ctrl+End` | jump to the oldest / latest transcript line |
 | `/resume` | pick a saved session to continue |
 | `/new` or `/clear` | start a new session (the old one stays saved) |
 | `/compact` | summarize the conversation to shrink context |
+| `/refresh` | rediscover available models |
 | `Ctrl+C` or `/quit` | exit |
 
 The trackpad / mouse wheel scrolls the transcript. Because the TUI captures mouse reporting for this, hold `Option` (macOS) or `Shift` (Linux/Windows) while dragging to use the terminal's native text selection.
 
 Messages can include images for vision models: press `Ctrl+V` to stage the clipboard image (screenshots, copied images), or reference a `.png`/`.jpg`/`.gif`/`.webp` path in your message (drag-and-drop onto the terminal works — escaped and quoted paths are handled). Staged attachments show in the input border; `Esc` clears them. Images go out as Anthropic image blocks, OpenAI data-URLs, or Ollama's native `images` field, capped at 5MB each.
 
-Assistant responses render markdown (heading hierarchy, bold/italic, accent-bulleted lists, styled blockquotes, and fenced code as full-width surface cards).
+The transcript uses a quiet activity rail with explicit `YOU`, `ASSISTANT`, and tool-state headers, so long agent runs remain scannable. Assistant responses render markdown (heading hierarchy, bold/italic, accent-bulleted lists, styled blockquotes, and fenced code as full-width surface cards).
 
 ## Themes
 
@@ -84,8 +88,8 @@ Conversations auto-save after every completed turn to `~/Library/Application Sup
 
 The agent has seven tools:
 
-- **Read-only** — `read_file`, `list_directory`, `grep` (regex content search, gitignore-aware), `glob` (find files by pattern). Auto-approved **only inside the working directory**; reads outside it (dotfiles, other projects, `/etc`…) always prompt before contents are sent to a provider.
-- **Mutating** — `write_file`, `edit_file` (exact find/replace, must match uniquely), `run_command`. Always prompt; the approval dialog shows a unified diff of what a file change will do. `a` answers "always allow this tool" for the rest of the session.
+- **Read-only** — `read_file`, `list_directory`, `grep` (regex content search, gitignore-aware), `glob` (find files by pattern). Auto-approved **only inside the working directory** after resolving symlinks; reads outside it (dotfiles, other projects, `/etc`…) always prompt before contents are sent to a provider.
+- **Mutating** — `write_file`, `edit_file` (exact find/replace, must match uniquely), `run_command`. Always prompt; the approval dialog shows a unified diff of what a file change will do. `a` remembers only the displayed path/search or exact command for the current conversation; grants are cleared by `/new`, `/resume`, and exit.
 
 Commands time out after 60s and tool output is capped at 32 KB. If `AGENTS.md` or `CLAUDE.md` exists in the working directory it is loaded into the system prompt automatically.
 
@@ -109,6 +113,6 @@ default_model = "qwen3.5:latest"
 
 `cargo run --example smoke [model_id]` exercises the provider layer end-to-end (discovery → streaming → tool call → result → final answer) without the TUI.
 
-Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic/OpenAI, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model; `src/app.rs` owns the agent loop and approval state machine; `src/ui.rs` renders with a per-entry line cache so cost stays flat as conversations grow.
+Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic/OpenAI, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model. Static models appear immediately and dynamic providers publish independently as their probes finish. `src/app.rs` owns the agent loop, approval state machine, and cancellable request/compaction tasks; `src/ui.rs` uses dirty-entry caching plus cumulative line offsets, so each redraw parses only changed content and jumps directly to the visible viewport as conversations grow.
 
 Provider details: transient failures (429/5xx) are retried with backoff honoring `Retry-After`; Anthropic requests use prompt caching (system, tools, and conversation tail breakpoints); truncated responses (`max_tokens`/`length`) are surfaced in the transcript; the status bar shows real token usage reported by the provider.

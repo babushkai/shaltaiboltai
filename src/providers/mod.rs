@@ -5,8 +5,11 @@ pub mod openai;
 mod sse;
 
 use crate::config::Config;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,8 +182,15 @@ pub async fn stream_chat(config: Config, req: ChatRequest, tx: UnboundedSender<C
 /// Discover models from every configured provider. Failures are silent per
 /// provider (e.g. Ollama not running) so the rest of the list still works.
 pub async fn discover_models(config: Config) -> Vec<ModelEntry> {
-    let mut models = Vec::new();
+    let mut models = immediate_models(&config);
+    discover_dynamic_models(&config, |batch| models.extend(batch)).await;
+    models
+}
 
+/// Models known without I/O. Publishing these immediately lets configured
+/// Anthropic users start typing while dynamic provider discovery continues.
+pub fn immediate_models(config: &Config) -> Vec<ModelEntry> {
+    let mut models = Vec::new();
     if config.anthropic_api_key.is_some() {
         for id in [
             "claude-fable-5",
@@ -194,42 +204,119 @@ pub async fn discover_models(config: Config) -> Vec<ModelEntry> {
             });
         }
     }
+    models
+}
+
+/// Discover providers that require I/O. The probes run concurrently and have
+/// provider-specific timeouts so one unavailable endpoint cannot block the
+/// others indefinitely.
+pub async fn discover_dynamic_models(config: &Config, mut publish: impl FnMut(Vec<ModelEntry>)) {
+    type Probe<'a> = Pin<Box<dyn Future<Output = Vec<ModelEntry>> + Send + 'a>>;
+    let mut probes = FuturesUnordered::<Probe<'_>>::new();
+
     if config.openai_api_key.is_some() {
-        match openai::list_models(&config).await {
-            Ok(ids) => models.extend(ids.into_iter().map(|id| ModelEntry {
-                provider: ProviderKind::OpenAi,
-                id,
-            })),
-            Err(_) => {
-                for id in ["gpt-5.4", "gpt-5.4-mini"] {
-                    models.push(ModelEntry {
+        probes.push(Box::pin(async move {
+            let ids = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                openai::list_models(config),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            match ids {
+                Some(ids) => ids
+                    .into_iter()
+                    .map(|id| ModelEntry {
+                        provider: ProviderKind::OpenAi,
+                        id,
+                    })
+                    .collect(),
+                None => ["gpt-5.4", "gpt-5.4-mini"]
+                    .into_iter()
+                    .map(|id| ModelEntry {
                         provider: ProviderKind::OpenAi,
                         id: id.into(),
-                    });
-                }
+                    })
+                    .collect(),
             }
-        }
-    }
-    if let Ok(ids) = ollama::list_models(&config).await {
-        models.extend(ids.into_iter().map(|id| ModelEntry {
-            provider: ProviderKind::Ollama,
-            id,
         }));
     }
-    // Subscription-backed sub-agents, available when their CLI is installed
-    // and logged in.
-    if cli_agent::claude_available().await {
-        models.push(ModelEntry {
-            provider: ProviderKind::ClaudeCode,
-            id: "claude-code".into(),
-        });
+
+    probes.push(Box::pin(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            ollama::list_models(config),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| ModelEntry {
+            provider: ProviderKind::Ollama,
+            id,
+        })
+        .collect()
+    }));
+
+    probes.push(Box::pin(async {
+        if cli_agent::claude_available().await {
+            vec![ModelEntry {
+                provider: ProviderKind::ClaudeCode,
+                id: "claude-code".into(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }));
+    probes.push(Box::pin(async {
+        if cli_agent::codex_available().await {
+            vec![ModelEntry {
+                provider: ProviderKind::Codex,
+                id: "codex".into(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }));
+
+    // Publish each provider as soon as its own bounded probe completes. A fast
+    // local model is no longer hidden behind an unrelated slow endpoint.
+    while let Some(models) = probes.next().await {
+        if !models.is_empty() {
+            publish(models);
+        }
     }
-    if cli_agent::codex_available().await {
-        models.push(ModelEntry {
-            provider: ProviderKind::Codex,
-            id: "codex".into(),
-        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(anthropic_api_key: Option<&str>) -> Config {
+        Config {
+            anthropic_api_key: anthropic_api_key.map(str::to_owned),
+            openai_api_key: None,
+            openai_base_url: "http://127.0.0.1:9".into(),
+            ollama_host: "http://127.0.0.1:9".into(),
+            default_model: None,
+            compact_threshold_chars: 80_000,
+            ollama_num_ctx: 16_384,
+            theme: None,
+            claude_code_bypass_permissions: false,
+            codex_full_access: false,
+        }
     }
 
-    models
+    #[test]
+    fn immediate_models_exposes_only_configured_static_models() {
+        assert!(immediate_models(&config(None)).is_empty());
+
+        let models = immediate_models(&config(Some("test-key")));
+        assert_eq!(models.len(), 4);
+        assert!(models
+            .iter()
+            .all(|model| model.provider == ProviderKind::Anthropic));
+        assert_eq!(models[0].id, "claude-fable-5");
+    }
 }

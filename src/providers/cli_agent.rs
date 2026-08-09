@@ -14,11 +14,17 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Whether the `claude` CLI is installed and responds. Cheap version probe with
 /// a short timeout so discovery never hangs.
 pub async fn claude_available() -> bool {
-    let probe = tokio::process::Command::new("claude")
+    command_available("claude").await
+}
+
+async fn command_available(name: &str) -> bool {
+    let mut command = tokio::process::Command::new(name);
+    command
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .kill_on_drop(true);
+    let probe = command.status();
     matches!(
         tokio::time::timeout(std::time::Duration::from_secs(3), probe).await,
         Ok(Ok(status)) if status.success()
@@ -240,15 +246,7 @@ fn user_message_count(messages: &[Message]) -> usize {
 // ---- Codex (ChatGPT subscription) ----
 
 pub async fn codex_available() -> bool {
-    let probe = tokio::process::Command::new("codex")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(3), probe).await,
-        Ok(Ok(status)) if status.success()
-    )
+    command_available("codex").await
 }
 
 pub async fn stream_chat_codex(

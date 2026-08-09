@@ -8,9 +8,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
 const MAX_INPUT_LINES: u16 = 8;
@@ -25,7 +26,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    let input_height = (app.textarea.lines().len() as u16).clamp(1, MAX_INPUT_LINES) + 2;
+    let desired_input = (app.textarea.lines().len() as u16).clamp(1, MAX_INPUT_LINES) + 2;
+    // Preserve at least a status row and one transcript row on short terminals.
+    let input_height = desired_input.min(frame.area().height.saturating_sub(2).max(1));
     let [transcript_area, status_area, input_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -45,6 +48,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::SessionPicker => draw_session_picker(frame, app),
         Mode::ThemePicker => draw_theme_picker(frame, app),
         Mode::Approval => draw_approval(frame, app),
+        Mode::Help => draw_help(frame, app),
         _ => {}
     }
 }
@@ -58,20 +62,36 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(border));
-    if !app.pending_images.is_empty() {
-        block = block.title(Line::styled(
-            format!(
-                " ⊞ {} image{} attached — Esc clears ",
-                app.pending_images.len(),
-                if app.pending_images.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-            ),
-            Style::new().fg(theme.accent2),
+        .border_style(Style::new().fg(border))
+        .title(Line::styled(
+            " compose ",
+            Style::new().fg(border).add_modifier(Modifier::BOLD),
         ));
+    if !app.pending_images.is_empty() {
+        block = block.title(
+            Line::styled(
+                format!(
+                    " ⊞ {} image{} · Esc clears ",
+                    app.pending_images.len(),
+                    if app.pending_images.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ),
+                Style::new().fg(theme.accent2),
+            )
+            .alignment(Alignment::Right),
+        );
+    }
+    if area.width >= 52 {
+        block = block.title_bottom(
+            Line::styled(
+                " Enter send · Alt+Enter newline · / commands ",
+                Style::new().fg(theme.dim),
+            )
+            .alignment(Alignment::Right),
+        );
     }
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
@@ -80,69 +100,105 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(&app.textarea, area);
 }
 
-/// Renders the transcript through a per-entry line cache: only new entries
-/// and the final (possibly streaming) entry are re-rendered each frame, so
-/// cost stays constant as the conversation grows.
+/// Renders the transcript through a per-entry line cache with cumulative line
+/// offsets. Only dirty/new entries are parsed, and locating the viewport is a
+/// binary search rather than a walk from the beginning of the conversation.
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     // Borders (2) + horizontal padding (2).
     let width = area.width.saturating_sub(4).max(10) as usize;
+    let previous_total = app.render_cache_total_lines;
+    let preserve_viewport = app.scroll_from_bottom > 0
+        && !app.render_cache.is_empty()
+        && app.render_cache_width == width
+        && app.render_cache_rev == app.transcript_rev
+        && app.render_cache.len() <= app.transcript.len();
 
     if app.render_cache_width != width || app.render_cache_rev != app.transcript_rev {
         app.render_cache.clear();
+        app.render_cache_starts.clear();
+        app.render_cache_total_lines = 0;
         app.render_cache_width = width;
         app.render_cache_rev = app.transcript_rev;
+        app.transcript_dirty_from = None;
     }
     if app.render_cache.len() > app.transcript.len() {
         app.render_cache.clear();
+        app.render_cache_starts.clear();
+        app.render_cache_total_lines = 0;
+        app.transcript_dirty_from = None;
+    }
+    if let Some(dirty) = app.transcript_dirty_from.take() {
+        let dirty = dirty.min(app.render_cache.len());
+        if dirty < app.render_cache.len() {
+            app.render_cache.truncate(dirty);
+            app.render_cache_starts.truncate(dirty);
+            app.render_cache_total_lines = dirty.checked_sub(1).map_or(0, |previous| {
+                app.render_cache_starts[previous] + app.render_cache[previous].len()
+            });
+        }
     }
     let streaming = app.mode == Mode::Streaming;
     while app.render_cache.len() < app.transcript.len() {
         let i = app.render_cache.len();
         let last = i + 1 == app.transcript.len();
-        app.render_cache.push(render_entry(
-            &app.transcript[i],
-            width,
-            last && streaming,
-            &theme,
-        ));
-    }
-    if let Some(last) = app.transcript.last() {
-        let i = app.transcript.len() - 1;
-        app.render_cache[i] = render_entry(last, width, streaming, &theme);
+        let lines = render_entry(&app.transcript[i], width, last && streaming, &theme);
+        let start = if i == 0 {
+            0
+        } else {
+            app.render_cache_total_lines + 1
+        };
+        app.render_cache_starts.push(start);
+        app.render_cache_total_lines = start + lines.len();
+        app.render_cache.push(lines);
     }
 
-    let total: usize = app.render_cache.iter().map(Vec::len).sum::<usize>()
-        + app.render_cache.len().saturating_sub(1);
+    let total = app.render_cache_total_lines;
+    // `scroll_from_bottom` normally follows the tail. Once the user scrolls,
+    // adjust that distance with content growth or shrinkage so the same
+    // transcript lines stay under the cursor while a response reflows.
+    if preserve_viewport {
+        if total >= previous_total {
+            app.scroll_from_bottom = app
+                .scroll_from_bottom
+                .saturating_add(total - previous_total);
+        } else {
+            app.scroll_from_bottom = app
+                .scroll_from_bottom
+                .saturating_sub(previous_total - total);
+        }
+    }
     let visible = area.height.saturating_sub(2) as usize;
     app.scroll_from_bottom = app.scroll_from_bottom.min(total.saturating_sub(visible));
     let start = total.saturating_sub(visible + app.scroll_from_bottom);
     let end = (start + visible).min(total);
 
     let mut window: Vec<Line> = Vec::with_capacity(end.saturating_sub(start));
-    let mut pos = 0;
-    'outer: for (i, lines) in app.render_cache.iter().enumerate() {
+    let first = app
+        .render_cache_starts
+        .partition_point(|entry_start| *entry_start <= start)
+        .saturating_sub(1);
+    for i in first..app.render_cache.len() {
+        let entry_start = app.render_cache_starts[i];
         if i > 0 {
-            if pos >= start && pos < end {
+            let separator = entry_start - 1;
+            if separator >= start && separator < end {
                 window.push(Line::raw(""));
             }
-            pos += 1;
-            if pos >= end {
+            if separator >= end {
                 break;
             }
         }
-        for line in lines {
-            if pos >= start && pos < end {
-                window.push(line.clone());
-            }
-            pos += 1;
-            if pos >= end {
-                break 'outer;
-            }
+        let lines = &app.render_cache[i];
+        let from = start.saturating_sub(entry_start).min(lines.len());
+        let to = end.saturating_sub(entry_start).min(lines.len());
+        window.extend(lines[from..to].iter().cloned());
+        if entry_start + lines.len() >= end {
+            break;
         }
     }
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.border))
@@ -151,10 +207,29 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
             " ◆ shaltaiboltai ",
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
+    if app.scroll_from_bottom > 0 {
+        let label = if area.width >= 52 {
+            format!(
+                " ↑ {} lines from latest · Ctrl+End jump ",
+                app.scroll_from_bottom
+            )
+        } else {
+            format!(" ↑ {} · Ctrl+End ", app.scroll_from_bottom)
+        };
+        block = block.title_bottom(
+            Line::styled(
+                label,
+                Style::new().fg(semantic_foreground(theme.warning, theme.bg, theme.fg)),
+            )
+            .alignment(Alignment::Right),
+        );
+    }
     frame.render_widget(Paragraph::new(window).block(block), area);
 
     if total > visible {
-        let mut state = ScrollbarState::new(total - visible).position(start);
+        let mut state = ScrollbarState::new(total)
+            .position(start)
+            .viewport_content_length(visible);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -195,20 +270,50 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
             );
         }
         Entry::User(text) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " YOU ",
+                    Style::new()
+                        .fg(on_color(theme.accent))
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  prompt", Style::new().fg(theme.dim)),
+            ]));
             push_wrapped(
                 &mut lines,
-                "▌ ",
-                Style::new().fg(theme.accent),
+                "│ ",
+                Style::new().fg(theme.border),
                 text,
                 width,
-                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+                Style::new().fg(theme.fg),
             );
         }
         Entry::Assistant(text) => {
-            if text.is_empty() && streaming {
-                lines.push(Line::styled("…", Style::new().fg(theme.dim)));
-            } else {
-                lines.extend(markdown::render(text, width, theme));
+            if !text.is_empty() || streaming {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "◆ ",
+                        Style::new().fg(theme.accent2).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "ASSISTANT",
+                        Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                if text.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("│ ", Style::new().fg(theme.border)),
+                        Span::styled("thinking…", Style::new().fg(theme.dim)),
+                    ]));
+                } else {
+                    for line in markdown::render(text, width.saturating_sub(2), theme) {
+                        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                        spans.push(Span::styled("│ ", Style::new().fg(theme.border)));
+                        spans.extend(line.spans);
+                        lines.push(Line::from(spans));
+                    }
+                }
             }
         }
         Entry::Tool {
@@ -216,41 +321,72 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
             result,
             is_error,
         } => {
-            let (glyph, color) = if *is_error {
-                ("✗ ", theme.error)
+            let (state, glyph, color) = if *is_error {
+                ("FAILED", "✗ ", theme.error)
             } else {
-                ("✓ ", theme.success)
+                ("DONE", "✓ ", theme.success)
             };
+            let result_lines = result.lines().count();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    glyph,
+                    Style::new()
+                        .fg(semantic_foreground(color, theme.bg, theme.fg))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {state} "),
+                    Style::new()
+                        .fg(on_color(color))
+                        .bg(color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  TOOL", Style::new().fg(theme.dim)),
+                Span::styled(
+                    if result_lines > 0 {
+                        format!(
+                            " · {result_lines} output line{}",
+                            if result_lines == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        String::new()
+                    },
+                    Style::new().fg(theme.dim),
+                ),
+            ]));
             push_wrapped(
                 &mut lines,
-                glyph,
-                Style::new().fg(color),
+                "│ ",
+                Style::new().fg(theme.border),
                 summary,
                 width,
                 Style::new().fg(theme.fg),
             );
-            for (i, line) in result.lines().take(TOOL_RESULT_PREVIEW_LINES).enumerate() {
-                let truncated = result.lines().count() > TOOL_RESULT_PREVIEW_LINES
-                    && i == TOOL_RESULT_PREVIEW_LINES - 1;
-                let text = if truncated {
-                    format!("{line} …")
-                } else {
-                    line.to_owned()
-                };
+            let shown = result_lines.min(TOOL_RESULT_PREVIEW_LINES);
+            for (i, line) in result.lines().take(shown).enumerate() {
                 push_wrapped(
                     &mut lines,
-                    "  ▏ ",
+                    "│   ",
                     Style::new().fg(theme.border),
-                    &text,
+                    line,
                     width,
                     Style::new().fg(theme.dim),
                 );
+                if i + 1 == shown && result_lines > shown {
+                    lines.push(Line::from(vec![
+                        Span::styled("│   ", Style::new().fg(theme.border)),
+                        Span::styled(
+                            format!("… {} more lines", result_lines - shown),
+                            Style::new().fg(theme.dim).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                }
             }
         }
         Entry::Info(text) => {
             push_wrapped(
                 &mut lines,
-                "• ",
+                "· ",
                 Style::new().fg(theme.dim),
                 text,
                 width,
@@ -258,13 +394,14 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
             );
         }
         Entry::Error(text) => {
+            let error = semantic_foreground(theme.error, theme.bg, theme.fg);
             push_wrapped(
                 &mut lines,
-                "✗ ",
-                Style::new().fg(theme.error),
+                "! ",
+                Style::new().fg(error),
                 text,
                 width,
-                Style::new().fg(theme.error),
+                Style::new().fg(error),
             );
         }
     }
@@ -323,17 +460,68 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             area,
         );
     }
-    let chip_fg = theme.bg.unwrap_or(Color::Black);
+    let wide = area.width >= 52;
+    let (state, state_color) = if app.compacting {
+        ("compacting context…", theme.accent)
+    } else if app.discovering && app.mode == Mode::Input {
+        ("discovering models…", theme.accent)
+    } else {
+        match app.mode {
+            Mode::Input => ("ready", theme.success),
+            Mode::Streaming => (
+                if wide {
+                    "thinking — Esc to cancel"
+                } else {
+                    "thinking"
+                },
+                theme.accent,
+            ),
+            Mode::RunningTool => (
+                if wide {
+                    "running tool — Esc to cancel"
+                } else {
+                    "running tool"
+                },
+                theme.accent2,
+            ),
+            Mode::Approval => ("approval needed", theme.warning),
+            Mode::ModelPicker => ("selecting model", theme.accent2),
+            Mode::SessionPicker => ("selecting session", theme.accent2),
+            Mode::ThemePicker => (
+                if wide {
+                    "previewing theme — Enter keep · Esc revert"
+                } else {
+                    "previewing theme"
+                },
+                theme.accent2,
+            ),
+            Mode::Help => ("keyboard guide", theme.accent2),
+        }
+    };
+    let spinner_width = if app.is_busy() { 3 } else { 1 };
+    let state_width = UnicodeWidthStr::width(state);
+    let chip_budget = (area.width as usize)
+        .saturating_sub(state_width + spinner_width + 2)
+        .min(36);
     let model = app
         .model
         .as_ref()
         .map(|m| format!("{} · {}", m.id, m.provider.label()))
-        .unwrap_or_else(|| "no model".into());
-
-    let mut spans = vec![Span::styled(
-        format!(" ◆ {model} "),
-        Style::new().fg(chip_fg).bg(theme.accent),
-    )];
+        .unwrap_or_else(|| {
+            if app.discovering {
+                "finding models".into()
+            } else {
+                "no model".into()
+            }
+        });
+    let mut spans = Vec::new();
+    if chip_budget >= 8 {
+        let model = truncate_width(&model, chip_budget.saturating_sub(4));
+        spans.push(Span::styled(
+            format!(" ◆ {model} "),
+            Style::new().fg(on_color(theme.accent)).bg(theme.accent),
+        ));
+    }
     if app.is_busy() {
         spans.push(Span::styled(
             format!(" {} ", spinner_frame()),
@@ -342,26 +530,28 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         spans.push(Span::raw(" "));
     }
-    let state = if app.compacting {
-        "compacting context…"
-    } else {
-        match app.mode {
-            Mode::Input => "ready",
-            Mode::Streaming => "thinking — Esc to cancel",
-            Mode::RunningTool => "running tool — Esc to cancel",
-            Mode::Approval => "awaiting approval",
-            Mode::ModelPicker => "selecting model",
-            Mode::SessionPicker => "selecting session",
-            Mode::ThemePicker => "selecting theme — Enter keep · Esc revert",
-        }
-    };
-    spans.push(Span::styled(state, Style::new().fg(theme.dim)));
+    spans.push(Span::styled(
+        state,
+        Style::new().fg(semantic_foreground(state_color, theme.surface, theme.fg)),
+    ));
     let left_width: usize = spans.iter().map(|s| s.width()).sum();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
     // Right side: cwd · branch · context usage, Claude Code style. On narrow
     // terminals, pieces are dropped (cwd first, then branch) instead of
     // colliding with the left side.
+    let approx = (app.last_usage.is_none()).then(|| app.approx_tokens());
+    let context = match app.last_usage {
+        Some(u) => Some(format!(
+            "ctx {} · out {}",
+            fmt_count(u.input_tokens as usize),
+            fmt_count(u.output_tokens as usize)
+        )),
+        None => approx
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| format!("ctx ~{}", fmt_count(tokens))),
+    };
+    let context_percent = context.as_ref().and_then(|_| app.context_percent());
     let assemble = |with_cwd: bool, with_branch: bool| -> Vec<Span<'static>> {
         let mut right: Vec<Span> = Vec::new();
         let sep = || Span::styled(" · ", Style::new().fg(theme.border));
@@ -379,29 +569,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 right.push(Span::styled(branch.clone(), Style::new().fg(theme.accent2)));
             }
         }
-        let context = match app.last_usage {
-            Some(u) => Some(format!(
-                "ctx {} · out {}",
-                fmt_count(u.input_tokens as usize),
-                fmt_count(u.output_tokens as usize)
-            )),
-            None if app.approx_tokens() > 0 => {
-                Some(format!("ctx ~{}", fmt_count(app.approx_tokens())))
-            }
-            None => None,
-        };
-        if let Some(ctx) = context {
+        if let Some(ctx) = &context {
             if !right.is_empty() {
                 right.push(sep());
             }
-            right.push(Span::styled(ctx, Style::new().fg(theme.dim)));
-            if let Some(pct) = app.context_percent() {
+            right.push(Span::styled(ctx.clone(), Style::new().fg(theme.dim)));
+            if let Some(pct) = context_percent {
                 let color = match pct {
                     0..=69 => theme.dim,
                     70..=89 => theme.warning,
                     _ => theme.error,
                 };
-                right.push(Span::styled(format!(" {pct}%"), Style::new().fg(color)));
+                right.push(Span::styled(
+                    format!(" {pct}%"),
+                    Style::new().fg(semantic_foreground(color, theme.surface, theme.fg)),
+                ));
             }
         }
         if !right.is_empty() {
@@ -413,19 +595,92 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         let w: usize = candidate.iter().map(|s| s.width()).sum();
         !candidate.is_empty() && left_width + w < area.width as usize
     };
-    let right = [
-        assemble(true, true),
-        assemble(false, true),
-        assemble(false, false),
-    ]
-    .into_iter()
-    .find(|candidate| fits(candidate));
+    let right = [(true, true), (false, true), (false, false)]
+        .into_iter()
+        .find_map(|(cwd, branch)| {
+            let candidate = assemble(cwd, branch);
+            fits(&candidate).then_some(candidate)
+        });
     if let Some(right) = right {
         frame.render_widget(
             Paragraph::new(Line::from(right)).alignment(Alignment::Right),
             area,
         );
     }
+}
+
+fn truncate_width(text: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + 1 > max {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
+}
+
+/// Pick a legible foreground for filled badges independently of the theme's
+/// canvas color. A light theme's base is not necessarily readable on success
+/// green, just as a dark theme's base can disappear on a dark error red.
+fn on_color(color: Color) -> Color {
+    match relative_luminance(color) {
+        Some(luminance) if luminance > 0.179 => Color::Black,
+        Some(_) => Color::White,
+        None => match color {
+            Color::Black | Color::Red | Color::Blue | Color::Magenta | Color::DarkGray => {
+                Color::White
+            }
+            _ => Color::Black,
+        },
+    }
+}
+
+/// Preserve a semantic hue only when it remains readable as text on the
+/// current surface; otherwise keep the icon/wording as the non-color cue and
+/// fall back to the theme's primary foreground.
+fn semantic_foreground(preferred: Color, background: Option<Color>, fallback: Color) -> Color {
+    let Some(background) = background else {
+        return preferred;
+    };
+    let Some(foreground_luminance) = relative_luminance(preferred) else {
+        return preferred;
+    };
+    let Some(background_luminance) = relative_luminance(background) else {
+        return preferred;
+    };
+    let contrast = (foreground_luminance.max(background_luminance) + 0.05)
+        / (foreground_luminance.min(background_luminance) + 0.05);
+    if contrast >= 4.5 {
+        preferred
+    } else {
+        fallback
+    }
+}
+
+fn relative_luminance(color: Color) -> Option<f64> {
+    let Color::Rgb(r, g, b) = color else {
+        return None;
+    };
+    let linear = |channel: u8| {
+        let channel = f64::from(channel) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    Some(0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b))
 }
 
 fn fmt_count(n: usize) -> String {
@@ -449,15 +704,21 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
         1 + c.name.len() + c.args.map(|a| a.len() + 1).unwrap_or(0)
     };
     let label_width = matches.iter().map(|c| label(c)).max().unwrap_or(0) + 2;
-    let height = (matches.len() as u16).min(8) + 2;
-    let width = matches
+    let available_height = input_area.y.saturating_sub(frame.area().y);
+    let available_width = frame.area().width.saturating_sub(2);
+    if available_height < 3 || available_width < 4 {
+        return;
+    }
+    let height = ((matches.len() as u16).min(8) + 2).min(available_height);
+    let desired_width = matches
         .iter()
         .map(|c| 4 + label_width + c.description.len())
         .max()
-        .unwrap_or(20)
-        .min(frame.area().width.saturating_sub(4) as usize) as u16;
+        .unwrap_or(20) as u16;
+    let width = desired_width.min(available_width);
+    let max_x = frame.area().x + frame.area().width - width;
     let area = Rect {
-        x: input_area.x + 1,
+        x: (input_area.x + 1).min(max_x),
         y: input_area.y.saturating_sub(height),
         width,
         height,
@@ -489,11 +750,7 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
     }
     let list = List::new(items)
         .block(block)
-        .highlight_style(
-            Style::new()
-                .bg(theme.accent)
-                .fg(theme.bg.unwrap_or(Color::Black)),
-        )
+        .highlight_style(Style::new().bg(theme.accent).fg(on_color(theme.accent)))
         .highlight_symbol("❯ ");
 
     let mut state = ListState::default();
@@ -603,7 +860,8 @@ fn draw_overlay_list(
     items: Vec<ListItem>,
     selected: usize,
 ) {
-    let area = centered(frame.area(), 60, 70);
+    let preferred_height = (items.len() as u16 + 2).clamp(5, 22);
+    let area = modal_area(frame.area(), 76, preferred_height);
     frame.render_widget(Clear, area);
 
     let empty = items.is_empty();
@@ -616,16 +874,21 @@ fn draw_overlay_list(
             title,
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
+    if area.width >= 34 {
+        block = block.title_bottom(
+            Line::styled(
+                " ↑↓ move · Enter select · Esc close ",
+                Style::new().fg(theme.dim),
+            )
+            .alignment(Alignment::Right),
+        );
+    }
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
     }
     let list = List::new(items)
         .block(block)
-        .highlight_style(
-            Style::new()
-                .bg(theme.accent)
-                .fg(theme.bg.unwrap_or(Color::Black)),
-        )
+        .highlight_style(Style::new().bg(theme.accent).fg(on_color(theme.accent)))
         .highlight_symbol("❯ ");
 
     let mut state = ListState::default();
@@ -633,102 +896,398 @@ fn draw_overlay_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_approval(frame: &mut Frame, app: &App) {
+fn draw_approval(frame: &mut Frame, app: &mut App) {
     let theme = app.theme;
+    let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
     let Some(call) = app.pending_approval() else {
         return;
     };
-    let area = centered(frame.area(), 80, 70);
+    let description = tools::describe(call);
+    let scope_label = tools::approval_scope_label(call);
+    let arguments = call.arguments.clone();
+    let area = modal_area(frame.area(), 96, 24);
     frame.render_widget(Clear, area);
-    let inner_width = area.width.saturating_sub(4) as usize;
-
-    let mut lines = vec![Line::styled(
-        tools::describe(call),
-        Style::new().fg(theme.warning).add_modifier(Modifier::BOLD),
-    )];
-    lines.push(Line::raw(""));
-
-    match &app.approval_preview {
-        Some(diff) => {
-            for (tag, text) in diff {
-                let (style, prefix) = match tag {
-                    '+' => (Style::new().fg(theme.success), "+"),
-                    '-' => (Style::new().fg(theme.error), "-"),
-                    '@' => (Style::new().fg(theme.accent2), "@"),
-                    '!' => (
-                        Style::new().fg(theme.error).add_modifier(Modifier::BOLD),
-                        "!",
-                    ),
-                    _ => (Style::new().fg(theme.dim), " "),
-                };
-                let mut shown = format!("{prefix} {text}");
-                shown.truncate(
-                    shown
-                        .char_indices()
-                        .nth(inner_width)
-                        .map_or(shown.len(), |(i, _)| i),
-                );
-                lines.push(Line::styled(shown, style));
-            }
-        }
-        None => {
-            if let Ok(pretty) = serde_json::to_string_pretty(&call.arguments) {
-                for l in pretty.lines().take(12) {
-                    lines.push(Line::styled(l.to_owned(), Style::new().fg(theme.dim)));
-                }
-            }
-        }
-    }
-
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[y]",
-            Style::new().fg(theme.success).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" approve  ", Style::new().fg(theme.fg)),
-        Span::styled(
-            "[a]",
-            Style::new().fg(theme.success).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" always allow {}  ", call.name),
-            Style::new().fg(theme.fg),
-        ),
-        Span::styled(
-            "[n]",
-            Style::new().fg(theme.error).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" deny", Style::new().fg(theme.fg)),
-    ]));
-
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.warning))
+        .border_style(Style::new().fg(warning))
         .padding(Padding::horizontal(1))
         .title(Line::styled(
-            " tool approval ",
-            Style::new().fg(theme.warning).add_modifier(Modifier::BOLD),
+            " review tool request ",
+            Style::new().fg(warning).add_modifier(Modifier::BOLD),
         ));
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let action_lines = approval_action_lines(scope_label, inner.width as usize, &theme);
+    let action_height = (action_lines.len() as u16).min(inner.height);
+    let room_before_actions = inner.height.saturating_sub(action_height);
+    let summary_height = if room_before_actions >= 7 {
+        2
+    } else if room_before_actions >= 2 {
+        1
+    } else {
+        0
+    };
+    let room_for_preview = room_before_actions.saturating_sub(summary_height);
+    let meta_height = u16::from(room_for_preview >= 2 && inner.height >= 6);
+    let [summary_area, preview_area, meta_area, action_area] = Layout::vertical([
+        Constraint::Length(summary_height),
+        Constraint::Min(0),
+        Constraint::Length(meta_height),
+        Constraint::Length(action_height),
+    ])
+    .areas(inner);
+    if summary_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(description)
+                .style(Style::new().fg(theme.fg).add_modifier(Modifier::BOLD))
+                .wrap(Wrap { trim: true }),
+            summary_area,
+        );
+    }
+
+    let inner_width = preview_area.width.saturating_sub(1) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match &app.approval_preview {
+        Some(diff) => {
+            for (tag, text) in diff {
+                let (style, prefix) = match tag {
+                    '+' => (
+                        Style::new().fg(semantic_foreground(
+                            theme.success,
+                            theme.surface,
+                            theme.fg,
+                        )),
+                        "+",
+                    ),
+                    '-' => (
+                        Style::new().fg(semantic_foreground(theme.error, theme.surface, theme.fg)),
+                        "-",
+                    ),
+                    '@' => (Style::new().fg(theme.accent2), "@"),
+                    '!' => (
+                        Style::new()
+                            .fg(semantic_foreground(theme.error, theme.surface, theme.fg))
+                            .add_modifier(Modifier::BOLD),
+                        "!",
+                    ),
+                    _ => (Style::new().fg(theme.dim), " "),
+                };
+                push_display_wrapped(
+                    &mut lines,
+                    text,
+                    &format!("{prefix} "),
+                    "  ",
+                    inner_width,
+                    style,
+                );
+            }
+        }
+        None => {
+            if let Ok(pretty) = serde_json::to_string_pretty(&arguments) {
+                for l in pretty.lines().take(200) {
+                    push_display_wrapped(
+                        &mut lines,
+                        l,
+                        "",
+                        "  ",
+                        inner_width,
+                        Style::new().fg(theme.dim),
+                    );
+                }
+            }
+        }
+    }
+    let visible = preview_area.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    app.approval_scroll = app.approval_scroll.min(max_scroll);
+    let start = app.approval_scroll;
+    let end = (start + visible).min(lines.len());
+    frame.render_widget(Paragraph::new(lines[start..end].to_vec()), preview_area);
+
+    if lines.len() > visible && visible > 0 {
+        let mut state = ScrollbarState::new(lines.len())
+            .position(start)
+            .viewport_content_length(visible);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(None)
+                .thumb_symbol("▐")
+                .style(Style::new().fg(warning)),
+            preview_area,
+            &mut state,
+        );
+    }
+    if meta_height > 0 {
+        let range = if lines.is_empty() {
+            "no preview".to_owned()
+        } else {
+            format!("lines {}–{} of {}", start + 1, end, lines.len())
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(range, Style::new().fg(theme.dim)),
+                Span::styled("  ·  ↑↓ / PgUp PgDn scroll", Style::new().fg(theme.dim)),
+            ])),
+            meta_area,
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(
+            action_lines
+                .into_iter()
+                .take(action_area.height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        action_area,
+    );
 }
 
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let [_, mid, _] = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .areas(area);
-    let [_, mid, _] = Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .areas(mid);
-    mid
+/// Wrap approval material into real visual rows before applying vertical
+/// scrolling. This keeps the tail of long commands and wide Unicode diff lines
+/// reviewable instead of letting `Paragraph` clip them horizontally.
+fn push_display_wrapped(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    first_prefix: &str,
+    continuation_prefix: &str,
+    width: usize,
+    style: Style,
+) {
+    if width == 0 {
+        return;
+    }
+
+    let mut chars = text.chars().peekable();
+    let mut first = true;
+    loop {
+        let prefix = if first {
+            first_prefix
+        } else {
+            continuation_prefix
+        };
+        let available = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
+        let mut chunk = String::new();
+        let mut chunk_width = 0;
+        while let Some(&ch) = chars.peek() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if !chunk.is_empty() && chunk_width + char_width > available {
+                break;
+            }
+            chars.next();
+            chunk.push(ch);
+            chunk_width += char_width;
+            if chunk_width >= available {
+                break;
+            }
+        }
+
+        lines.push(Line::styled(format!("{prefix}{chunk}"), style));
+        if chars.peek().is_none() {
+            break;
+        }
+        first = false;
+    }
+}
+
+/// Keep approval and denial visible before the longer allow-scope wording. At
+/// narrow widths the safety choices stay on the first row and the exact scope
+/// wraps below them.
+fn approval_action_lines(scope: &'static str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let success = semantic_foreground(theme.success, theme.surface, theme.fg);
+    let error = semantic_foreground(theme.error, theme.surface, theme.fg);
+    let wide = Line::from(vec![
+        key_span("y", success),
+        Span::styled(" approve   ·   ", Style::new().fg(theme.fg)),
+        key_span("n / Esc", error),
+        Span::styled(" deny   ·   ", Style::new().fg(theme.fg)),
+        key_span("a", success),
+        Span::styled(format!(" allow {scope}"), Style::new().fg(theme.fg)),
+    ]);
+    if wide.width() <= width {
+        return vec![wide];
+    }
+
+    let compact = Line::from(vec![
+        key_span("y", success),
+        Span::styled(" yes · ", Style::new().fg(theme.fg)),
+        key_span("n", error),
+        Span::styled(" no · ", Style::new().fg(theme.fg)),
+        key_span("a", success),
+        Span::styled(format!(" {scope}"), Style::new().fg(theme.fg)),
+    ]);
+    if compact.width() <= width {
+        return vec![compact];
+    }
+
+    let primary = Line::from(vec![
+        key_span("y", success),
+        Span::styled(" yes · ", Style::new().fg(theme.fg)),
+        key_span("n", error),
+        Span::styled(" no", Style::new().fg(theme.fg)),
+    ]);
+    let mut lines = if primary.width() <= width {
+        vec![primary]
+    } else {
+        vec![
+            Line::from(vec![
+                key_span("n", error),
+                Span::styled(" no · Esc", Style::new().fg(theme.fg)),
+            ]),
+            Line::from(vec![
+                key_span("y", success),
+                Span::styled(" yes", Style::new().fg(theme.fg)),
+            ]),
+        ]
+    };
+
+    let scope_width = width.saturating_sub(2).max(1);
+    for (index, chunk) in textwrap::wrap(scope, scope_width).into_iter().enumerate() {
+        if index == 0 {
+            lines.push(Line::from(vec![
+                key_span("a", success),
+                Span::styled(format!(" {chunk}"), Style::new().fg(theme.fg)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(chunk.into_owned(), Style::new().fg(theme.fg)),
+            ]));
+        }
+    }
+    lines
+}
+
+fn key_span(label: &'static str, color: Color) -> Span<'static> {
+    Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD))
+}
+
+fn draw_help(frame: &mut Frame, app: &App) {
+    let theme = app.theme;
+    // The guide is intentionally a focused full-screen layer; clearing the
+    // underlying composer/status avoids a noisy double frame on 80×24 shells.
+    frame.render_widget(Clear, frame.area());
+    if let Some(bg) = theme.bg {
+        frame.render_widget(
+            Block::default().style(Style::new().bg(bg).fg(theme.fg)),
+            frame.area(),
+        );
+    }
+    let area = modal_area(frame.area(), 78, 20);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.accent2))
+        .padding(Padding::horizontal(1))
+        .title(Line::styled(
+            " keyboard guide ",
+            Style::new().fg(theme.accent2).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(
+            Line::styled(" F1 · Enter · Esc close ", Style::new().fg(theme.dim))
+                .alignment(Alignment::Right),
+        );
+    if let Some(surface) = theme.surface {
+        block = block.style(Style::new().bg(surface).fg(theme.fg));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let key_column = if inner.width >= 44 {
+        14
+    } else if inner.width >= 28 {
+        11
+    } else {
+        9
+    };
+    let key = |label: &'static str, action: &'static str| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {label:<key_column$}"),
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(action, Style::new().fg(theme.fg)),
+        ])
+    };
+    let section = |title: &'static str| {
+        Line::styled(
+            title.to_owned(),
+            Style::new().fg(theme.accent2).add_modifier(Modifier::BOLD),
+        )
+    };
+    let lines = if inner.height >= 17 && inner.width >= 44 {
+        vec![
+            section("MESSAGE"),
+            key("Enter", "send message"),
+            key("Alt+Enter", "insert a newline"),
+            key("Ctrl+V", "attach clipboard image"),
+            key("Ctrl+U", "clear the composer"),
+            key("/", "browse commands"),
+            Line::raw(""),
+            section("NAVIGATE"),
+            key("Ctrl+P", "choose a model"),
+            key("↑ / ↓", "recall prompts or move in menus"),
+            key("PgUp / PgDn", "scroll conversation or approval"),
+            key("Ctrl+Home/End", "oldest / latest message"),
+            Line::raw(""),
+            section("AGENT"),
+            key("Esc", "cancel work; deny an approval"),
+            key("y / a / n", "approve / allow scope / deny"),
+            key("Ctrl+C", "cancel safely and quit"),
+        ]
+    } else if inner.height >= 8 {
+        vec![
+            key("Enter", "send"),
+            key("Alt+Enter", "newline"),
+            key("Ctrl+P", "models"),
+            key("/", "commands"),
+            key("PgUp/PgDn", "scroll"),
+            key("Esc", "cancel / deny"),
+            key("y / a / n", "approval choices"),
+            key("Ctrl+C", "safe quit"),
+        ]
+    } else {
+        // Safety and exit bindings come first when there is not enough room
+        // for even the compact guide; never render more rows than can fit.
+        vec![
+            key("Esc", "cancel / deny"),
+            key("y / a / n", "approval"),
+            key("Ctrl+C", "safe quit"),
+            key("Enter", "send"),
+            key("/", "commands"),
+            key("PgUp/PgDn", "scroll"),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .take(inner.height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
+    );
+}
+
+fn modal_area(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    let horizontal_margin = u16::from(area.width > 4);
+    let vertical_margin = u16::from(area.height > 4);
+    let width = preferred_width.min(area.width.saturating_sub(horizontal_margin * 2));
+    let height = preferred_height.min(area.height.saturating_sub(vertical_margin * 2));
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }

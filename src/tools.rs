@@ -1,7 +1,8 @@
 use crate::providers::{ToolCall, ToolDef};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -116,31 +117,103 @@ fn path_within_cwd(path: &str) -> bool {
     let Ok(cwd) = std::env::current_dir() else {
         return false;
     };
+    path_within_root(&cwd, path)
+}
+
+/// Resolve an existing target (or its nearest existing parent) before deciding
+/// whether it belongs to the project. This closes the common `repo/link ->
+/// ~/.ssh` escape that a lexical `starts_with` check cannot see.
+fn path_within_root(root: &Path, path: &str) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    resolve_path(root.as_path(), path).is_some_and(|target| target.starts_with(root))
+}
+
+/// Produce a stable, narrowly scoped key for an "allow for this session"
+/// decision. File operations are limited to one resolved path, searches to
+/// their exact arguments, and shell access to one exact command.
+pub fn approval_scope(call: &ToolCall) -> String {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    approval_scope_in(&root, call)
+}
+
+fn approval_scope_in(root: &Path, call: &ToolCall) -> String {
+    let serialized_arguments =
+        || serde_json::to_string(&call.arguments).unwrap_or_else(|_| call.arguments.to_string());
+    let resolved_path = |raw: &str| {
+        std::fs::canonicalize(root)
+            .ok()
+            .and_then(|root| resolve_path(&root, raw))
+            .unwrap_or_else(|| PathBuf::from(raw))
+    };
+    match call.name.as_str() {
+        "read_file" | "write_file" | "edit_file" | "list_directory" => {
+            let raw = call.arguments["path"].as_str().unwrap_or(".");
+            let resolved = resolved_path(raw);
+            format!("{}\0{}", call.name, resolved.display())
+        }
+        "run_command" => format!(
+            "run_command\0{}",
+            call.arguments["command"].as_str().unwrap_or("")
+        ),
+        "grep" | "glob" => {
+            let raw = call.arguments["path"].as_str().unwrap_or(".");
+            format!(
+                "{}\0{}\0{}",
+                call.name,
+                resolved_path(raw).display(),
+                serialized_arguments()
+            )
+        }
+        _ => format!("{}\0{}", call.name, serialized_arguments()),
+    }
+}
+
+/// Human wording paired with [`approval_scope`] in the approval footer.
+pub fn approval_scope_label(call: &ToolCall) -> &'static str {
+    match call.name.as_str() {
+        "read_file" | "write_file" | "edit_file" | "list_directory" => "this path",
+        "grep" | "glob" => "this search",
+        "run_command" => "this exact command",
+        _ => "these exact arguments",
+    }
+}
+
+/// Resolve symlinks in every existing portion of `path`, retaining any
+/// missing suffix. The latter matters for prospective write targets whose
+/// parent already exists (and may itself be a symlink).
+fn resolve_path(root: &Path, path: &str) -> Option<PathBuf> {
     let p = Path::new(path);
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        cwd.join(p)
+        root.join(p)
     };
-    normalize(&abs).starts_with(normalize(&cwd))
-}
+    // Do not collapse `..` lexically before canonicalization: `link/..`
+    // follows the symlink first on the filesystem and can land somewhere very
+    // different from the lexical parent.
+    let mut cursor = abs.as_path();
+    let mut missing = Vec::<OsString>::new();
 
-/// Lexical normalization (`a/b/../c` → `a/c`) — no filesystem access, so it
-/// also works for paths that don't exist yet.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push(Component::ParentDir);
-                }
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(cursor) {
+            for component in missing.iter().rev() {
+                resolved.push(component);
             }
-            other => out.push(other),
+            return Some(resolved);
         }
+        match std::fs::symlink_metadata(cursor) {
+            // An entry is present but cannot be canonicalized (most commonly
+            // a dangling symlink). Treat it as unsafe rather than pretending
+            // it is a missing in-project suffix.
+            Ok(_) => return None,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return None,
+            Err(_) => {}
+        }
+        missing.push(cursor.file_name()?.to_owned());
+        cursor = cursor.parent()?;
     }
-    out
 }
 
 /// One-line human-readable summary shown in the approval prompt and transcript.
@@ -482,6 +555,74 @@ mod tests {
             "run_command",
             json!({"command": "ls"})
         )));
+    }
+
+    #[test]
+    fn session_approval_scopes_commands_and_paths() {
+        let first_command = call("run_command", json!({"command": "cargo test"}));
+        let second_command = call("run_command", json!({"command": "cargo publish"}));
+        assert_ne!(
+            approval_scope(&first_command),
+            approval_scope(&second_command)
+        );
+
+        let first_path = call("write_file", json!({"path": "one.txt", "content": "same"}));
+        let second_path = call("write_file", json!({"path": "two.txt", "content": "same"}));
+        assert_ne!(approval_scope(&first_path), approval_scope(&second_path));
+
+        let same_path_new_content = call(
+            "write_file",
+            json!({"path": "one.txt", "content": "updated"}),
+        );
+        assert_eq!(
+            approval_scope(&first_path),
+            approval_scope(&same_path_new_content)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_from_project_requires_approval() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("shaltai-path-scope-{}-{nonce}", std::process::id()));
+        let root = base.join("project");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "private").unwrap();
+        std::fs::write(base.join("outside-secret"), "private").unwrap();
+        symlink(&outside, root.join("secrets")).unwrap();
+
+        assert!(!path_within_root(&root, "secrets/secret"));
+        assert!(!path_within_root(&root, "secrets/new-secret"));
+        assert!(!path_within_root(&root, "secrets/../outside-secret"));
+        assert!(path_within_root(&root, "new-file.txt"));
+
+        let dangling_target = outside.join("not-created-yet");
+        symlink(&dangling_target, root.join("dangling")).unwrap();
+        assert!(!path_within_root(&root, "dangling/secret"));
+        std::fs::create_dir_all(&dangling_target).unwrap();
+        std::fs::write(dangling_target.join("secret"), "private").unwrap();
+        assert!(!path_within_root(&root, "dangling/secret"));
+
+        let search = call("grep", json!({"path": "secrets", "pattern": "token"}));
+        let first_scope = approval_scope_in(&root, &search);
+        std::fs::remove_file(root.join("secrets")).unwrap();
+        symlink(&dangling_target, root.join("secrets")).unwrap();
+        let second_scope = approval_scope_in(&root, &search);
+        assert_ne!(
+            first_scope, second_scope,
+            "retargeted searches must reprompt"
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

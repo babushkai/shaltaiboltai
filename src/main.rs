@@ -23,6 +23,28 @@ With no options it launches the interactive TUI. Configure providers via
 ANTHROPIC_API_KEY / OPENAI_API_KEY / a running Ollama, or a logged-in
 `claude` / `codex` CLI for subscription use. See the README for details.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    ApproveOnce,
+    AllowForSession,
+    Deny,
+}
+
+fn approval_decision(key: &KeyEvent) -> Option<ApprovalDecision> {
+    if key.code == KeyCode::Esc {
+        return Some(ApprovalDecision::Deny);
+    }
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('y') => Some(ApprovalDecision::ApproveOnce),
+        KeyCode::Char('a') => Some(ApprovalDecision::AllowForSession),
+        KeyCode::Char('n') => Some(ApprovalDecision::Deny),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Handle non-interactive flags before touching the terminal, so the binary
@@ -84,14 +106,26 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
             }
         }
     }
-    app.save_session();
+    app.save_session_for_exit()?;
     Ok(())
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
     // Global bindings, regardless of mode.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.should_quit = true;
+        app.request_quit();
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::End {
+        app.scroll_from_bottom = 0;
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Home {
+        app.scroll_from_bottom = usize::MAX;
+        return;
+    }
+    if key.code == KeyCode::F(1) && app.mode == Mode::Input {
+        app.open_help();
         return;
     }
     match app.mode {
@@ -103,11 +137,19 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 handle_scroll_key(app, key);
             }
         }
-        Mode::Approval => match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => app.approve_pending(false),
-            KeyCode::Char('a') => app.approve_pending(true),
-            KeyCode::Char('n') | KeyCode::Esc => app.deny_pending(),
-            _ => handle_scroll_key(app, key),
+        Mode::Approval => match approval_decision(&key) {
+            Some(ApprovalDecision::ApproveOnce) => app.approve_pending(false),
+            Some(ApprovalDecision::AllowForSession) => app.approve_pending(true),
+            Some(ApprovalDecision::Deny) => app.deny_pending(),
+            None => match key.code {
+                KeyCode::Up => app.approval_scroll = app.approval_scroll.saturating_sub(1),
+                KeyCode::Down => app.approval_scroll = app.approval_scroll.saturating_add(1),
+                KeyCode::PageUp => app.approval_scroll = app.approval_scroll.saturating_sub(8),
+                KeyCode::PageDown => app.approval_scroll = app.approval_scroll.saturating_add(8),
+                KeyCode::Home => app.approval_scroll = 0,
+                KeyCode::End => app.approval_scroll = usize::MAX,
+                _ => {}
+            },
         },
         Mode::ModelPicker => handle_model_picker_key(app, key),
         Mode::SessionPicker => handle_session_picker_key(app, key),
@@ -116,6 +158,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Enter => app.pick_theme(),
             KeyCode::Up => app.theme_move(-1),
             KeyCode::Down => app.theme_move(1),
+            _ => {}
+        },
+        Mode::Help => match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) => app.close_help(),
             _ => {}
         },
     }
@@ -183,6 +229,16 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
 /// One line per event: trackpads emit a dense, velocity-scaled event stream,
 /// so larger steps multiply the speed and feel chunky rather than faster.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.mode == Mode::Approval {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.approval_scroll = app.approval_scroll.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                app.approval_scroll = app.approval_scroll.saturating_add(1)
+            }
+            _ => {}
+        }
+        return;
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => app.scroll_from_bottom += 1,
         MouseEventKind::ScrollDown => {
@@ -229,11 +285,34 @@ fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.mode = Mode::Input,
         KeyCode::Enter => app.pick_session(),
         KeyCode::Up => app.session_index = app.session_index.saturating_sub(1),
-        KeyCode::Down => {
-            if count > 0 {
-                app.session_index = (app.session_index + 1).min(count - 1);
-            }
+        KeyCode::Down if count > 0 => {
+            app.session_index = (app.session_index + 1).min(count - 1);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_shortcuts_reject_modified_keys() {
+        assert_eq!(
+            approval_decision(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            approval_decision(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(
+            approval_decision(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(ApprovalDecision::AllowForSession)
+        );
+        assert_eq!(
+            approval_decision(&KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL)),
+            Some(ApprovalDecision::Deny)
+        );
     }
 }
