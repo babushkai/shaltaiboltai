@@ -44,23 +44,26 @@ Safe defaults, each opt-out via config.toml:
 - **Claude Code** runs with `--permission-mode acceptEdits` (reads/edits files autonomously; shell commands auto-denied since there's no interactive prompt). `claude_code_bypass_permissions = true` lets it run shell commands unsupervised.
 - **Codex** runs with `--sandbox workspace-write` (OS-sandboxed: edits and commands confined to the working directory, no network). `codex_full_access = true` removes the sandbox (`danger-full-access`).
 
-Continuity across turns rides each CLI's own session (`claude --continue`, `codex exec resume --last`); `/new` starts a fresh one. Images aren't forwarded to these providers yet (they work with the API providers).
+Each CLI request starts an ephemeral fresh process with an explicit handoff of this app's conversation history. That avoids attaching to an unrelated “last” CLI session in the same directory or duplicating the handoff in CLI session storage. Images are represented in the handoff but their binary contents aren't forwarded to these providers yet (they work with the API providers).
 
 ## Keys & commands
 
 Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered, and `/refresh` rediscovers providers. The statusline prioritizes the active state on narrow terminals, then adds the model, project, linked-worktree branch, and live context usage as space allows.
 
+The composer stays live while a response streams or a tool runs. Press `Enter` to queue one next message; it is sent automatically only after the current turn finishes cleanly (and after any context compaction). Cancellation, provider errors, truncation, or persistence/compaction failures restore that message to the composer instead. The one-message queue locks after capture, and slash commands wait until the active turn ends.
+
 | Key | Action |
 |---|---|
-| `Enter` | send message |
+| `Enter` | send a message, or queue one next message while the agent is working |
 | `Ctrl+V` | attach an image from the clipboard (macOS) — or just drag/type an image path into the message |
+| `Ctrl+X` | clear staged attachments without clearing the message or cancelling active work |
 | `Alt+Enter` | insert newline (multi-line input; pasting multi-line text also works) |
 | `Up` / `Down` | recall previous prompts (when the input is empty), shell-style |
 | `Ctrl+U` | clear the input |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
 | `F1` or `/help` | focused keyboard guide |
-| `Esc` | cancel an in-flight response or running tool (including CLI sub-agents) |
-| `y` / `a` / `n` | approve once / allow only this path, search, or exact command for the current session / deny |
+| `Esc` | cancel an in-flight response or running tool (including CLI sub-agents); in a tool approval, first focus its review controls and then deny the tool |
+| `Tab`, then `y` / `a` / `n` | focus a newly arrived tool approval, then approve once / allow only this path, search, or exact command for the current session / deny |
 | `Up` / `Down`, `PgUp` / `PgDn` | scroll a tool approval preview while its actions stay pinned |
 | `PgUp` / `PgDn` or mouse wheel | scroll transcript |
 | `Ctrl+Home` / `Ctrl+End` | jump to the oldest / latest transcript line |
@@ -68,11 +71,11 @@ Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down
 | `/new` or `/clear` | start a new session (the old one stays saved) |
 | `/compact` | summarize the conversation to shrink context |
 | `/refresh` | rediscover available models |
-| `Ctrl+C` or `/quit` | exit |
+| `Ctrl+C` or `/quit` | exit; if a next message is queued, the first Ctrl+C restores it and asks for confirmation |
 
 The trackpad / mouse wheel scrolls the transcript. Because the TUI captures mouse reporting for this, hold `Option` (macOS) or `Shift` (Linux/Windows) while dragging to use the terminal's native text selection.
 
-Messages can include images for vision models: press `Ctrl+V` to stage the clipboard image (screenshots, copied images), or reference a `.png`/`.jpg`/`.gif`/`.webp` path in your message (drag-and-drop onto the terminal works — escaped and quoted paths are handled). Staged attachments show in the input border; `Esc` clears them. Images go out as Anthropic image blocks, OpenAI data-URLs, or Ollama's native `images` field, capped at 5MB each.
+Messages can include images for vision models: press `Ctrl+V` to stage the clipboard image (screenshots, copied images), or reference a `.png`/`.jpg`/`.gif`/`.webp` path in your message (drag-and-drop onto the terminal works — escaped and quoted paths are handled). Staged attachments show in the input border; `Ctrl+X` clears them at any editable composer, while `Esc` also clears them when no work is active. Images go out as Anthropic image blocks, OpenAI data-URLs, or Ollama's native `images` field, capped at 5MB each.
 
 The transcript uses a quiet activity rail with explicit `YOU`, `ASSISTANT`, and tool-state headers, so long agent runs remain scannable. Assistant responses render markdown (heading hierarchy, bold/italic, accent-bulleted lists, styled blockquotes, and fenced code as full-width surface cards).
 

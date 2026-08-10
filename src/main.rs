@@ -86,8 +86,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
         tokio::select! {
             Some(event) = rx.recv() => {
                 app.on_event(event);
-                // Coalesce bursts (e.g. stream deltas) into a single redraw.
-                while let Ok(event) = rx.try_recv() {
+                // Coalesce a bounded burst into one redraw, then yield back to
+                // terminal input. An unbounded high-rate stream must not starve
+                // Esc/Ctrl+C or type-ahead key handling.
+                for _ in 0..255 {
+                    let Ok(event) = rx.try_recv() else {
+                        break;
+                    };
                     app.on_event(event);
                 }
             }
@@ -124,33 +129,26 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.scroll_from_bottom = usize::MAX;
         return;
     }
-    if key.code == KeyCode::F(1) && app.mode == Mode::Input {
+    if key.code == KeyCode::Esc
+        && app.compacting
+        && app.mode == Mode::Input
+        && !app.slash_menu_active()
+    {
+        app.cancel_compaction_request();
+        return;
+    }
+    if key.code == KeyCode::F(1)
+        && app.mode == Mode::Input
+        && !app.compacting
+        && app.composer_accepts_input()
+    {
         app.open_help();
         return;
     }
     match app.mode {
         Mode::Input => handle_input_key(app, key),
-        Mode::Streaming | Mode::RunningTool => {
-            if key.code == KeyCode::Esc {
-                app.cancel_request();
-            } else {
-                handle_scroll_key(app, key);
-            }
-        }
-        Mode::Approval => match approval_decision(&key) {
-            Some(ApprovalDecision::ApproveOnce) => app.approve_pending(false),
-            Some(ApprovalDecision::AllowForSession) => app.approve_pending(true),
-            Some(ApprovalDecision::Deny) => app.deny_pending(),
-            None => match key.code {
-                KeyCode::Up => app.approval_scroll = app.approval_scroll.saturating_sub(1),
-                KeyCode::Down => app.approval_scroll = app.approval_scroll.saturating_add(1),
-                KeyCode::PageUp => app.approval_scroll = app.approval_scroll.saturating_sub(8),
-                KeyCode::PageDown => app.approval_scroll = app.approval_scroll.saturating_add(8),
-                KeyCode::Home => app.approval_scroll = 0,
-                KeyCode::End => app.approval_scroll = usize::MAX,
-                _ => {}
-            },
-        },
+        Mode::Streaming | Mode::RunningTool => handle_active_key(app, key),
+        Mode::Approval => handle_approval_key(app, key),
         Mode::ModelPicker => handle_model_picker_key(app, key),
         Mode::SessionPicker => handle_session_picker_key(app, key),
         Mode::ThemePicker => match key.code {
@@ -167,7 +165,98 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_active_key(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Esc {
+        app.cancel_request();
+        return;
+    }
+    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        handle_scroll_key(app, key);
+        return;
+    }
+    handle_lookahead_composer_key(app, key);
+}
+
+fn handle_approval_key(app: &mut App, key: KeyEvent) {
+    if !app.approval_focused {
+        match key.code {
+            // The first Esc only leaves type-ahead focus. A second Esc, now in
+            // approval focus, performs the existing deny action.
+            KeyCode::Tab | KeyCode::Esc => app.focus_approval(),
+            KeyCode::PageUp => app.approval_scroll = app.approval_scroll.saturating_sub(8),
+            KeyCode::PageDown => app.approval_scroll = app.approval_scroll.saturating_add(8),
+            _ => handle_lookahead_composer_key(app, key),
+        }
+        return;
+    }
+
+    if key.code == KeyCode::Tab {
+        app.toggle_approval_focus();
+        return;
+    }
+    match approval_decision(&key) {
+        Some(ApprovalDecision::ApproveOnce) => app.approve_pending(false),
+        Some(ApprovalDecision::AllowForSession) => app.approve_pending(true),
+        Some(ApprovalDecision::Deny) => app.deny_pending(),
+        None => match key.code {
+            KeyCode::Up => app.approval_scroll = app.approval_scroll.saturating_sub(1),
+            KeyCode::Down => app.approval_scroll = app.approval_scroll.saturating_add(1),
+            KeyCode::PageUp => app.approval_scroll = app.approval_scroll.saturating_sub(8),
+            KeyCode::PageDown => app.approval_scroll = app.approval_scroll.saturating_add(8),
+            KeyCode::Home => app.approval_scroll = 0,
+            KeyCode::End => app.approval_scroll = usize::MAX,
+            _ => {}
+        },
+    }
+}
+
+fn handle_lookahead_composer_key(app: &mut App, key: KeyEvent) {
+    if !app.composer_accepts_input() {
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('v') => {
+                app.attach_clipboard_image();
+                return;
+            }
+            KeyCode::Char('x') => {
+                app.clear_attachments();
+                return;
+            }
+            KeyCode::Char('u') => {
+                app.clear_input();
+                app.note_input_changed();
+                return;
+            }
+            _ => {}
+        }
+    }
+    match key.code {
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.textarea.insert_newline();
+            app.note_input_changed();
+        }
+        KeyCode::Enter => app.queue_input(),
+        _ => {
+            app.textarea.input(key);
+            if matches!(
+                key.code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+            ) {
+                app.note_input_changed();
+            }
+        }
+    }
+}
+
 fn handle_input_key(app: &mut App, key: KeyEvent) {
+    if !app.composer_accepts_input() {
+        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            handle_scroll_key(app, key);
+        }
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('p') => {
@@ -176,6 +265,10 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Char('v') => {
                 app.attach_clipboard_image();
+                return;
+            }
+            KeyCode::Char('x') => {
+                app.clear_attachments();
                 return;
             }
             // Shell-style line kill; clears the whole input rather than
@@ -192,6 +285,7 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
             app.textarea.insert_newline();
+            app.note_input_changed();
         }
         // The `/` completion menu captures navigation while open.
         KeyCode::Enter if menu => app.run_selected_slash(),
@@ -295,6 +389,32 @@ fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn test_app() -> App {
+        let data_dir = std::env::temp_dir().join(format!("shaltai-main-{}", std::process::id()));
+        std::env::set_var("SHALTAIBOLTAI_DATA_DIR", data_dir);
+        let config = Config {
+            anthropic_api_key: None,
+            openai_api_key: None,
+            openai_base_url: "http://127.0.0.1:9".into(),
+            ollama_host: "http://127.0.0.1:9".into(),
+            default_model: None,
+            compact_threshold_chars: 80_000,
+            ollama_num_ctx: 16_384,
+            theme: None,
+            claude_code_bypass_permissions: false,
+            codex_full_access: false,
+        };
+        let (tx, _rx) = unbounded_channel();
+        let mut app = App::new(config, tx);
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "key-test".into(),
+        });
+        app
+    }
 
     #[test]
     fn approval_shortcuts_reject_modified_keys() {
@@ -314,5 +434,207 @@ mod tests {
             approval_decision(&KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL)),
             Some(ApprovalDecision::Deny)
         );
+    }
+
+    #[tokio::test]
+    async fn active_turn_keys_edit_and_queue_the_next_message() {
+        let mut app = test_app();
+        app.mode = Mode::Streaming;
+        for ch in "next request".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.textarea.lines().join("\n"), "next request");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.queued_prompt_count(), 1);
+        assert!(app.input_is_empty());
+        assert_eq!(app.mode, Mode::Streaming);
+    }
+
+    #[tokio::test]
+    async fn first_quit_restores_a_queued_message_and_its_attachments() {
+        let mut app = test_app();
+        app.mode = Mode::Streaming;
+        app.pending_images.push((
+            "queued.png".into(),
+            ImageData {
+                media_type: "image/png".into(),
+                data: "cXVldWVk".into(),
+            },
+        ));
+        app.textarea.insert_str("do not lose this");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.textarea.lines().join("\n"), "do not lose this");
+        assert_eq!(app.pending_image_count(), 1);
+        assert!(app
+            .composer_notice()
+            .is_some_and(|notice| notice.contains("Ctrl+C again")));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn active_composer_can_clear_an_attachment_without_cancelling() {
+        let mut app = test_app();
+        app.mode = Mode::Streaming;
+        app.pending_images.push((
+            "wrong.png".into(),
+            ImageData {
+                media_type: "image/png".into(),
+                data: "d3Jvbmc=".into(),
+            },
+        ));
+        app.textarea.insert_str("keep this text");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.mode, Mode::Streaming);
+        assert_eq!(app.pending_image_count(), 0);
+        assert_eq!(app.textarea.lines().join("\n"), "keep this text");
+    }
+
+    #[tokio::test]
+    async fn occupied_compaction_lookahead_locks_a_second_draft() {
+        let mut app = test_app();
+        app.compacting = true;
+        for ch in "after compaction".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.queued_prompt_count(), 1);
+        assert!(app.input_is_empty());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(app.input_is_empty());
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Input, "Help must not strand the queue");
+    }
+
+    #[tokio::test]
+    async fn overlay_escape_closes_before_compaction_is_cancelled() {
+        let mut app = test_app();
+        app.compacting = true;
+        app.open_help();
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Input);
+        assert!(app.compacting);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.compacting);
+    }
+
+    #[tokio::test]
+    async fn escape_cancels_compaction_and_restores_its_lookahead() {
+        let mut app = test_app();
+        app.compacting = true;
+        app.textarea.insert_str("after compaction");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.queued_prompt_count(), 1);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.compacting);
+        assert_eq!(app.queued_prompt_count(), 0);
+        assert_eq!(app.textarea.lines().join("\n"), "after compaction");
+
+        app.compacting = true;
+        app.clear_input();
+        app.textarea.insert_str("unsent draft");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.compacting);
+        assert_eq!(app.textarea.lines().join("\n"), "unsent draft");
+    }
+
+    #[tokio::test]
+    async fn newly_arrived_approval_cannot_consume_typed_decision_letters() {
+        let mut app = test_app();
+        app.mode = Mode::Streaming;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        app.on_event(AppEvent::Chat {
+            gen: 0,
+            event: ChatEvent::Completed {
+                tool_calls: vec![ToolCall {
+                    id: "focus-call".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path": "x.txt", "content": "x"}),
+                }],
+                stop_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+        });
+        assert_eq!(app.mode, Mode::Approval);
+        assert!(!app.approval_focused);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.textarea.lines().join("\n"), "ay");
+        assert!(app.pending_approval().is_some());
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(app.pending_approval().is_none());
+        app.cancel_request();
+    }
+
+    #[tokio::test]
+    async fn escape_denies_an_approval_without_releasing_the_queued_prompt() {
+        let mut app = test_app();
+        app.mode = Mode::Streaming;
+        app.textarea.insert_str("next request");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_event(AppEvent::Chat {
+            gen: 0,
+            event: ChatEvent::Completed {
+                tool_calls: vec![ToolCall {
+                    id: "queued-focus-call".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path": "x.txt", "content": "x"}),
+                }],
+                stop_reason: Some("tool_calls".into()),
+                usage: None,
+            },
+        });
+        assert!(!app.approval_focused);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.approval_focused);
+        assert!(app.pending_approval().is_some());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.pending_approval().is_none());
+        assert_eq!(app.queued_prompt_count(), 1);
+        assert_eq!(app.mode, Mode::Streaming);
+        app.cancel_request();
     }
 }

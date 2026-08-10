@@ -28,6 +28,31 @@ const COMPACT_FLATTEN_CAP: usize = 4_000;
 /// Cap on project instruction files injected into the system prompt.
 const PROJECT_CONTEXT_CAP: usize = 8_000;
 
+/// One-turn lookahead keeps memory bounded and makes failure recovery exact:
+/// there can never be a second draft to merge with a restored queued prompt.
+struct QueuedPrompt {
+    text: String,
+    staged_images: Vec<(String, ImageData)>,
+    referenced_images: Vec<(String, ImageData)>,
+    model: ModelEntry,
+}
+
+impl QueuedPrompt {
+    fn image_count(&self) -> usize {
+        self.staged_images.len() + self.referenced_images.len()
+    }
+
+    fn into_images(mut self) -> (String, ModelEntry, Vec<(String, ImageData)>) {
+        self.staged_images.append(&mut self.referenced_images);
+        (self.text, self.model, self.staged_images)
+    }
+}
+
+struct RestoredReferences {
+    text: String,
+    images: Vec<(String, ImageData)>,
+}
+
 /// The slash-command registry: drives the `/` completion menu, `/help`, and
 /// dispatch, so the three can never drift apart.
 pub struct SlashCommand {
@@ -123,6 +148,7 @@ pub enum AppEvent {
     },
     CompactionDone {
         session_id: String,
+        compaction_gen: u64,
         result: Result<String, String>,
     },
 }
@@ -206,6 +232,7 @@ pub struct App {
     input_draft: String,
     pub slash_index: usize,
     slash_dismissed: bool,
+    composer_notice: Option<String>,
 
     // Statusline environment, refreshed at startup and after each turn/tool.
     pub cwd_display: String,
@@ -214,9 +241,22 @@ pub struct App {
     /// Images staged for the next message: (display name, encoded data).
     pub pending_images: Vec<(String, ImageData)>,
 
+    /// A single next message captured while the current agent turn runs. It is
+    /// deliberately kept out of transcript/history until it is dispatched.
+    queued_prompt: Option<QueuedPrompt>,
+    /// Frozen bytes for image paths from a queued prompt that was restored.
+    /// Editing the text clears these; an unchanged resubmission reuses them.
+    restored_references: Option<RestoredReferences>,
+    /// Clearing a restored inline attachment suppresses re-resolution while
+    /// the text is unchanged; editing the text makes paths eligible again.
+    suppressed_reference_text: Option<String>,
+
     /// Diff preview for the tool call currently awaiting approval.
     pub approval_preview: Option<Vec<(char, String)>>,
     pub approval_scroll: usize,
+    /// Approval shortcuts are armed explicitly when type-ahead was available,
+    /// so a typed `a`, `y`, or `n` can never decide a newly arrived modal.
+    pub approval_focused: bool,
 
     // Renderer cache, managed by ui::draw.
     pub render_cache: Vec<Vec<Line<'static>>>,
@@ -234,6 +274,9 @@ pub struct App {
     /// intentionally conversation-local and never persisted.
     approved_scopes: HashSet<String>,
     agent_turns: usize,
+    active_turn_model: Option<ModelEntry>,
+    active_turn_can_promote_queue: bool,
+    compaction_gen: u64,
     request_task: Option<JoinHandle<()>>,
     tool_task: Option<JoinHandle<()>>,
     compaction_task: Option<JoinHandle<()>>,
@@ -285,11 +328,16 @@ impl App {
             input_draft: String::new(),
             slash_index: 0,
             slash_dismissed: false,
+            composer_notice: None,
             cwd_display: String::new(),
             git_branch: None,
             pending_images: Vec::new(),
+            queued_prompt: None,
+            restored_references: None,
+            suppressed_reference_text: None,
             approval_preview: None,
             approval_scroll: 0,
+            approval_focused: true,
             render_cache: Vec::new(),
             render_cache_starts: Vec::new(),
             render_cache_total_lines: 0,
@@ -300,6 +348,9 @@ impl App {
             pending_calls: VecDeque::new(),
             approved_scopes: HashSet::new(),
             agent_turns: 0,
+            active_turn_model: None,
+            active_turn_can_promote_queue: true,
+            compaction_gen: 0,
             request_task: None,
             tool_task: None,
             compaction_task: None,
@@ -402,6 +453,68 @@ impl App {
     pub fn note_input_changed(&mut self) {
         self.slash_dismissed = false;
         self.slash_index = 0;
+        self.composer_notice = None;
+    }
+
+    /// Whether keyboard and paste events should currently reach the composer.
+    /// A captured lookahead prompt locks the editor until it is sent or
+    /// restored, which keeps attachment ownership unambiguous.
+    pub fn composer_accepts_input(&self) -> bool {
+        if self.queued_prompt.is_some() {
+            return false;
+        }
+        match self.mode {
+            Mode::Input | Mode::Streaming | Mode::RunningTool => true,
+            Mode::Approval => !self.approval_focused,
+            _ => false,
+        }
+    }
+
+    pub fn queued_prompt_count(&self) -> usize {
+        usize::from(self.queued_prompt.is_some())
+    }
+
+    /// Token carried by events for the currently active provider/tool phase.
+    /// Each new request or tool execution advances it so delayed events from a
+    /// previous round cannot mutate the next phase of the same agent turn.
+    pub fn event_generation(&self) -> u64 {
+        self.gen
+    }
+
+    pub fn queued_image_count(&self) -> usize {
+        self.queued_prompt
+            .as_ref()
+            .map_or(0, QueuedPrompt::image_count)
+    }
+
+    pub fn pending_image_count(&self) -> usize {
+        let Some(restored) = self.restored_references.as_ref() else {
+            return self.pending_images.len();
+        };
+        let text = self.textarea.lines().join("\n").trim().to_owned();
+        self.pending_images.len()
+            + if restored.text == text {
+                restored.images.len()
+            } else {
+                0
+            }
+    }
+
+    pub fn composer_notice(&self) -> Option<&str> {
+        self.composer_notice.as_deref()
+    }
+
+    pub fn toggle_approval_focus(&mut self) {
+        if self.mode != Mode::Approval {
+            return;
+        }
+        self.approval_focused = !(self.approval_focused && self.queued_prompt.is_none());
+    }
+
+    pub fn focus_approval(&mut self) {
+        if self.mode == Mode::Approval {
+            self.approval_focused = true;
+        }
     }
 
     fn spawn_discovery(&mut self) {
@@ -488,10 +601,17 @@ impl App {
                     self.finish_tool(call, content, is_error);
                 }
             }
-            AppEvent::CompactionDone { session_id, result } => {
+            AppEvent::CompactionDone {
+                session_id,
+                compaction_gen,
+                result,
+            } => {
                 // A compaction started in another session must not replace
                 // this one's history or clear a newer session's busy state.
-                if session_id == self.session_id {
+                if session_id == self.session_id
+                    && compaction_gen == self.compaction_gen
+                    && self.compacting
+                {
                     self.compacting = false;
                     if let Some(task) = self.compaction_task.take() {
                         task.abort();
@@ -507,6 +627,7 @@ impl App {
             self.mode,
             Mode::Streaming | Mode::RunningTool | Mode::Approval
         ) || !self.pending_calls.is_empty()
+            || self.queued_prompt.is_some()
     }
 
     fn reconcile_discovered_model(&mut self, finished: bool) {
@@ -602,10 +723,21 @@ impl App {
                     text: std::mem::take(&mut self.streaming_text),
                     tool_calls: tool_calls.clone(),
                 });
-                if stop_reason.as_deref() == Some("length") {
-                    self.transcript.push(Entry::Error(
-                        "response was truncated by the output token limit".into(),
-                    ));
+                if !clean_stop_reason(stop_reason.as_deref(), !tool_calls.is_empty()) {
+                    self.active_turn_can_promote_queue = false;
+                    let message = match stop_reason.as_deref() {
+                        Some("length") => "response was truncated by the output token limit".into(),
+                        Some(reason) => {
+                            format!("response stopped before normal completion: {reason}")
+                        }
+                        None => "response stream ended before normal completion".into(),
+                    };
+                    self.transcript.push(Entry::Error(message));
+                    if !tool_calls.is_empty() {
+                        self.repair_dangling_tool_calls();
+                    }
+                    self.end_turn();
+                    return;
                 }
                 if tool_calls.is_empty() {
                     self.end_turn();
@@ -613,6 +745,7 @@ impl App {
                 }
                 self.agent_turns += 1;
                 if self.agent_turns > MAX_AGENT_TURNS {
+                    self.active_turn_can_promote_queue = false;
                     self.transcript.push(Entry::Error(format!(
                         "stopped after {MAX_AGENT_TURNS} consecutive tool rounds"
                     )));
@@ -620,11 +753,17 @@ impl App {
                     self.end_turn();
                     return;
                 }
+                // The provider request is finished. Tool work gets a distinct
+                // phase token, so any late provider Error/Text event is stale.
+                self.gen += 1;
                 self.pending_calls = tool_calls.into();
                 self.advance_tools();
             }
             ChatEvent::Error(message) => {
                 if let Some(task) = self.request_task.take() {
+                    task.abort();
+                }
+                if let Some(task) = self.tool_task.take() {
                     task.abort();
                 }
                 // Keep partial text the user already saw consistent with what
@@ -645,8 +784,18 @@ impl App {
                     );
                 }
                 self.transcript.push(Entry::Error(message));
+                self.pending_calls.clear();
+                self.approval_preview = None;
+                self.repair_dangling_tool_calls();
+                // Fence any already-buffered events from this failed root turn
+                // before the restored draft can be submitted again.
+                self.gen += 1;
                 self.agent_turns = 0;
                 self.mode = Mode::Input;
+                self.active_turn_model = None;
+                self.active_turn_can_promote_queue = true;
+                self.approval_focused = true;
+                self.restore_queued_prompt("the previous request failed");
                 self.apply_deferred_model_reconciliation();
             }
         }
@@ -655,17 +804,39 @@ impl App {
     /// A user turn finished with a final answer: persist, and compact the
     /// context in the background if it has grown past the threshold.
     fn end_turn(&mut self) {
+        // A root turn is closed before another can start. Any provider events
+        // already buffered with the old generation are ignored.
+        self.gen += 1;
         self.agent_turns = 0;
         self.mode = Mode::Input;
-        self.apply_deferred_model_reconciliation();
+        self.active_turn_model = None;
         self.refresh_environment();
-        self.save_session();
+        let can_promote = std::mem::replace(&mut self.active_turn_can_promote_queue, true);
+        if !self.save_session_checked() {
+            self.restore_queued_prompt("the completed turn could not be saved");
+            self.apply_deferred_model_reconciliation();
+            return;
+        }
+        if !can_promote {
+            self.restore_queued_prompt("the previous response did not finish cleanly");
+            self.apply_deferred_model_reconciliation();
+            return;
+        }
+        if self.queued_prompt.is_none() {
+            self.apply_deferred_model_reconciliation();
+        }
         if self.context_over_threshold() && !self.compacting {
             self.transcript.push(Entry::Info(
                 "context exceeded threshold — compacting in the background".into(),
             ));
             self.start_compaction();
+            if !self.compacting {
+                self.restore_queued_prompt("context compaction could not start");
+                self.apply_deferred_model_reconciliation();
+            }
+            return;
         }
+        self.dispatch_queued_prompt();
     }
 
     /// Process the queue of tool calls returned by the model: pause for
@@ -681,6 +852,10 @@ impl App {
                     && !self.approved_scopes.contains(&tools::approval_scope(call)) =>
             {
                 self.approval_preview = tools::approval_preview(call);
+                // Always require an explicit Tab before decision shortcuts are
+                // armed. This also fences keys buffered just before the modal
+                // arrived, even when the one lookahead slot is already full.
+                self.approval_focused = false;
                 self.mode = Mode::Approval;
             }
             Some(_) => {
@@ -692,6 +867,7 @@ impl App {
 
     fn run_tool(&mut self, call: ToolCall) {
         self.mode = Mode::RunningTool;
+        self.gen += 1;
         let gen = self.gen;
         let tx = self.tx.clone();
         self.tool_task = Some(tokio::spawn(async move {
@@ -747,16 +923,21 @@ impl App {
     // ---- user actions ----
 
     pub fn submit_input(&mut self) {
+        if self.mode != Mode::Input {
+            return;
+        }
+        if self.queued_prompt.is_some() {
+            self.composer_notice = Some("next message is already queued".into());
+            return;
+        }
         let text = self.textarea.lines().join("\n").trim().to_owned();
         if text.is_empty() {
             return;
         }
-        // Slash commands stay available while compacting; only chat turns
-        // must wait for the new context.
+        // Slash commands stay available while compacting. A normal message is
+        // captured as the one-turn lookahead and sent after compaction.
         if self.compacting && !text.starts_with('/') {
-            self.transcript.push(Entry::Error(
-                "context compaction in progress — try again in a moment".into(),
-            ));
+            self.queue_input();
             return;
         }
         // Keep the user's draft intact while providers are still being found
@@ -777,15 +958,105 @@ impl App {
             self.run_slash_command(command);
             return;
         }
+
+        let model = self
+            .model
+            .clone()
+            .expect("a model was checked before dispatch");
         // Attach staged images plus any image paths referenced in the text
         // (typed or drag-and-dropped onto the terminal).
-        let mut images = std::mem::take(&mut self.pending_images);
-        for path in images::extract_image_paths(&text) {
-            match images::load_image(&path) {
-                Ok(attachment) => images.push(attachment),
-                Err(e) => self.transcript.push(Entry::Error(format!("{e:#}"))),
+        let staged_images = std::mem::take(&mut self.pending_images);
+        let restored = self.restored_references.take();
+        let reuse_restored = restored
+            .as_ref()
+            .is_some_and(|restored| restored.text == text);
+        let mut referenced_images = if reuse_restored {
+            restored.map_or_else(Vec::new, |restored| restored.images)
+        } else {
+            Vec::new()
+        };
+        let references_suppressed = self
+            .suppressed_reference_text
+            .take()
+            .is_some_and(|suppressed| suppressed == text);
+        if !reuse_restored && !references_suppressed {
+            for path in images::extract_image_paths(&text) {
+                match images::load_image(&path) {
+                    Ok(attachment) => referenced_images.push(attachment),
+                    Err(e) => self.transcript.push(Entry::Error(format!("{e:#}"))),
+                }
             }
         }
+        self.dispatch_prompt(QueuedPrompt {
+            text,
+            staged_images,
+            referenced_images,
+            model,
+        });
+    }
+
+    /// Capture the next user turn without touching provider history. This is
+    /// intentionally one-slot: after capture the composer locks until the
+    /// prompt is dispatched or restored following an abnormal end.
+    pub fn queue_input(&mut self) {
+        if self.queued_prompt.is_some() {
+            self.composer_notice = Some("next message is already queued".into());
+            return;
+        }
+        let text = self.textarea.lines().join("\n").trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        if text.starts_with('/') {
+            self.composer_notice = Some("commands are available after the current turn".into());
+            return;
+        }
+        let Some(model) = self
+            .active_turn_model
+            .clone()
+            .or_else(|| self.model.clone())
+        else {
+            self.composer_notice = Some("no model available for the next message".into());
+            return;
+        };
+
+        // Resolve referenced files now, so the queued message owns the exact
+        // bytes the user saw when pressing Enter. On failure, keep the draft
+        // and originally staged attachments untouched.
+        let staged_images = std::mem::take(&mut self.pending_images);
+        let mut referenced_images = Vec::new();
+        for path in images::extract_image_paths(&text) {
+            match images::load_image(&path) {
+                Ok(attachment) => referenced_images.push(attachment),
+                Err(e) => {
+                    self.pending_images = staged_images;
+                    self.composer_notice = Some(format!("could not queue message: {e:#}"));
+                    return;
+                }
+            }
+        }
+
+        self.textarea = make_textarea(&self.theme);
+        self.remember_input(&text);
+        self.composer_notice = None;
+        self.queued_prompt = Some(QueuedPrompt {
+            text,
+            staged_images,
+            referenced_images,
+            model,
+        });
+    }
+
+    fn dispatch_prompt(&mut self, prompt: QueuedPrompt) {
+        debug_assert_eq!(self.mode, Mode::Input);
+        debug_assert!(!self.compacting);
+        debug_assert!(self.request_task.is_none());
+        debug_assert!(self.tool_task.is_none());
+        debug_assert!(self.pending_calls.is_empty());
+
+        let (text, model, images) = prompt.into_images();
+        self.active_turn_model = Some(model);
+        self.active_turn_can_promote_queue = true;
         self.transcript.push(Entry::User(text.clone()));
         if !images.is_empty() {
             let names: Vec<&str> = images.iter().map(|(n, _)| n.as_str()).collect();
@@ -806,8 +1077,44 @@ impl App {
         self.start_request();
     }
 
+    fn dispatch_queued_prompt(&mut self) {
+        if self.mode != Mode::Input
+            || self.compacting
+            || self.request_task.is_some()
+            || self.tool_task.is_some()
+            || !self.pending_calls.is_empty()
+        {
+            return;
+        }
+        if let Some(prompt) = self.queued_prompt.take() {
+            self.dispatch_prompt(prompt);
+        }
+    }
+
+    fn restore_queued_prompt(&mut self, reason: &str) {
+        let Some(prompt) = self.queued_prompt.take() else {
+            return;
+        };
+        let QueuedPrompt {
+            text,
+            staged_images,
+            referenced_images,
+            ..
+        } = prompt;
+        self.set_input(&text);
+        self.pending_images = staged_images;
+        // Preserve the exact bytes captured from referenced paths. If the user
+        // edits the restored text, exact-text matching prevents their reuse.
+        self.restored_references = Some(RestoredReferences {
+            text,
+            images: referenced_images,
+        });
+        self.suppressed_reference_text = None;
+        self.composer_notice = Some(format!("next message restored — {reason}"));
+    }
+
     pub fn paste(&mut self, text: &str) {
-        if self.mode != Mode::Input {
+        if !self.composer_accepts_input() {
             return;
         }
         // Files dragged onto the terminal arrive as a paste of their paths:
@@ -817,41 +1124,73 @@ impl App {
             for path in dropped {
                 match images::load_image(&path) {
                     Ok((name, data)) => {
-                        self.transcript
-                            .push(Entry::Info(format!("image staged: {name} — Esc clears")));
                         self.pending_images.push((name, data));
+                        if self.mode == Mode::Input && !self.compacting {
+                            self.transcript.push(Entry::Info(
+                                "image staged from dropped file — Esc clears".into(),
+                            ));
+                        }
                     }
-                    Err(e) => self.transcript.push(Entry::Error(format!("{e:#}"))),
+                    Err(e) => {
+                        if self.mode == Mode::Input && !self.compacting {
+                            self.transcript.push(Entry::Error(format!("{e:#}")));
+                        } else {
+                            self.composer_notice = Some(format!("{e:#}"));
+                        }
+                    }
                 }
             }
             return;
         }
         self.textarea
             .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+        self.note_input_changed();
     }
 
     // ---- image attachments ----
 
     /// Ctrl+V: stage an image from the system clipboard for the next message.
     pub fn attach_clipboard_image(&mut self) {
+        if !self.composer_accepts_input() {
+            return;
+        }
         match images::clipboard_image() {
             Ok(image) => {
                 let name = format!("clipboard-{}.png", self.pending_images.len() + 1);
                 self.pending_images.push((name, image));
-                self.transcript.push(Entry::Info(format!(
-                    "image staged from clipboard ({} attached) — Esc clears",
-                    self.pending_images.len()
-                )));
+                if self.mode == Mode::Input && !self.compacting {
+                    self.transcript.push(Entry::Info(format!(
+                        "image staged from clipboard ({} attached) — Esc clears",
+                        self.pending_images.len()
+                    )));
+                }
             }
-            Err(e) => self.transcript.push(Entry::Info(format!("{e:#}"))),
+            Err(e) => {
+                if self.mode == Mode::Input && !self.compacting {
+                    self.transcript.push(Entry::Info(format!("{e:#}")));
+                } else {
+                    self.composer_notice = Some(format!("{e:#}"));
+                }
+            }
         }
     }
 
     pub fn clear_attachments(&mut self) {
-        if !self.pending_images.is_empty() {
+        let text = self.textarea.lines().join("\n").trim().to_owned();
+        let had_restored = self
+            .restored_references
+            .as_ref()
+            .is_some_and(|restored| restored.text == text && !restored.images.is_empty());
+        if !self.pending_images.is_empty() || had_restored {
             self.pending_images.clear();
-            self.transcript
-                .push(Entry::Info("attachments cleared".into()));
+            self.restored_references = None;
+            if had_restored {
+                self.suppressed_reference_text = Some(text);
+            }
+            if self.mode == Mode::Input && !self.compacting {
+                self.transcript
+                    .push(Entry::Info("attachments cleared".into()));
+            }
         }
     }
 
@@ -876,6 +1215,9 @@ impl App {
         self.textarea = make_textarea(&self.theme);
         self.input_history_pos = None;
         self.input_draft.clear();
+        self.composer_notice = None;
+        self.restored_references = None;
+        self.suppressed_reference_text = None;
     }
 
     pub fn history_recall_active(&self) -> bool {
@@ -916,6 +1258,9 @@ impl App {
     fn set_input(&mut self, text: &str) {
         self.textarea = make_textarea(&self.theme);
         self.textarea.insert_str(text);
+        self.composer_notice = None;
+        self.restored_references = None;
+        self.suppressed_reference_text = None;
     }
 
     fn run_slash_command(&mut self, command: &str) {
@@ -964,6 +1309,7 @@ impl App {
 
     pub fn close_help(&mut self) {
         self.mode = Mode::Input;
+        self.dispatch_queued_prompt();
     }
 
     /// `/model <name>`: select directly on a unique match, open the picker
@@ -1021,10 +1367,16 @@ impl App {
     }
 
     fn start_request(&mut self) {
-        let Some(model) = self.model.clone() else {
+        let Some(model) = self
+            .active_turn_model
+            .clone()
+            .or_else(|| self.model.clone())
+        else {
             self.mode = Mode::Input;
+            self.restore_queued_prompt("the selected model is unavailable");
             return;
         };
+        debug_assert!(self.request_task.is_none());
         self.mode = Mode::Streaming;
         self.streaming_text.clear();
         self.transcript.push(Entry::Assistant(String::new()));
@@ -1041,6 +1393,7 @@ impl App {
             messages: self.history.clone(),
             tools,
         };
+        self.gen += 1;
         let gen = self.gen;
         let config = self.config.clone();
         let tx = self.tx.clone();
@@ -1055,6 +1408,10 @@ impl App {
     }
 
     pub fn cancel_request(&mut self) {
+        self.cancel_request_inner(true);
+    }
+
+    fn cancel_request_inner(&mut self, restore_queue: bool) {
         // Invalidate in-flight work; late events from old generations are dropped.
         self.gen += 1;
         if let Some(task) = self.request_task.take() {
@@ -1084,27 +1441,63 @@ impl App {
         self.transcript.push(Entry::Info("cancelled".into()));
         self.agent_turns = 0;
         self.mode = Mode::Input;
+        self.active_turn_model = None;
+        self.active_turn_can_promote_queue = true;
+        self.approval_focused = true;
+        if restore_queue {
+            self.restore_queued_prompt("the previous request was cancelled");
+        } else {
+            self.queued_prompt = None;
+        }
         self.apply_deferred_model_reconciliation();
     }
 
     /// Quit through the same cancellation path as Esc so partial text is
     /// preserved and dangling tool calls are repaired before session save.
     pub fn request_quit(&mut self) {
+        if self.queued_prompt.is_some() {
+            if matches!(
+                self.mode,
+                Mode::Streaming | Mode::RunningTool | Mode::Approval
+            ) {
+                self.cancel_request_inner(true);
+            } else {
+                self.cancel_compaction();
+                self.mode = Mode::Input;
+                self.restore_queued_prompt("quit was paused for confirmation");
+            }
+            self.composer_notice =
+                Some("next message restored — press Ctrl+C again to discard it and quit".into());
+            return;
+        }
         if matches!(
             self.mode,
             Mode::Streaming | Mode::RunningTool | Mode::Approval
         ) {
-            self.cancel_request();
+            self.cancel_request_inner(false);
         }
         self.cancel_compaction();
+        self.queued_prompt = None;
         self.should_quit = true;
     }
 
     fn cancel_compaction(&mut self) {
+        self.compaction_gen += 1;
         if let Some(task) = self.compaction_task.take() {
             task.abort();
         }
         self.compacting = false;
+    }
+
+    pub fn cancel_compaction_request(&mut self) {
+        if !self.compacting {
+            return;
+        }
+        self.cancel_compaction();
+        self.transcript
+            .push(Entry::Info("context compaction cancelled".into()));
+        self.restore_queued_prompt("context compaction was cancelled");
+        self.apply_deferred_model_reconciliation();
     }
 
     /// Providers reject an assistant tool call that has no matching result.
@@ -1233,10 +1626,17 @@ impl App {
     // ---- sessions ----
 
     pub fn save_session(&mut self) {
+        self.save_session_checked();
+    }
+
+    fn save_session_checked(&mut self) -> bool {
         if let Err(e) = self.persist_session() {
             // Mid-session persistence failures stay inside the restored TUI.
             self.transcript
                 .push(Entry::Error(format!("failed to save session: {e:#}")));
+            false
+        } else {
+            true
         }
     }
 
@@ -1299,8 +1699,14 @@ impl App {
         self.scroll_from_bottom = 0;
         self.last_usage = None;
         self.pending_calls.clear();
+        self.queued_prompt = None;
+        self.pending_images.clear();
+        self.clear_input();
         self.approved_scopes.clear();
         self.approval_preview = None;
+        self.approval_focused = true;
+        self.active_turn_model = None;
+        self.active_turn_can_promote_queue = true;
         self.transcript
             .push(Entry::Info("started a new session".into()));
     }
@@ -1345,7 +1751,15 @@ impl App {
                 self.scroll_from_bottom = 0;
                 self.agent_turns = 0;
                 self.last_usage = None;
+                self.pending_calls.clear();
+                self.queued_prompt = None;
+                self.pending_images.clear();
+                self.clear_input();
                 self.approved_scopes.clear();
+                self.approval_preview = None;
+                self.approval_focused = true;
+                self.active_turn_model = None;
+                self.active_turn_can_promote_queue = true;
                 if let Some(saved) = loaded.model {
                     if self
                         .models
@@ -1444,6 +1858,8 @@ impl App {
             return;
         }
         self.compacting = true;
+        self.compaction_gen += 1;
+        let compaction_gen = self.compaction_gen;
 
         // The history is flattened to plain text so the summary request is
         // valid for every provider regardless of tool-call wire formats.
@@ -1469,7 +1885,11 @@ impl App {
             // kill-on-drop CLI children instead of leaving billed work behind.
             let stream = providers::stream_chat(config, request, chat_tx);
             let result = collect_compaction_stream(stream, &mut chat_rx).await;
-            let _ = tx.send(AppEvent::CompactionDone { session_id, result });
+            let _ = tx.send(AppEvent::CompactionDone {
+                session_id,
+                compaction_gen,
+                result,
+            });
         }));
     }
 
@@ -1488,11 +1908,22 @@ impl App {
                     before / 1000,
                     self.history_chars() / 1000
                 )));
-                self.save_session();
+                if self.save_session_checked() {
+                    if self.queued_prompt.is_none() {
+                        self.apply_deferred_model_reconciliation();
+                    }
+                    self.dispatch_queued_prompt();
+                } else {
+                    self.restore_queued_prompt("the compacted session could not be saved");
+                    self.apply_deferred_model_reconciliation();
+                }
             }
-            Err(e) => self
-                .transcript
-                .push(Entry::Error(format!("compaction failed: {e}"))),
+            Err(e) => {
+                self.transcript
+                    .push(Entry::Error(format!("compaction failed: {e}")));
+                self.restore_queued_prompt("context compaction failed");
+                self.apply_deferred_model_reconciliation();
+            }
         }
     }
 }
@@ -1506,43 +1937,62 @@ where
 {
     tokio::pin!(stream);
     let mut text = String::new();
+    let mut terminal = None;
 
     loop {
         tokio::select! {
             _ = &mut stream => {
                 while let Ok(event) = chat_rx.try_recv() {
-                    if let Some(result) = collect_compaction_event(event, &mut text) {
-                        return result;
-                    }
+                    stage_compaction_event(event, &mut text, &mut terminal);
                 }
-                return finish_compaction_text(text);
+                return terminal.unwrap_or_else(|| {
+                    Err("summary stream ended before normal completion".into())
+                });
             }
             event = chat_rx.recv() => match event {
-                Some(event) => {
-                    if let Some(result) = collect_compaction_event(event, &mut text) {
-                        // A terminal event is enough: returning drops the
-                        // provider future if its transport/CLI has not exited.
-                        return result;
-                    }
-                }
+                Some(event) => stage_compaction_event(event, &mut text, &mut terminal),
                 None => {
                     (&mut stream).await;
-                    return finish_compaction_text(text);
+                    return terminal.unwrap_or_else(|| {
+                        Err("summary stream ended before normal completion".into())
+                    });
                 }
             }
         }
     }
 }
 
-fn collect_compaction_event(event: ChatEvent, text: &mut String) -> Option<Result<String, String>> {
+fn stage_compaction_event(
+    event: ChatEvent,
+    text: &mut String,
+    terminal: &mut Option<Result<String, String>>,
+) {
+    // An error reported during provider cleanup wins over an earlier success.
+    if terminal.as_ref().is_some_and(Result::is_err) {
+        return;
+    }
     match event {
-        ChatEvent::TextDelta(delta) => {
+        ChatEvent::TextDelta(delta) if terminal.is_none() => {
             text.push_str(&delta);
-            None
         }
-        ChatEvent::Error(error) => Some(Err(error)),
-        ChatEvent::Completed { .. } => Some(finish_compaction_text(std::mem::take(text))),
-        ChatEvent::ToolActivity { .. } => None,
+        ChatEvent::Error(error) => *terminal = Some(Err(error)),
+        ChatEvent::Completed {
+            tool_calls,
+            stop_reason,
+            ..
+        } if terminal.is_none() => {
+            *terminal = Some(
+                if clean_stop_reason(stop_reason.as_deref(), !tool_calls.is_empty()) {
+                    finish_compaction_text(std::mem::take(text))
+                } else {
+                    let reason = stop_reason.unwrap_or_else(|| "unknown".into());
+                    Err(format!(
+                        "summary stopped before normal completion: {reason}"
+                    ))
+                },
+            );
+        }
+        ChatEvent::TextDelta(_) | ChatEvent::ToolActivity { .. } | ChatEvent::Completed { .. } => {}
     }
 }
 
@@ -1554,6 +2004,17 @@ fn finish_compaction_text(text: String) -> Result<String, String> {
     }
 }
 
+/// Providers use different normal terminal labels. Unknown/refusal/filter
+/// reasons are conservative failures for queue promotion: the next prompt is
+/// restored for review instead of being sent automatically.
+fn clean_stop_reason(reason: Option<&str>, has_tool_calls: bool) -> bool {
+    match reason {
+        Some("stop" | "end_turn") => !has_tool_calls,
+        Some("tool_use" | "tool_calls" | "function_call") => has_tool_calls,
+        None | Some(_) => false,
+    }
+}
+
 async fn forward_chat_stream<F>(
     gen: u64,
     stream: F,
@@ -1562,14 +2023,56 @@ async fn forward_chat_stream<F>(
 ) where
     F: Future<Output = ()>,
 {
-    let forward = async move {
-        while let Some(event) = chat_rx.recv().await {
-            if tx.send(AppEvent::Chat { gen, event }).is_err() {
-                break;
+    tokio::pin!(stream);
+    let mut terminal = None;
+
+    loop {
+        tokio::select! {
+            _ = &mut stream => break,
+            event = chat_rx.recv() => match event {
+                Some(event) => {
+                    if !forward_or_hold_chat_event(gen, event, &tx, &mut terminal) {
+                        return;
+                    }
+                }
+                None => {
+                    (&mut stream).await;
+                    break;
+                }
             }
         }
-    };
-    tokio::join!(stream, forward);
+    }
+
+    // Providers may emit their logical terminal marker before an HTTP body or
+    // CLI process has fully closed. Hold that marker until the owned future is
+    // done so an immediately queued turn cannot overlap cleanup/session state.
+    while let Ok(event) = chat_rx.try_recv() {
+        if !forward_or_hold_chat_event(gen, event, &tx, &mut terminal) {
+            return;
+        }
+    }
+    let event = terminal
+        .unwrap_or_else(|| ChatEvent::Error("provider stream ended before completion".into()));
+    let _ = tx.send(AppEvent::Chat { gen, event });
+}
+
+fn forward_or_hold_chat_event(
+    gen: u64,
+    event: ChatEvent,
+    tx: &UnboundedSender<AppEvent>,
+    terminal: &mut Option<ChatEvent>,
+) -> bool {
+    match event {
+        ChatEvent::Error(_) => *terminal = Some(event),
+        ChatEvent::Completed { .. } if !matches!(terminal.as_ref(), Some(ChatEvent::Error(_))) => {
+            *terminal = Some(event);
+        }
+        ChatEvent::TextDelta(_) | ChatEvent::ToolActivity { .. } if terminal.is_none() => {
+            return tx.send(AppEvent::Chat { gen, event }).is_ok();
+        }
+        ChatEvent::Completed { .. } | ChatEvent::TextDelta(_) | ChatEvent::ToolActivity { .. } => {}
+    }
+    true
 }
 
 fn make_textarea(theme: &Theme) -> TextArea<'static> {
@@ -1813,6 +2316,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarder_holds_completion_until_provider_cleanup_finishes() {
+        let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (terminal_sent_tx, terminal_sent_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let provider = async move {
+            let _ = chat_tx.send(ChatEvent::Completed {
+                tool_calls: Vec::new(),
+                stop_reason: Some("stop".into()),
+                usage: None,
+            });
+            let _ = terminal_sent_tx.send(());
+            let _ = release_rx.await;
+        };
+        let task = tokio::spawn(forward_chat_stream(7, provider, chat_rx, app_tx));
+
+        terminal_sent_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(app_rx.try_recv().is_err());
+
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        assert!(matches!(
+            app_rx.recv().await,
+            Some(AppEvent::Chat {
+                gen: 7,
+                event: ChatEvent::Completed { .. }
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_requires_a_clean_terminal_marker() {
+        let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider = async move {
+            let _ = chat_tx.send(ChatEvent::TextDelta("partial summary".into()));
+        };
+        let result = collect_compaction_stream(provider, &mut chat_rx).await;
+        assert!(matches!(result, Err(message) if message.contains("before normal completion")));
+
+        let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider = async move {
+            let _ = chat_tx.send(ChatEvent::TextDelta("truncated summary".into()));
+            let _ = chat_tx.send(ChatEvent::Completed {
+                tool_calls: Vec::new(),
+                stop_reason: Some("length".into()),
+                usage: None,
+            });
+        };
+        let result = collect_compaction_stream(provider, &mut chat_rx).await;
+        assert!(matches!(result, Err(message) if message.contains("length")));
+    }
+
+    #[tokio::test]
+    async fn cancelled_compaction_rejects_a_buffered_same_session_result() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        app.history.push(Message::User("current history".into()));
+        app.compacting = true;
+        let session_id = app.session_id.clone();
+        let cancelled_gen = app.compaction_gen;
+
+        app.cancel_compaction_request();
+        app.on_event(AppEvent::CompactionDone {
+            session_id,
+            compaction_gen: cancelled_gen,
+            result: Ok("stale summary".into()),
+        });
+
+        assert!(!app.compacting);
+        assert!(matches!(
+            app.history.as_slice(),
+            [Message::User(content)] if content.text() == "current history"
+        ));
+    }
+
+    #[tokio::test]
     async fn new_session_aborts_owned_compaction_work() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -1917,6 +2497,103 @@ mod tests {
             app.save_session_for_exit().is_err(),
             "shutdown must surface a persistence failure"
         );
+
+        std::fs::remove_dir_all(&data_dir).ok();
+        match previous_data_dir {
+            Some(path) => std::env::set_var("SHALTAIBOLTAI_DATA_DIR", path),
+            None => std::env::remove_var("SHALTAIBOLTAI_DATA_DIR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_waits_for_successful_compaction() {
+        let _data_dir_guard = DATA_DIR_ENV_LOCK.lock().await;
+        let previous_data_dir = std::env::var_os("SHALTAIBOLTAI_DATA_DIR");
+        let data_dir =
+            std::env::temp_dir().join(format!("shaltai-queued-compact-{}", session::new_id()));
+        std::env::set_var("SHALTAIBOLTAI_DATA_DIR", &data_dir);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "queue-test".into(),
+        });
+        app.history.push(Message::User("old context".into()));
+        app.compacting = true;
+        app.textarea.insert_str("after compaction");
+        app.submit_input();
+        assert_eq!(app.queued_prompt_count(), 1);
+        assert_eq!(app.history.len(), 1);
+
+        app.compacting = false;
+        app.finish_compaction(Ok("compressed context".into()));
+        assert_eq!(app.mode, Mode::Streaming);
+        assert_eq!(app.queued_prompt_count(), 0);
+        assert!(matches!(
+            app.history.as_slice(),
+            [Message::User(summary), Message::User(next)]
+                if summary.text().contains("compressed context")
+                    && next.text() == "after compaction"
+        ));
+        app.cancel_request();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut failed = App::new(offline_config(), tx);
+        failed.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "queue-test".into(),
+        });
+        failed.history.push(Message::User("old context".into()));
+        failed.compacting = true;
+        failed.textarea.insert_str("do not auto-send");
+        failed.submit_input();
+        failed.compacting = false;
+        failed.finish_compaction(Err("offline".into()));
+        assert_eq!(failed.mode, Mode::Input);
+        assert_eq!(failed.queued_prompt_count(), 0);
+        assert_eq!(failed.textarea.lines().join("\n"), "do not auto-send");
+        assert_eq!(failed.history.len(), 1);
+
+        std::fs::remove_dir_all(&data_dir).ok();
+        match previous_data_dir {
+            Some(path) => std::env::set_var("SHALTAIBOLTAI_DATA_DIR", path),
+            None => std::env::remove_var("SHALTAIBOLTAI_DATA_DIR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_failure_restores_queued_prompt_without_dispatching() {
+        let _data_dir_guard = DATA_DIR_ENV_LOCK.lock().await;
+        let previous_data_dir = std::env::var_os("SHALTAIBOLTAI_DATA_DIR");
+        let data_dir =
+            std::env::temp_dir().join(format!("shaltai-queued-save-{}", session::new_id()));
+        std::env::set_var("SHALTAIBOLTAI_DATA_DIR", &data_dir);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "queue-test".into(),
+        });
+        app.history.push(Message::User("completed request".into()));
+        app.mode = Mode::Streaming;
+        app.textarea.insert_str("must remain a draft");
+        app.queue_input();
+
+        let blocked_data_root = data_dir.join("not-a-directory");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(&blocked_data_root, "occupied").unwrap();
+        std::env::set_var("SHALTAIBOLTAI_DATA_DIR", &blocked_data_root);
+        app.end_turn();
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.queued_prompt_count(), 0);
+        assert_eq!(app.textarea.lines().join("\n"), "must remain a draft");
+        assert!(app
+            .transcript
+            .iter()
+            .any(|entry| matches!(entry, Entry::Error(text) if text.contains("failed to save"))));
 
         std::fs::remove_dir_all(&data_dir).ok();
         match previous_data_dir {

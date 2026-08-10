@@ -7,6 +7,7 @@
 use super::{ChatEvent, ChatRequest, Config, Message, Usage};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
@@ -36,7 +37,7 @@ pub async fn stream_chat_claude(
     req: &ChatRequest,
     tx: &UnboundedSender<ChatEvent>,
 ) -> Result<()> {
-    let Some(prompt) = last_user_text(&req.messages) else {
+    let Some(prompt) = prompt_for_request(req) else {
         anyhow::bail!("no user message to send");
     };
     if has_images(&req.messages) {
@@ -46,28 +47,26 @@ pub async fn stream_chat_claude(
         });
     }
 
-    // First turn of a conversation starts fresh; later turns continue the CLI's
-    // own session so it keeps full context. Counting our user messages also
-    // makes /new (which clears history) naturally start a new CLI session.
-    let continue_session = user_message_count(&req.messages) > 1;
+    let cmd = fresh_claude_command(config, &prompt);
+    drive(cmd, "claude", tx, handle_claude_event).await
+}
+
+fn fresh_claude_command(config: &Config, prompt: &str) -> tokio::process::Command {
     let permission_mode = if config.claude_code_bypass_permissions {
         "bypassPermissions"
     } else {
         "acceptEdits"
     };
-
     let mut cmd = tokio::process::Command::new("claude");
     cmd.arg("--print")
-        .arg(&prompt)
+        .arg("--no-session-persistence")
+        .arg(prompt)
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
         .arg("--permission-mode")
         .arg(permission_mode);
-    if continue_session {
-        cmd.arg("--continue");
-    }
-    drive(cmd, "claude", tx, handle_claude_event).await
+    cmd
 }
 
 /// Shared subprocess driver: spawn the CLI, stream its NDJSON stdout through
@@ -180,7 +179,7 @@ fn handle_claude_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
             });
             let _ = tx.send(ChatEvent::Completed {
                 tool_calls: Vec::new(),
-                stop_reason: None,
+                stop_reason: Some("stop".into()),
                 usage,
             });
             true
@@ -218,11 +217,74 @@ fn first_line(s: &str) -> String {
     }
 }
 
-fn last_user_text(messages: &[Message]) -> Option<String> {
-    messages.iter().rev().find_map(|m| match m {
-        Message::User(c) => Some(c.text().to_owned()),
-        _ => None,
-    })
+/// Build a self-contained prompt for a fresh CLI process. A genuinely first
+/// turn stays as terse as the user wrote it; later requests carry the complete
+/// provider-agnostic history because no cwd-global CLI session is resumed.
+fn prompt_for_request(req: &ChatRequest) -> Option<String> {
+    if let [Message::User(content)] = req.messages.as_slice() {
+        return Some(content.text().to_owned());
+    }
+    if !req
+        .messages
+        .iter()
+        .any(|message| matches!(message, Message::User(_)))
+    {
+        return None;
+    }
+
+    let mut prompt = String::from(
+        "Continue the coding-assistant conversation below. This is a complete handoff from a \
+fresh process; use the supplied history instead of assuming access to an earlier CLI session.\n\n",
+    );
+    prompt.push_str("## System instructions\n");
+    prompt.push_str(&req.system);
+    prompt.push_str("\n\n## Conversation history\n");
+
+    for message in &req.messages {
+        match message {
+            Message::User(content) => {
+                prompt.push_str("\n### User\n");
+                for (index, image) in content.images().iter().enumerate() {
+                    let _ = writeln!(
+                        prompt,
+                        "[image {}: {}; binary data omitted]",
+                        index + 1,
+                        image.media_type
+                    );
+                }
+                prompt.push_str(content.text());
+                prompt.push('\n');
+            }
+            Message::Assistant { text, tool_calls } => {
+                prompt.push_str("\n### Assistant\n");
+                prompt.push_str(text);
+                prompt.push('\n');
+                for call in tool_calls {
+                    let _ = writeln!(
+                        prompt,
+                        "[tool call: {} (id {})]\n{}",
+                        call.name, call.id, call.arguments
+                    );
+                }
+            }
+            Message::ToolResult {
+                call_id,
+                name,
+                content,
+                is_error,
+            } => {
+                let status = if *is_error { "error" } else { "success" };
+                let _ = writeln!(prompt, "\n### Tool result: {name} (id {call_id}, {status})");
+                prompt.push_str(content);
+                prompt.push('\n');
+            }
+        }
+    }
+
+    prompt.push_str(
+        "\n## Continuation\nContinue from this history and address the latest unresolved user request.",
+    );
+    Some(prompt)
 }
 
 fn has_images(messages: &[Message]) -> bool {
@@ -236,13 +298,6 @@ fn has_images(messages: &[Message]) -> bool {
         .unwrap_or(false)
 }
 
-fn user_message_count(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .filter(|m| matches!(m, Message::User(_)))
-        .count()
-}
-
 // ---- Codex (ChatGPT subscription) ----
 
 pub async fn codex_available() -> bool {
@@ -254,7 +309,7 @@ pub async fn stream_chat_codex(
     req: &ChatRequest,
     tx: &UnboundedSender<ChatEvent>,
 ) -> Result<()> {
-    let Some(prompt) = last_user_text(&req.messages) else {
+    let Some(prompt) = prompt_for_request(req) else {
         anyhow::bail!("no user message to send");
     };
     if has_images(&req.messages) {
@@ -264,25 +319,27 @@ pub async fn stream_chat_codex(
         });
     }
 
-    let mut cmd = tokio::process::Command::new("codex");
-    cmd.arg("exec");
-    // `resume --last` continues the most recent session in this directory; it
-    // reuses that session's sandbox, so --sandbox is only set on a fresh run.
-    if user_message_count(&req.messages) > 1 {
-        cmd.arg("resume").arg("--last");
-    } else {
-        // workspace-write is OS-sandboxed (no network, confined to the cwd);
-        // danger-full-access removes the sandbox entirely.
-        let sandbox = if config.codex_full_access {
-            "danger-full-access"
-        } else {
-            "workspace-write"
-        };
-        cmd.arg("--sandbox").arg(sandbox);
-    }
-    cmd.arg("--json").arg("--skip-git-repo-check").arg(&prompt);
-
+    let cmd = fresh_codex_command(config, &prompt);
     drive(cmd, "codex", tx, handle_codex_event).await
+}
+
+fn fresh_codex_command(config: &Config, prompt: &str) -> tokio::process::Command {
+    // Every request starts in a fresh, explicitly sandboxed process. Context is
+    // carried in `prompt`, never inferred from another cwd-global CLI session.
+    let sandbox = if config.codex_full_access {
+        "danger-full-access"
+    } else {
+        "workspace-write"
+    };
+    let mut cmd = tokio::process::Command::new("codex");
+    cmd.arg("exec")
+        .arg("--ephemeral")
+        .arg("--sandbox")
+        .arg(sandbox)
+        .arg("--json")
+        .arg("--skip-git-repo-check")
+        .arg(prompt);
+    cmd
 }
 
 /// Translate one `codex exec --json` event. Returns true on `turn.completed`
@@ -327,7 +384,7 @@ fn handle_codex_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
             });
             let _ = tx.send(ChatEvent::Completed {
                 tool_calls: Vec::new(),
-                stop_reason: None,
+                stop_reason: Some("stop".into()),
                 usage,
             });
             true
@@ -366,9 +423,44 @@ fn summarize_codex_item(item: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::UserContent;
+    use crate::providers::{ImageData, ModelEntry, ProviderKind, ToolCall, UserContent};
     use serde_json::json;
     use tokio::sync::mpsc::unbounded_channel;
+
+    fn request(system: &str, messages: Vec<Message>) -> ChatRequest {
+        ChatRequest {
+            model: ModelEntry {
+                provider: ProviderKind::Codex,
+                id: "codex".into(),
+            },
+            system: system.into(),
+            messages,
+            tools: Vec::new(),
+        }
+    }
+
+    fn config() -> Config {
+        Config {
+            anthropic_api_key: None,
+            openai_api_key: None,
+            openai_base_url: "http://127.0.0.1:9".into(),
+            ollama_host: "http://127.0.0.1:9".into(),
+            default_model: None,
+            compact_threshold_chars: 80_000,
+            ollama_num_ctx: 16_384,
+            theme: None,
+            claude_code_bypass_permissions: false,
+            codex_full_access: false,
+        }
+    }
+
+    fn command_args(command: &tokio::process::Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
 
     fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<ChatEvent>) -> Vec<ChatEvent> {
         let mut out = Vec::new();
@@ -440,18 +532,110 @@ mod tests {
     }
 
     #[test]
-    fn continuation_is_driven_by_user_message_count() {
-        let first = vec![Message::User("hi".into())];
-        let later = vec![
-            Message::User("hi".into()),
+    fn first_turn_prompt_stays_plain() {
+        let req = request(
+            "system context",
+            vec![Message::User("fix the tests".into())],
+        );
+        assert_eq!(prompt_for_request(&req).as_deref(), Some("fix the tests"));
+    }
+
+    #[test]
+    fn multi_turn_prompt_contains_the_complete_handoff() {
+        let req = request(
+            "system context",
+            vec![
+                Message::User(UserContent::Rich {
+                    text: "inspect the screenshot".into(),
+                    images: vec![ImageData {
+                        media_type: "image/png".into(),
+                        data: "BASE64-MUST-NOT-BE-IN-PROMPT".into(),
+                    }],
+                }),
+                Message::Assistant {
+                    text: "I will inspect it.".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "src/main.rs"}),
+                    }],
+                },
+                Message::ToolResult {
+                    call_id: "call-1".into(),
+                    name: "read_file".into(),
+                    content: "fn main() {}".into(),
+                    is_error: false,
+                },
+                Message::User("now fix it".into()),
+            ],
+        );
+
+        let prompt = prompt_for_request(&req).unwrap();
+        for expected in [
+            "## System instructions\nsystem context",
+            "### User\n[image 1: image/png; binary data omitted]\ninspect the screenshot",
+            "### Assistant\nI will inspect it.",
+            "[tool call: read_file (id call-1)]\n{\"path\":\"src/main.rs\"}",
+            "### Tool result: read_file (id call-1, success)\nfn main() {}",
+            "### User\nnow fix it",
+        ] {
+            assert!(
+                prompt.contains(expected),
+                "missing {expected:?} in {prompt}"
+            );
+        }
+        assert!(!prompt.contains("BASE64-MUST-NOT-BE-IN-PROMPT"));
+    }
+
+    #[test]
+    fn cli_commands_always_start_fresh() {
+        let config = config();
+        let claude_args = command_args(&fresh_claude_command(&config, "prompt"));
+        assert!(!claude_args.iter().any(|arg| arg == "--continue"));
+        assert!(claude_args
+            .iter()
+            .any(|arg| arg == "--no-session-persistence"));
+
+        let codex_args = command_args(&fresh_codex_command(&config, "prompt"));
+        assert_eq!(codex_args.first().map(String::as_str), Some("exec"));
+        assert!(!codex_args
+            .iter()
+            .any(|arg| arg == "resume" || arg == "--last"));
+        assert!(codex_args.iter().any(|arg| arg == "--ephemeral"));
+        assert!(codex_args
+            .windows(2)
+            .any(|args| { args[0] == "--sandbox" && args[1] == "workspace-write" }));
+    }
+
+    #[test]
+    fn prompt_requires_at_least_one_user_message() {
+        let req = request(
+            "system context",
+            vec![Message::Assistant {
+                text: "orphaned".into(),
+                tool_calls: vec![],
+            }],
+        );
+        assert!(prompt_for_request(&req).is_none());
+    }
+
+    #[test]
+    fn image_notice_reads_the_latest_user_turn() {
+        let messages = vec![
+            Message::User("old".into()),
             Message::Assistant {
-                text: "hello".into(),
+                text: "x".into(),
                 tool_calls: vec![],
             },
-            Message::User("again".into()),
+            Message::User(UserContent::Rich {
+                text: "newest".into(),
+                images: vec![ImageData {
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                }],
+            }),
         ];
-        assert_eq!(user_message_count(&first), 1);
-        assert_eq!(user_message_count(&later), 2);
+        assert!(has_images(&messages));
     }
 
     #[test]
@@ -510,25 +694,5 @@ mod tests {
             &tx,
         );
         assert!(drain(&mut rx).is_empty());
-    }
-
-    #[test]
-    fn last_user_text_and_images_read_the_latest_turn() {
-        let messages = vec![
-            Message::User("old".into()),
-            Message::Assistant {
-                text: "x".into(),
-                tool_calls: vec![],
-            },
-            Message::User(UserContent::Rich {
-                text: "newest".into(),
-                images: vec![crate::providers::ImageData {
-                    media_type: "image/png".into(),
-                    data: "AA==".into(),
-                }],
-            }),
-        ];
-        assert_eq!(last_user_text(&messages).as_deref(), Some("newest"));
-        assert!(has_images(&messages));
     }
 }

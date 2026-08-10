@@ -3,7 +3,7 @@ use ratatui::style::Color;
 use ratatui::Terminal;
 use shaltaiboltai::app::{App, AppEvent, Entry, Mode};
 use shaltaiboltai::config::Config;
-use shaltaiboltai::providers::{ChatEvent, ToolCall};
+use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
 use shaltaiboltai::{theme, ui};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -166,8 +166,22 @@ async fn help_is_a_responsive_overlay_instead_of_transcript_noise() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let rendered = screen(&terminal);
     assert!(rendered.contains("keyboard guide"), "{rendered}");
-    assert!(rendered.contains("cancel safely and quit"), "{rendered}");
+    assert!(rendered.contains("restore queued, then quit"), "{rendered}");
     assert!(rendered.contains("F1 · Enter · Esc close"), "{rendered}");
+}
+
+#[tokio::test]
+async fn help_height_boundary_keeps_the_queue_safe_quit_binding() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.open_help();
+    // This yields exactly 17 inner rows: one too short for the detailed guide.
+    let mut terminal = Terminal::new(TestBackend::new(80, 21)).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    assert!(rendered.contains("queue-safe quit"), "{rendered}");
 }
 
 #[tokio::test]
@@ -190,11 +204,12 @@ async fn long_approval_keeps_actions_visible_and_scrolls_its_preview() {
                     "content": content,
                 }),
             }],
-            stop_reason: None,
+            stop_reason: Some("tool_calls".into()),
             usage: None,
         },
     });
     assert_eq!(app.mode, Mode::Approval);
+    app.focus_approval();
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -315,6 +330,128 @@ async fn narrow_terminal_preserves_conversation_status_and_composer() {
     assert!(rendered.contains("shaltaiboltai"), "{rendered}");
     assert!(rendered.contains("discovering"), "{rendered}");
     assert!(rendered.contains("compose"), "{rendered}");
+}
+
+#[tokio::test]
+async fn active_composer_explains_and_confirms_one_turn_lookahead() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "queue-test".into(),
+    });
+    app.mode = Mode::Streaming;
+    app.textarea.insert_str("run these checks next");
+    let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let composing = screen(&terminal);
+    assert!(composing.contains("next message"), "{composing}");
+    assert!(composing.contains("Enter queue"), "{composing}");
+
+    app.queue_input();
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let queued = screen(&terminal);
+    assert!(queued.contains("next message queued"), "{queued}");
+    assert!(queued.contains("waiting for current"), "{queued}");
+
+    let mut narrow = Terminal::new(TestBackend::new(24, 8)).unwrap();
+    narrow.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let narrow = screen(&narrow);
+    assert!(narrow.contains("queued"), "{narrow}");
+
+    let (tx, _rx) = unbounded_channel();
+    let mut with_images = App::new(offline_config(), tx);
+    with_images.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "queue-test".into(),
+    });
+    with_images.mode = Mode::Streaming;
+    for name in ["one.png", "two.png"] {
+        with_images.pending_images.push((
+            name.into(),
+            ImageData {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            },
+        ));
+    }
+    with_images.textarea.insert_str("inspect these");
+    with_images.queue_input();
+    let mut narrow = Terminal::new(TestBackend::new(24, 8)).unwrap();
+    narrow
+        .draw(|frame| ui::draw(frame, &mut with_images))
+        .unwrap();
+    let narrow = screen(&narrow);
+    assert!(narrow.contains("2 images"), "{narrow}");
+}
+
+#[tokio::test]
+async fn approval_arrives_with_composer_focus_and_explicit_review_hint() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.mode = Mode::Streaming;
+    app.textarea.insert_str("typed y remains text");
+    app.on_event(AppEvent::Chat {
+        gen: 0,
+        event: ChatEvent::Completed {
+            tool_calls: vec![ToolCall {
+                id: "focus-render".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "x.txt", "content": "x"}),
+            }],
+            stop_reason: Some("tool_calls".into()),
+            usage: None,
+        },
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+
+    assert!(rendered.contains("composer focus"), "{rendered}");
+    assert!(rendered.contains("Tab review"), "{rendered}");
+    assert!(rendered.contains("typed y remains text"), "{rendered}");
+}
+
+#[tokio::test]
+async fn tall_draft_keeps_the_approval_review_escape_hatch_visible() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.mode = Mode::Streaming;
+    app.textarea.insert_str(
+        (1..=8)
+            .map(|line| format!("draft line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    app.on_event(AppEvent::Chat {
+        gen: 0,
+        event: ChatEvent::Completed {
+            tool_calls: vec![ToolCall {
+                id: "tall-draft-approval".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "x.txt", "content": "x"}),
+            }],
+            stop_reason: Some("tool_calls".into()),
+            usage: None,
+        },
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(32, 10)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    assert!(rendered.contains("Tab"), "{rendered}");
+    assert!(rendered.contains("draft line 8"), "{rendered}");
+
+    let mut tiny = Terminal::new(TestBackend::new(24, 8)).unwrap();
+    tiny.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&tiny);
+    assert!(rendered.contains("Tab"), "{rendered}");
+    assert!(rendered.contains("draft line 8"), "{rendered}");
 }
 
 #[tokio::test]
@@ -448,10 +585,11 @@ async fn long_approval_material_wraps_to_reachable_visual_rows() {
                     "command": format!("echo start; {} echo APPROVAL_TAIL_§", "echo segment; ".repeat(40)),
                 }),
             }],
-            stop_reason: None,
+            stop_reason: Some("tool_calls".into()),
             usage: None,
         },
     });
+    command_app.focus_approval();
     let mut terminal = Terminal::new(TestBackend::new(52, 16)).unwrap();
     terminal.draw(|f| ui::draw(f, &mut command_app)).unwrap();
     command_app.approval_scroll = usize::MAX;
@@ -476,10 +614,11 @@ async fn long_approval_material_wraps_to_reachable_visual_rows() {
                     "content": format!("{}§\n", "界".repeat(80)),
                 }),
             }],
-            stop_reason: None,
+            stop_reason: Some("tool_calls".into()),
             usage: None,
         },
     });
+    diff_app.focus_approval();
     let mut terminal = Terminal::new(TestBackend::new(42, 14)).unwrap();
     terminal.draw(|f| ui::draw(f, &mut diff_app)).unwrap();
     diff_app.approval_scroll = usize::MAX;
@@ -500,7 +639,7 @@ async fn narrow_help_prioritizes_safety_bindings_without_overflow() {
     let rendered = screen(&terminal);
     assert!(rendered.contains("cancel / deny"), "{rendered}");
     assert!(rendered.contains("approval"), "{rendered}");
-    assert!(rendered.contains("safe quit"), "{rendered}");
+    assert!(rendered.contains("queue-safe quit"), "{rendered}");
 }
 
 #[tokio::test]
@@ -549,7 +688,7 @@ async fn light_theme_tool_badge_uses_a_readable_on_color() {
                     "content": "contrast check",
                 }),
             }],
-            stop_reason: None,
+            stop_reason: Some("tool_calls".into()),
             usage: None,
         },
     });

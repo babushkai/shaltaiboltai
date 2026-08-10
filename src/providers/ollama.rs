@@ -1,6 +1,6 @@
 use super::sse;
 use super::{ChatEvent, ChatRequest, Config, Message, ToolCall, Usage};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -92,13 +92,28 @@ pub async fn stream_chat(
         Ok(())
     })
     .await?;
+    let stop_reason = normalize_stop_reason(
+        stop_reason.context("Ollama stream ended before a done reason")?,
+        !tool_calls.is_empty(),
+    );
 
     let _ = tx.send(ChatEvent::Completed {
         tool_calls,
-        stop_reason,
+        stop_reason: Some(stop_reason),
         usage,
     });
     Ok(())
+}
+
+fn normalize_stop_reason(reason: String, has_tool_calls: bool) -> String {
+    // Ollama commonly reports `done_reason: "stop"` even when the message
+    // contains tool calls. Normalize that provider quirk so the app can apply
+    // one strict terminal-reason contract across every provider.
+    if reason == "stop" && has_tool_calls {
+        "tool_calls".into()
+    } else {
+        reason
+    }
 }
 
 pub async fn list_models(config: &Config) -> Result<Vec<String>> {
@@ -189,5 +204,11 @@ mod tests {
         let wire = to_wire_messages("sys", &[Message::User("hi".into())]);
         assert_eq!(wire[1]["content"], "hi");
         assert!(wire[1].get("images").is_none());
+    }
+
+    #[test]
+    fn stop_with_tool_calls_is_normalized_to_a_tool_terminal() {
+        assert_eq!(normalize_stop_reason("stop".into(), true), "tool_calls");
+        assert_eq!(normalize_stop_reason("stop".into(), false), "stop");
     }
 }

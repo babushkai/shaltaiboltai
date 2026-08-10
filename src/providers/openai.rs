@@ -97,10 +97,11 @@ pub async fn stream_chat(
             arguments: serde_json::from_str(&args).unwrap_or(json!({})),
         })
         .collect();
+    let stop_reason = stop_reason.context("OpenAI stream ended before a finish reason")?;
 
     let _ = tx.send(ChatEvent::Completed {
         tool_calls,
-        stop_reason,
+        stop_reason: Some(stop_reason),
         usage,
     });
     Ok(())

@@ -26,9 +26,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    let desired_input = (app.textarea.lines().len() as u16).clamp(1, MAX_INPUT_LINES) + 2;
-    // Preserve at least a status row and one transcript row on short terminals.
-    let input_height = desired_input.min(frame.area().height.saturating_sub(2).max(1));
+    let input_height = input_height(app, frame.area().height);
     let [transcript_area, status_area, input_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -53,49 +51,127 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+fn input_height(app: &App, total_height: u16) -> u16 {
+    let desired = (app.textarea.lines().len() as u16).clamp(1, MAX_INPUT_LINES) + 2;
+    // Composer-focused approvals reserve enough room for a visible review and
+    // Tab affordance even when the draft itself is tall. At normal terminal
+    // sizes the composer still keeps one visible inner row for safe editing.
+    if app.mode == Mode::Approval && !app.approval_focused {
+        let available = total_height.saturating_sub(5).max(1);
+        let minimum = if total_height >= 8 { 3 } else { 1 };
+        desired.min(available).max(minimum)
+    } else {
+        desired.min(total_height.saturating_sub(2).max(1))
+    }
+}
+
 /// The input renders as an elevated card; its border doubles as the focus
 /// indicator — accent while typing is possible, structural otherwise.
 fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
-    let focused = app.mode == Mode::Input && !app.compacting;
-    let border = if focused { theme.accent } else { theme.border };
+    let focused = app.composer_accepts_input();
+    let queued = app.queued_prompt_count() > 0;
+    let lookahead = app.compacting
+        || matches!(
+            app.mode,
+            Mode::Streaming | Mode::RunningTool | Mode::Approval
+        );
+    let border = if focused {
+        theme.accent
+    } else if queued {
+        theme.accent2
+    } else {
+        theme.border
+    };
+    let title = if queued && area.width < 32 {
+        " queued "
+    } else if queued {
+        " next message queued "
+    } else if lookahead {
+        " next message "
+    } else {
+        " compose "
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(border))
         .title(Line::styled(
-            " compose ",
+            title,
             Style::new().fg(border).add_modifier(Modifier::BOLD),
         ));
-    if !app.pending_images.is_empty() {
+    let image_count = if queued {
+        app.queued_image_count()
+    } else {
+        app.pending_image_count()
+    };
+    if image_count > 0 {
+        let mut metadata = Vec::new();
+        metadata.push(format!(
+            "{image_count} image{}",
+            if image_count == 1 { "" } else { "s" }
+        ));
+        if focused && lookahead {
+            metadata.push("Ctrl+X clear".into());
+        }
+        let budget = area.width.saturating_sub(title.width() as u16 + 4) as usize;
+        let metadata = truncate_width(&metadata.join(" · "), budget);
         block = block.title(
-            Line::styled(
-                format!(
-                    " ⊞ {} image{} · Esc clears ",
-                    app.pending_images.len(),
-                    if app.pending_images.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                ),
-                Style::new().fg(theme.accent2),
-            )
-            .alignment(Alignment::Right),
+            Line::styled(format!(" {metadata} "), Style::new().fg(theme.accent2))
+                .alignment(Alignment::Right),
         );
     }
-    if area.width >= 52 {
-        block = block.title_bottom(
-            Line::styled(
-                " Enter send · Alt+Enter newline · / commands ",
-                Style::new().fg(theme.dim),
-            )
-            .alignment(Alignment::Right),
-        );
+    let footer = if let Some(notice) = app.composer_notice() {
+        Some((notice.to_owned(), theme.warning))
+    } else if app.mode == Mode::Approval && !app.approval_focused && queued {
+        Some(("Tab review tool · next message queued".into(), theme.dim))
+    } else if app.mode == Mode::Approval && !app.approval_focused {
+        Some((
+            "Tab review tool · Enter queue · Alt+Enter newline".into(),
+            theme.dim,
+        ))
+    } else if focused && lookahead {
+        Some((
+            "Esc cancel · Enter queue · Alt+Enter newline".into(),
+            theme.dim,
+        ))
+    } else if queued && app.mode == Mode::Approval {
+        Some(("waiting for tool decision · n / Esc deny".into(), theme.dim))
+    } else if queued {
+        Some(("Esc cancel · waiting for current turn".into(), theme.dim))
+    } else if focused {
+        Some((
+            "Enter send · Alt+Enter newline · / commands".into(),
+            theme.dim,
+        ))
+    } else {
+        None
+    };
+    if area.width >= 16 {
+        if let Some((footer, color)) = footer {
+            let footer = truncate_width(&footer, area.width.saturating_sub(4) as usize);
+            block = block.title_bottom(
+                Line::styled(format!(" {footer} "), Style::new().fg(color))
+                    .alignment(Alignment::Right),
+            );
+        }
     }
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
     }
+    let placeholder = if queued {
+        "Waiting for the current turn to finish…"
+    } else if lookahead {
+        "Type the next request while this one runs…"
+    } else {
+        "Describe a change or ask a question…"
+    };
+    app.textarea.set_placeholder_text(placeholder);
+    app.textarea.set_cursor_style(if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    });
     app.textarea.set_block(block);
     frame.render_widget(&app.textarea, area);
 }
@@ -498,8 +574,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Mode::Help => ("keyboard guide", theme.accent2),
         }
     };
+    let state = if app.mode == Mode::Approval && !app.approval_focused {
+        if app.queued_prompt_count() > 0 {
+            format!("{state} · next queued · Tab review")
+        } else {
+            format!("{state} · Tab to review")
+        }
+    } else if app.queued_prompt_count() > 0 {
+        format!("{state} · next queued")
+    } else {
+        state.to_owned()
+    };
     let spinner_width = if app.is_busy() { 3 } else { 1 };
-    let state_width = UnicodeWidthStr::width(state);
+    let state_width = UnicodeWidthStr::width(state.as_str());
     let chip_budget = (area.width as usize)
         .saturating_sub(state_width + spinner_width + 2)
         .min(36);
@@ -899,13 +986,27 @@ fn draw_overlay_list(
 fn draw_approval(frame: &mut Frame, app: &mut App) {
     let theme = app.theme;
     let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
+    let approval_focused = app.approval_focused;
     let Some(call) = app.pending_approval() else {
         return;
     };
     let description = tools::describe(call);
     let scope_label = tools::approval_scope_label(call);
     let arguments = call.arguments.clone();
-    let area = modal_area(frame.area(), 96, 24);
+    let queue_occupied = app.queued_prompt_count() > 0;
+    // When type-ahead owns focus, keep the composer physically visible below
+    // the modal. Arming approval focus with Tab expands the review back to the
+    // full terminal height.
+    let modal_root = if approval_focused {
+        frame.area()
+    } else {
+        let input_height = input_height(app, frame.area().height);
+        Rect {
+            height: frame.area().height.saturating_sub(input_height),
+            ..frame.area()
+        }
+    };
+    let area = modal_area(modal_root, 96, 24);
     frame.render_widget(Clear, area);
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -913,7 +1014,13 @@ fn draw_approval(frame: &mut Frame, app: &mut App) {
         .border_style(Style::new().fg(warning))
         .padding(Padding::horizontal(1))
         .title(Line::styled(
-            " review tool request ",
+            if approval_focused {
+                " review tool request · approval focus "
+            } else if queue_occupied {
+                " review tool request · press Tab "
+            } else {
+                " review tool request · composer focus "
+            },
             Style::new().fg(warning).add_modifier(Modifier::BOLD),
         ));
     if let Some(surface) = theme.surface {
@@ -925,7 +1032,13 @@ fn draw_approval(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let action_lines = approval_action_lines(scope_label, inner.width as usize, &theme);
+    let action_lines = if approval_focused {
+        approval_action_lines(scope_label, inner.width as usize, &theme)
+    } else if queue_occupied {
+        approval_paused_lines(inner.width as usize, &theme)
+    } else {
+        approval_composer_lines(inner.width as usize, &theme)
+    };
     let action_height = (action_lines.len() as u16).min(inner.height);
     let room_before_actions = inner.height.saturating_sub(action_height);
     let summary_height = if room_before_actions >= 7 {
@@ -1033,10 +1146,17 @@ fn draw_approval(frame: &mut Frame, app: &mut App) {
         } else {
             format!("lines {}–{} of {}", start + 1, end, lines.len())
         };
+        let controls = if approval_focused {
+            "  ·  ↑↓ / PgUp PgDn scroll"
+        } else if queue_occupied {
+            "  ·  PgUp PgDn scroll · Tab review"
+        } else {
+            "  ·  PgUp PgDn scroll · ↑↓ edit"
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(range, Style::new().fg(theme.dim)),
-                Span::styled("  ·  ↑↓ / PgUp PgDn scroll", Style::new().fg(theme.dim)),
+                Span::styled(controls, Style::new().fg(theme.dim)),
             ])),
             meta_area,
         );
@@ -1051,6 +1171,47 @@ fn draw_approval(frame: &mut Frame, app: &mut App) {
         ),
         action_area,
     );
+}
+
+fn approval_paused_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let review = Line::from(vec![
+        key_span("Tab", theme.accent),
+        Span::styled(" review tool request", Style::new().fg(theme.fg)),
+    ]);
+    let queued = Line::styled(
+        "next message already queued",
+        Style::new().fg(theme.accent2),
+    );
+    if review.width() + queued.width() + 3 <= width {
+        vec![Line::from(vec![
+            key_span("Tab", theme.accent),
+            Span::styled(" review   ·   ", Style::new().fg(theme.fg)),
+            Span::styled("next queued", Style::new().fg(theme.accent2)),
+        ])]
+    } else {
+        vec![review, queued]
+    }
+}
+
+fn approval_composer_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let first = Line::from(vec![
+        key_span("Tab", theme.accent),
+        Span::styled(" review tool request", Style::new().fg(theme.fg)),
+    ]);
+    let second = Line::from(vec![
+        key_span("Enter", theme.accent2),
+        Span::styled(" queue next message", Style::new().fg(theme.fg)),
+    ]);
+    if first.width() + second.width() + 3 <= width {
+        vec![Line::from(vec![
+            key_span("Tab", theme.accent),
+            Span::styled(" review   ·   ", Style::new().fg(theme.fg)),
+            key_span("Enter", theme.accent2),
+            Span::styled(" queue next", Style::new().fg(theme.fg)),
+        ])]
+    } else {
+        vec![first, second]
+    }
 }
 
 /// Wrap approval material into real visual rows before applying vertical
@@ -1225,12 +1386,13 @@ fn draw_help(frame: &mut Frame, app: &App) {
             Style::new().fg(theme.accent2).add_modifier(Modifier::BOLD),
         )
     };
-    let lines = if inner.height >= 17 && inner.width >= 44 {
+    let lines = if inner.height >= 18 && inner.width >= 44 {
         vec![
             section("MESSAGE"),
-            key("Enter", "send message"),
+            key("Enter", "send, or queue next while working"),
             key("Alt+Enter", "insert a newline"),
             key("Ctrl+V", "attach clipboard image"),
+            key("Ctrl+X", "clear staged attachments"),
             key("Ctrl+U", "clear the composer"),
             key("/", "browse commands"),
             Line::raw(""),
@@ -1241,28 +1403,28 @@ fn draw_help(frame: &mut Frame, app: &App) {
             key("Ctrl+Home/End", "oldest / latest message"),
             Line::raw(""),
             section("AGENT"),
-            key("Esc", "cancel work; deny an approval"),
-            key("y / a / n", "approve / allow scope / deny"),
-            key("Ctrl+C", "cancel safely and quit"),
+            key("Esc", "cancel work; focus / deny approval"),
+            key("Tab · y/a/n", "focus approval · decide"),
+            key("Ctrl+C", "restore queued, then quit"),
         ]
     } else if inner.height >= 8 {
         vec![
-            key("Enter", "send"),
+            key("Enter", "send / queue next"),
             key("Alt+Enter", "newline"),
             key("Ctrl+P", "models"),
             key("/", "commands"),
             key("PgUp/PgDn", "scroll"),
             key("Esc", "cancel / deny"),
-            key("y / a / n", "approval choices"),
-            key("Ctrl+C", "safe quit"),
+            key("Tab · y/a/n", "approval choices"),
+            key("Ctrl+C", "queue-safe quit"),
         ]
     } else {
         // Safety and exit bindings come first when there is not enough room
         // for even the compact guide; never render more rows than can fit.
         vec![
             key("Esc", "cancel / deny"),
-            key("y / a / n", "approval"),
-            key("Ctrl+C", "safe quit"),
+            key("Tab · y/a/n", "approval"),
+            key("Ctrl+C", "queue-safe quit"),
             key("Enter", "send"),
             key("/", "commands"),
             key("PgUp/PgDn", "scroll"),
