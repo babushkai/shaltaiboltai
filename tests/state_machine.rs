@@ -159,6 +159,71 @@ async fn error_and_cancel_restore_queued_text_and_attachments() {
 }
 
 #[tokio::test]
+async fn provider_rejection_before_activity_restores_the_current_prompt() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.pending_images.push((
+        "retry.png".into(),
+        ImageData {
+            media_type: "image/png".into(),
+            data: "cmV0cnk=".into(),
+        },
+    ));
+    app.textarea.insert_str("retry this exact request");
+    app.submit_input();
+    let gen = app.event_generation();
+
+    app.on_event(AppEvent::Chat {
+        gen,
+        event: ChatEvent::Notice("images are not forwarded by this CLI".into()),
+    });
+    app.on_event(AppEvent::Chat {
+        gen,
+        event: ChatEvent::Error("unknown model".into()),
+    });
+
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.textarea.lines().join("\n"), "retry this exact request");
+    assert_eq!(app.pending_images.len(), 1);
+    assert!(
+        app.history.is_empty(),
+        "the rejected user turn must roll back"
+    );
+    assert!(app
+        .composer_notice()
+        .is_some_and(|notice| notice.contains("message restored")));
+}
+
+#[tokio::test]
+async fn early_provider_failure_never_overwrites_a_successive_draft() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("first request");
+    app.submit_input();
+    let gen = app.event_generation();
+
+    app.textarea.insert_str("draft for later");
+    app.pending_images.push((
+        "later.png".into(),
+        ImageData {
+            media_type: "image/png".into(),
+            data: "bGF0ZXI=".into(),
+        },
+    ));
+    app.on_event(AppEvent::Chat {
+        gen,
+        event: ChatEvent::Error("unknown model".into()),
+    });
+
+    assert_eq!(app.textarea.lines().join("\n"), "draft for later");
+    assert_eq!(app.pending_images[0].0, "later.png");
+    assert!(matches!(
+        app.history.first(),
+        Some(Message::User(content)) if content.text() == "first request"
+    ));
+}
+
+#[tokio::test]
 async fn restored_queue_reuses_frozen_referenced_image_bytes() {
     let (mut app, _rx) = test_app();
     enable_test_model(&mut app);
@@ -222,6 +287,52 @@ async fn clearing_a_restored_reference_prevents_hidden_resubmission() {
     assert!(matches!(
         app.history.last(),
         Some(Message::User(UserContent::Text(text))) if text.contains("inspect")
+    ));
+    app.cancel_request();
+}
+
+#[tokio::test]
+async fn editing_a_restored_reference_permanently_invalidates_frozen_bytes() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("first request");
+    app.submit_input();
+    let first_gen = app.event_generation();
+
+    let image_path =
+        std::env::temp_dir().join(format!("shaltai-queued-edit-{}.png", std::process::id()));
+    std::fs::write(&image_path, b"original image bytes").unwrap();
+    let original = format!("inspect {}", image_path.display());
+    app.textarea.insert_str(&original);
+    app.queue_input();
+    std::fs::remove_file(&image_path).unwrap();
+    app.on_event(AppEvent::Chat {
+        gen: first_gen,
+        event: ChatEvent::Error("provider failed".into()),
+    });
+    assert_eq!(app.pending_image_count(), 1);
+
+    // A Delete/Backspace key can be delivered without changing text. The
+    // content comparison in note_input_changed must keep frozen bytes intact.
+    app.note_input_changed();
+    assert_eq!(app.pending_image_count(), 1);
+
+    app.textarea.insert_str(" edited");
+    app.note_input_changed();
+    assert_eq!(
+        app.pending_image_count(),
+        0,
+        "the first text mutation must discard frozen referenced bytes"
+    );
+    app.clear_attachments();
+    app.clear_input();
+    app.textarea.insert_str(&original);
+    app.note_input_changed();
+    app.submit_input();
+
+    assert!(matches!(
+        app.history.last(),
+        Some(Message::User(UserContent::Text(text))) if text == &original
     ));
     app.cancel_request();
 }
@@ -590,6 +701,378 @@ async fn slash_model_with_argument_selects_or_prefilters() {
     app.submit_input();
     assert_eq!(app.mode, Mode::ModelPicker);
     assert_eq!(app.picker_filter, "qwen");
+}
+
+#[tokio::test]
+async fn slash_model_accepts_explicit_cli_selectors() {
+    let (mut app, _rx) = test_app();
+    app.models = vec![
+        ModelEntry {
+            provider: ProviderKind::ClaudeCode,
+            id: "claude-code".into(),
+        },
+        ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
+        },
+    ];
+
+    app.textarea.insert_str("/model claude-code:claude-fable-5");
+    app.submit_input();
+    assert_eq!(
+        app.model
+            .as_ref()
+            .map(|model| (model.provider, model.id.as_str())),
+        Some((ProviderKind::ClaudeCode, "claude-code:claude-fable-5"))
+    );
+
+    app.textarea.insert_str("/model codex:gpt-future");
+    app.submit_input();
+    assert_eq!(
+        app.model
+            .as_ref()
+            .map(|model| (model.provider, model.id.as_str())),
+        Some((ProviderKind::Codex, "codex:gpt-future"))
+    );
+    assert!(app
+        .models
+        .iter()
+        .any(|model| model.id == "codex:gpt-future"));
+
+    app.textarea.insert_str("/model codex:default");
+    app.submit_input();
+    assert_eq!(
+        app.model.as_ref().map(|model| model.id.as_str()),
+        Some("codex")
+    );
+
+    app.models.push(ModelEntry {
+        provider: ProviderKind::Codex,
+        id: "codex:gpt-5.6-sol".into(),
+    });
+    app.textarea.insert_str("/model codex:gpt-5.6");
+    app.submit_input();
+    assert_eq!(
+        app.model.as_ref().map(|model| model.id.as_str()),
+        Some("codex:gpt-5.6"),
+        "a qualified custom selector must not fuzzy-match a listed model"
+    );
+}
+
+#[tokio::test]
+async fn configured_cli_selector_materializes_after_provider_discovery() {
+    let mut config = offline_config();
+    config.default_model = Some("codex:gpt-future".into());
+    let (mut app, _rx) = test_app_with_config(config);
+    assert!(app.model.is_none());
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: vec![
+            ModelEntry {
+                provider: ProviderKind::Ollama,
+                id: "codex:gpt-future".into(),
+            },
+            ModelEntry {
+                provider: ProviderKind::Codex,
+                id: "codex".into(),
+            },
+        ],
+        finished: true,
+    });
+
+    assert_eq!(
+        app.model
+            .as_ref()
+            .map(|model| (model.provider, model.id.as_str())),
+        Some((ProviderKind::Codex, "codex:gpt-future"))
+    );
+    assert!(app
+        .models
+        .iter()
+        .any(|model| model.id == "codex:gpt-future"));
+}
+
+#[tokio::test]
+async fn unavailable_configured_cli_model_never_falls_back_across_providers() {
+    let mut config = offline_config();
+    config.anthropic_api_key = Some("test-key".into());
+    config.default_model = Some("codex:gpt-unavailable".into());
+    let (mut app, _rx) = test_app_with_config(config);
+    assert!(app.model.is_none());
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: Vec::new(),
+        finished: true,
+    });
+
+    assert!(app.model.is_none());
+    assert!(app.transcript.iter().any(|entry| matches!(
+        entry,
+        shaltaiboltai::app::Entry::Error(message)
+            if message.contains("codex:gpt-unavailable") && message.contains("unavailable")
+    )));
+}
+
+#[tokio::test]
+async fn unavailable_explicit_cli_model_never_falls_back_across_providers() {
+    let (mut app, _rx) = test_app();
+    app.models = vec![ModelEntry {
+        provider: ProviderKind::Codex,
+        id: "codex".into(),
+    }];
+    app.textarea.insert_str("/model codex");
+    app.submit_input();
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: vec![ModelEntry {
+            provider: ProviderKind::Anthropic,
+            id: "claude-sonnet-4-6".into(),
+        }],
+        finished: true,
+    });
+
+    assert!(app.model.is_none());
+    assert!(app.transcript.iter().any(|entry| matches!(
+        entry,
+        shaltaiboltai::app::Entry::Error(message)
+            if message.contains("selected model codex is unavailable")
+    )));
+}
+
+#[tokio::test]
+async fn bare_cli_default_config_is_bound_to_its_provider() {
+    let mut config = offline_config();
+    config.default_model = Some("codex".into());
+    let (mut app, _rx) = test_app_with_config(config);
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: vec![
+            ModelEntry {
+                provider: ProviderKind::Ollama,
+                id: "codex".into(),
+            },
+            ModelEntry {
+                provider: ProviderKind::Codex,
+                id: "codex".into(),
+            },
+        ],
+        finished: true,
+    });
+
+    assert_eq!(
+        app.model.as_ref().map(|model| model.provider),
+        Some(ProviderKind::Codex)
+    );
+}
+
+#[tokio::test]
+async fn custom_cli_selector_round_trips_through_a_saved_session() {
+    use shaltaiboltai::session;
+
+    let (mut app, _rx) = test_app();
+    let id = format!("cli-selector-session-{}", std::process::id());
+    let title = format!("custom cli selector {}", std::process::id());
+    session::save(&session::Session {
+        id,
+        title: title.clone(),
+        updated_at: session::now_secs(),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string()),
+        model: Some(ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:gpt-future".into(),
+        }),
+        history: vec![Message::User("continue later".into())],
+        transcript: Vec::new(),
+    })
+    .unwrap();
+
+    app.open_sessions();
+    app.session_index = app
+        .sessions
+        .iter()
+        .position(|session| session.title == title)
+        .unwrap();
+    app.pick_session();
+
+    assert_eq!(
+        app.model
+            .as_ref()
+            .map(|model| (model.provider, model.id.as_str())),
+        Some((ProviderKind::Codex, "codex:gpt-future"))
+    );
+
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: vec![ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
+        }],
+        finished: true,
+    });
+    assert_eq!(
+        app.model.as_ref().map(|model| model.id.as_str()),
+        Some("codex:gpt-future"),
+        "later discovery must retain the provisionally resumed selector"
+    );
+}
+
+#[tokio::test]
+async fn legacy_cli_defaults_resume_before_discovery() {
+    use shaltaiboltai::session;
+
+    for (provider, selector) in [
+        (ProviderKind::ClaudeCode, "claude-code"),
+        (ProviderKind::Codex, "codex"),
+    ] {
+        let (mut app, _rx) = test_app();
+        let title = format!("legacy {selector} {}", std::process::id());
+        session::save(&session::Session {
+            id: format!("legacy-{selector}-{}", std::process::id()),
+            title: title.clone(),
+            updated_at: session::now_secs(),
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string()),
+            model: Some(ModelEntry {
+                provider,
+                id: selector.into(),
+            }),
+            history: vec![Message::User("continue later".into())],
+            transcript: Vec::new(),
+        })
+        .unwrap();
+
+        app.open_sessions();
+        app.session_index = app
+            .sessions
+            .iter()
+            .position(|session| session.title == title)
+            .unwrap();
+        app.pick_session();
+        assert_eq!(
+            app.model
+                .as_ref()
+                .map(|model| (model.provider, model.id.as_str())),
+            Some((provider, selector))
+        );
+
+        app.on_event(AppEvent::ModelsDiscovered {
+            models: vec![ModelEntry {
+                provider,
+                id: selector.into(),
+            }],
+            finished: true,
+        });
+        assert_eq!(
+            app.model.as_ref().map(|model| model.id.as_str()),
+            Some(selector)
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_and_local_models_resume_before_their_discovery_batch() {
+    use shaltaiboltai::session;
+
+    for (provider, selector) in [
+        (ProviderKind::OpenAi, "gpt-saved"),
+        (ProviderKind::Ollama, "qwen-saved:latest"),
+    ] {
+        let (mut app, _rx) = test_app();
+        let title = format!("early {selector} {}", std::process::id());
+        session::save(&session::Session {
+            id: format!(
+                "early-{}-{}",
+                selector.replace(':', "-"),
+                std::process::id()
+            ),
+            title: title.clone(),
+            updated_at: session::now_secs(),
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string()),
+            model: Some(ModelEntry {
+                provider,
+                id: selector.into(),
+            }),
+            history: vec![Message::User("continue later".into())],
+            transcript: Vec::new(),
+        })
+        .unwrap();
+
+        app.open_sessions();
+        app.session_index = app
+            .sessions
+            .iter()
+            .position(|session| session.title == title)
+            .unwrap();
+        app.pick_session();
+        assert_eq!(
+            app.model
+                .as_ref()
+                .map(|model| (model.provider, model.id.as_str())),
+            Some((provider, selector))
+        );
+
+        app.on_event(AppEvent::ModelsDiscovered {
+            models: vec![ModelEntry {
+                provider,
+                id: selector.into(),
+            }],
+            finished: true,
+        });
+        assert_eq!(
+            app.model
+                .as_ref()
+                .map(|model| (model.provider, model.id.as_str())),
+            Some((provider, selector))
+        );
+    }
+}
+
+#[tokio::test]
+async fn unavailable_saved_model_never_inherits_the_previous_sessions_provider() {
+    use shaltaiboltai::session;
+
+    let (mut app, _rx) = test_app();
+    app.discovering = false;
+    app.models = vec![ModelEntry {
+        provider: ProviderKind::Anthropic,
+        id: "claude-sonnet-4-6".into(),
+    }];
+    app.model = app.models.first().cloned();
+    let title = format!("unavailable saved model {}", std::process::id());
+    session::save(&session::Session {
+        id: format!("unavailable-saved-model-{}", std::process::id()),
+        title: title.clone(),
+        updated_at: session::now_secs(),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string()),
+        model: Some(ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:gpt-unavailable".into(),
+        }),
+        history: vec![Message::User("continue later".into())],
+        transcript: Vec::new(),
+    })
+    .unwrap();
+
+    app.open_sessions();
+    app.session_index = app
+        .sessions
+        .iter()
+        .position(|session| session.title == title)
+        .unwrap();
+    app.pick_session();
+
+    assert!(app.model.is_none());
+    assert!(app.transcript.iter().any(|entry| matches!(
+        entry,
+        shaltaiboltai::app::Entry::Error(message)
+            if message.contains("saved model codex:gpt-unavailable is unavailable")
+    )));
 }
 
 #[tokio::test]

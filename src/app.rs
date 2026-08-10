@@ -30,11 +30,19 @@ const PROJECT_CONTEXT_CAP: usize = 8_000;
 
 /// One-turn lookahead keeps memory bounded and makes failure recovery exact:
 /// there can never be a second draft to merge with a restored queued prompt.
+#[derive(Clone)]
 struct QueuedPrompt {
     text: String,
     staged_images: Vec<(String, ImageData)>,
     referenced_images: Vec<(String, ImageData)>,
     model: ModelEntry,
+}
+
+struct ActiveRootPrompt {
+    prompt: QueuedPrompt,
+    history_len: usize,
+    transcript_len: usize,
+    observed_activity: bool,
 }
 
 impl QueuedPrompt {
@@ -276,6 +284,9 @@ pub struct App {
     agent_turns: usize,
     active_turn_model: Option<ModelEntry>,
     active_turn_can_promote_queue: bool,
+    /// Exact ownership of the submitted root prompt until the provider emits
+    /// activity. A launch/model error can then roll it back for lossless retry.
+    active_root_prompt: Option<ActiveRootPrompt>,
     compaction_gen: u64,
     request_task: Option<JoinHandle<()>>,
     tool_task: Option<JoinHandle<()>>,
@@ -292,7 +303,10 @@ impl App {
             .unwrap_or(theme::DEFAULT);
         let models = providers::immediate_models(&config);
         let model = match config.default_model.as_ref() {
-            Some(wanted) => models.iter().find(|entry| &entry.id == wanted).cloned(),
+            Some(wanted) if providers::cli_model_selector(wanted).is_none() => {
+                models.iter().find(|entry| &entry.id == wanted).cloned()
+            }
+            Some(_) => None,
             None => models.first().cloned(),
         };
         let discovery_models = models.clone();
@@ -350,6 +364,7 @@ impl App {
             agent_turns: 0,
             active_turn_model: None,
             active_turn_can_promote_queue: true,
+            active_root_prompt: None,
             compaction_gen: 0,
             request_task: None,
             tool_task: None,
@@ -454,6 +469,26 @@ impl App {
         self.slash_dismissed = false;
         self.slash_index = 0;
         self.composer_notice = None;
+        // Frozen/suppressed inline-reference state is valid only for the exact
+        // text it belongs to. Comparing content also makes a no-op Delete or
+        // Backspace harmless.
+        if self.restored_references.is_some() || self.suppressed_reference_text.is_some() {
+            let text = self.textarea.lines().join("\n").trim().to_owned();
+            if self
+                .restored_references
+                .as_ref()
+                .is_some_and(|restored| restored.text != text)
+            {
+                self.restored_references = None;
+            }
+            if self
+                .suppressed_reference_text
+                .as_ref()
+                .is_some_and(|suppressed| suppressed != &text)
+            {
+                self.suppressed_reference_text = None;
+            }
+        }
     }
 
     /// Whether keyboard and paste events should currently reach the composer.
@@ -564,6 +599,26 @@ impl App {
                         self.discovery_models.push(model);
                     }
                 }
+                // An explicitly entered CLI selector may not be present in a
+                // provider's detected catalog. Preserve it across /refresh as
+                // long as that CLI itself is still available.
+                if let Some(current) = self.model.as_ref().filter(|current| {
+                    self.model_selected_explicitly
+                        && current.provider.is_sub_agent()
+                        && current.id.contains(':')
+                        && self
+                            .discovery_models
+                            .iter()
+                            .any(|model| model.provider == current.provider)
+                }) {
+                    if !self
+                        .discovery_models
+                        .iter()
+                        .any(|model| model.provider == current.provider && model.id == current.id)
+                    {
+                        self.discovery_models.push(current.clone());
+                    }
+                }
                 let models = self.discovery_models.clone();
                 self.models = models.clone();
                 if finished {
@@ -631,27 +686,55 @@ impl App {
     }
 
     fn reconcile_discovered_model(&mut self, finished: bool) {
+        let configured_default = self.config.default_model.as_ref().and_then(|wanted| {
+            if providers::cli_model_selector(wanted).is_some() {
+                providers::custom_cli_model(wanted, &self.models)
+            } else {
+                self.models
+                    .iter()
+                    .find(|model| &model.id == wanted)
+                    .cloned()
+            }
+        });
+        if let Some(default) = configured_default.as_ref() {
+            if !self
+                .models
+                .iter()
+                .any(|model| model.id == default.id && model.provider == default.provider)
+            {
+                self.models.push(default.clone());
+                self.discovery_models.push(default.clone());
+            }
+        }
         let current_available = self.model.as_ref().is_some_and(|current| {
             self.models
                 .iter()
                 .any(|model| model.id == current.id && model.provider == current.provider)
         });
-        let configured_default = self
-            .config
-            .default_model
-            .as_ref()
-            .and_then(|want| self.models.iter().find(|m| &m.id == want).cloned());
         if !self.model_selected_explicitly {
             if let Some(default) = configured_default {
                 self.model = Some(default);
-            } else if (self.model.is_none() && self.config.default_model.is_none())
-                || (finished && !current_available)
-            {
+            } else if self.config.default_model.is_some() {
+                if finished {
+                    let wanted = self.config.default_model.as_deref().unwrap_or("unknown");
+                    self.model = None;
+                    self.transcript.push(Entry::Error(format!(
+                        "configured model {wanted} is unavailable — choose another with Ctrl+P"
+                    )));
+                }
+            } else if self.model.is_none() || (finished && !current_available) {
                 self.model = self.models.first().cloned();
             }
         } else if finished && !current_available {
-            self.model = configured_default.or_else(|| self.models.first().cloned());
+            let unavailable = self
+                .model
+                .as_ref()
+                .map_or_else(|| "saved model".to_owned(), |model| model.id.clone());
+            self.model = None;
             self.model_selected_explicitly = false;
+            self.transcript.push(Entry::Error(format!(
+                "selected model {unavailable} is unavailable — choose another with Ctrl+P"
+            )));
         }
     }
 
@@ -665,6 +748,11 @@ impl App {
     fn on_chat_event(&mut self, event: ChatEvent) {
         match event {
             ChatEvent::TextDelta(text) => {
+                if !text.is_empty() {
+                    if let Some(active) = self.active_root_prompt.as_mut() {
+                        active.observed_activity = true;
+                    }
+                }
                 self.streaming_text.push_str(&text);
                 // Append to the current assistant block, or start a new one if
                 // a sub-agent's tool activity interrupted it.
@@ -678,7 +766,25 @@ impl App {
                         .map_or(changed, |earlier| earlier.min(changed)),
                 );
             }
+            ChatEvent::Notice(message) => {
+                let replaced_placeholder =
+                    matches!(self.transcript.last(), Some(Entry::Assistant(t)) if t.is_empty());
+                if replaced_placeholder {
+                    self.transcript.pop();
+                }
+                self.transcript.push(Entry::Info(message));
+                if replaced_placeholder {
+                    let changed = self.transcript.len().saturating_sub(1);
+                    self.transcript_dirty_from = Some(
+                        self.transcript_dirty_from
+                            .map_or(changed, |earlier| earlier.min(changed)),
+                    );
+                }
+            }
             ChatEvent::ToolActivity { summary, is_error } => {
+                if let Some(active) = self.active_root_prompt.as_mut() {
+                    active.observed_activity = true;
+                }
                 // Sub-agent tools have already run inside the CLI; this is
                 // display-only and never enters our approval flow.
                 let replaced_placeholder =
@@ -704,6 +810,9 @@ impl App {
                 stop_reason,
                 usage,
             } => {
+                if let Some(active) = self.active_root_prompt.as_mut() {
+                    active.observed_activity = true;
+                }
                 if let Some(task) = self.request_task.take() {
                     task.abort();
                 }
@@ -766,22 +875,41 @@ impl App {
                 if let Some(task) = self.tool_task.take() {
                     task.abort();
                 }
-                // Keep partial text the user already saw consistent with what
-                // the model will see next turn.
-                let text = std::mem::take(&mut self.streaming_text);
-                if !text.is_empty() {
-                    self.history.push(Message::Assistant {
-                        text,
-                        tool_calls: Vec::new(),
-                    });
-                } else if matches!(self.transcript.last(), Some(Entry::Assistant(t)) if t.is_empty())
-                {
-                    self.transcript.pop();
-                    let changed = self.transcript.len();
-                    self.transcript_dirty_from = Some(
-                        self.transcript_dirty_from
-                            .map_or(changed, |earlier| earlier.min(changed)),
-                    );
+                let active_root = self.active_root_prompt.take();
+                let composer_untouched = self.input_is_empty()
+                    && self.pending_images.is_empty()
+                    && self.restored_references.is_none()
+                    && self.suppressed_reference_text.is_none();
+                let restore_current = self.queued_prompt.is_none()
+                    && composer_untouched
+                    && active_root
+                        .as_ref()
+                        .is_some_and(|active| !active.observed_activity);
+                if restore_current {
+                    let active = active_root.as_ref().expect("checked above");
+                    self.history.truncate(active.history_len);
+                    self.history_chars_cache.set(None);
+                    self.transcript.truncate(active.transcript_len);
+                    self.transcript_rev += 1;
+                    self.streaming_text.clear();
+                } else {
+                    // Keep partial text the user already saw consistent with
+                    // what the model will see next turn.
+                    let text = std::mem::take(&mut self.streaming_text);
+                    if !text.is_empty() {
+                        self.history.push(Message::Assistant {
+                            text,
+                            tool_calls: Vec::new(),
+                        });
+                    } else if matches!(self.transcript.last(), Some(Entry::Assistant(t)) if t.is_empty())
+                    {
+                        self.transcript.pop();
+                        let changed = self.transcript.len();
+                        self.transcript_dirty_from = Some(
+                            self.transcript_dirty_from
+                                .map_or(changed, |earlier| earlier.min(changed)),
+                        );
+                    }
                 }
                 self.transcript.push(Entry::Error(message));
                 self.pending_calls.clear();
@@ -795,7 +923,14 @@ impl App {
                 self.active_turn_model = None;
                 self.active_turn_can_promote_queue = true;
                 self.approval_focused = true;
-                self.restore_queued_prompt("the previous request failed");
+                if restore_current {
+                    self.restore_prompt(
+                        active_root.expect("checked above").prompt,
+                        "message restored — the provider rejected it before producing output",
+                    );
+                } else {
+                    self.restore_queued_prompt("the previous request failed");
+                }
                 self.apply_deferred_model_reconciliation();
             }
         }
@@ -810,6 +945,7 @@ impl App {
         self.agent_turns = 0;
         self.mode = Mode::Input;
         self.active_turn_model = None;
+        self.active_root_prompt = None;
         self.refresh_environment();
         let can_promote = std::mem::replace(&mut self.active_turn_can_promote_queue, true);
         if !self.save_session_checked() {
@@ -1054,6 +1190,12 @@ impl App {
         debug_assert!(self.tool_task.is_none());
         debug_assert!(self.pending_calls.is_empty());
 
+        self.active_root_prompt = Some(ActiveRootPrompt {
+            prompt: prompt.clone(),
+            history_len: self.history.len(),
+            transcript_len: self.transcript.len(),
+            observed_activity: false,
+        });
         let (text, model, images) = prompt.into_images();
         self.active_turn_model = Some(model);
         self.active_turn_can_promote_queue = true;
@@ -1095,6 +1237,10 @@ impl App {
         let Some(prompt) = self.queued_prompt.take() else {
             return;
         };
+        self.restore_prompt(prompt, &format!("next message restored — {reason}"));
+    }
+
+    fn restore_prompt(&mut self, prompt: QueuedPrompt, notice: &str) {
         let QueuedPrompt {
             text,
             staged_images,
@@ -1110,7 +1256,7 @@ impl App {
             images: referenced_images,
         });
         self.suppressed_reference_text = None;
-        self.composer_notice = Some(format!("next message restored — {reason}"));
+        self.composer_notice = Some(notice.to_owned());
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -1315,6 +1461,35 @@ impl App {
     /// `/model <name>`: select directly on a unique match, open the picker
     /// pre-filtered when ambiguous.
     fn select_model_by_filter(&mut self, filter: &str) {
+        // Provider-qualified selectors are exact identities, including
+        // unlisted model IDs. Never let substring matching silently turn one
+        // explicit CLI model into another.
+        if let Some(requested) = providers::cli_model_selector(filter) {
+            if let Some(model) = providers::custom_cli_model(filter, &self.models) {
+                if !self
+                    .models
+                    .iter()
+                    .any(|known| known.id == model.id && known.provider == model.provider)
+                {
+                    self.models.push(model.clone());
+                    self.discovery_models.push(model.clone());
+                }
+                self.transcript.push(Entry::Info(format!(
+                    "model: {} ({})",
+                    model.id,
+                    model.provider.label()
+                )));
+                self.model = Some(model);
+                self.model_selected_explicitly = true;
+            } else {
+                self.transcript.push(Entry::Error(format!(
+                    "{} CLI is not available — sign in or run /refresh",
+                    requested.provider.label()
+                )));
+            }
+            return;
+        }
+
         let needle = filter.to_lowercase();
         let matches: Vec<ModelEntry> = self
             .models
@@ -1322,12 +1497,18 @@ impl App {
             .filter(|m| m.id.to_lowercase().contains(&needle))
             .cloned()
             .collect();
-        let exact = matches.iter().find(|m| m.id.to_lowercase() == needle);
-        if let Some(model) = exact.or(if matches.len() == 1 {
+        let exact: Vec<&ModelEntry> = matches
+            .iter()
+            .filter(|model| model.id.to_lowercase() == needle)
+            .collect();
+        let picked = if exact.len() == 1 {
+            exact.first().copied()
+        } else if exact.is_empty() && matches.len() == 1 {
             matches.first()
         } else {
             None
-        }) {
+        };
+        if let Some(model) = picked {
             self.transcript.push(Entry::Info(format!(
                 "model: {} ({})",
                 model.id,
@@ -1443,6 +1624,7 @@ impl App {
         self.mode = Mode::Input;
         self.active_turn_model = None;
         self.active_turn_can_promote_queue = true;
+        self.active_root_prompt = None;
         self.approval_focused = true;
         if restore_queue {
             self.restore_queued_prompt("the previous request was cancelled");
@@ -1556,6 +1738,7 @@ impl App {
             .filter(|m| {
                 needle.is_empty()
                     || m.id.to_lowercase().contains(&needle)
+                    || m.display_id().to_lowercase().contains(&needle)
                     || m.provider.label().contains(&needle)
             })
             .collect()
@@ -1707,6 +1890,7 @@ impl App {
         self.approval_focused = true;
         self.active_turn_model = None;
         self.active_turn_can_promote_queue = true;
+        self.active_root_prompt = None;
         self.transcript
             .push(Entry::Info("started a new session".into()));
     }
@@ -1760,17 +1944,40 @@ impl App {
                 self.approval_focused = true;
                 self.active_turn_model = None;
                 self.active_turn_can_promote_queue = true;
+                self.active_root_prompt = None;
                 if let Some(saved) = loaded.model {
-                    if self
+                    let available = self
                         .models
                         .iter()
-                        .any(|m| m.id == saved.id && m.provider == saved.provider)
-                    {
-                        self.model = Some(saved);
+                        .find(|model| model.id == saved.id && model.provider == saved.provider)
+                        .cloned()
+                        .or_else(|| {
+                            providers::custom_cli_model(&saved.id, &self.models)
+                                .filter(|model| model.provider == saved.provider)
+                        });
+                    // Discovery is incremental, so a saved provider may not
+                    // have published yet. Retain its exact provider+ID
+                    // provisionally; final reconciliation validates or clears
+                    // it instead of inheriting another session's provider.
+                    let resolved = available
+                        .clone()
+                        .or_else(|| self.discovering.then(|| saved.clone()));
+                    if let Some(model) = resolved {
+                        if available.is_some()
+                            && !self.models.iter().any(|known| {
+                                known.id == model.id && known.provider == model.provider
+                            })
+                        {
+                            self.models.push(model.clone());
+                            self.discovery_models.push(model.clone());
+                        }
+                        self.model = Some(model);
                         self.model_selected_explicitly = true;
                     } else {
-                        self.transcript.push(Entry::Info(format!(
-                            "saved model {} is unavailable — keeping current model",
+                        self.model = None;
+                        self.model_selected_explicitly = false;
+                        self.transcript.push(Entry::Error(format!(
+                            "saved model {} is unavailable — choose another with Ctrl+P",
                             saved.id
                         )));
                     }
@@ -1992,7 +2199,10 @@ fn stage_compaction_event(
                 },
             );
         }
-        ChatEvent::TextDelta(_) | ChatEvent::ToolActivity { .. } | ChatEvent::Completed { .. } => {}
+        ChatEvent::TextDelta(_)
+        | ChatEvent::Notice(_)
+        | ChatEvent::ToolActivity { .. }
+        | ChatEvent::Completed { .. } => {}
     }
 }
 
@@ -2067,10 +2277,15 @@ fn forward_or_hold_chat_event(
         ChatEvent::Completed { .. } if !matches!(terminal.as_ref(), Some(ChatEvent::Error(_))) => {
             *terminal = Some(event);
         }
-        ChatEvent::TextDelta(_) | ChatEvent::ToolActivity { .. } if terminal.is_none() => {
+        ChatEvent::TextDelta(_) | ChatEvent::Notice(_) | ChatEvent::ToolActivity { .. }
+            if terminal.is_none() =>
+        {
             return tx.send(AppEvent::Chat { gen, event }).is_ok();
         }
-        ChatEvent::Completed { .. } | ChatEvent::TextDelta(_) | ChatEvent::ToolActivity { .. } => {}
+        ChatEvent::Completed { .. }
+        | ChatEvent::TextDelta(_)
+        | ChatEvent::Notice(_)
+        | ChatEvent::ToolActivity { .. } => {}
     }
     true
 }

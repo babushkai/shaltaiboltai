@@ -7,9 +7,10 @@
 use super::{ChatEvent, ChatRequest, Config, Message, Usage};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Whether the `claude` CLI is installed and responds. Cheap version probe with
@@ -41,26 +42,34 @@ pub async fn stream_chat_claude(
         anyhow::bail!("no user message to send");
     };
     if has_images(&req.messages) {
-        let _ = tx.send(ChatEvent::ToolActivity {
-            summary: "note: images are not yet forwarded to the Claude Code provider".into(),
-            is_error: false,
-        });
+        let _ = tx.send(ChatEvent::Notice(
+            "images are not yet forwarded to the Claude Code provider".into(),
+        ));
     }
 
-    let cmd = fresh_claude_command(config, &prompt);
-    drive(cmd, "claude", tx, handle_claude_event).await
+    let model = cli_model_override(
+        &req.model,
+        super::ProviderKind::ClaudeCode,
+        "claude-code",
+        "claude-code:",
+    )?;
+    let cmd = fresh_claude_command(config, model);
+    drive(cmd, "claude", &prompt, tx, handle_claude_event).await
 }
 
-fn fresh_claude_command(config: &Config, prompt: &str) -> tokio::process::Command {
+fn fresh_claude_command(config: &Config, model: Option<&str>) -> tokio::process::Command {
     let permission_mode = if config.claude_code_bypass_permissions {
         "bypassPermissions"
     } else {
         "acceptEdits"
     };
     let mut cmd = tokio::process::Command::new("claude");
-    cmd.arg("--print")
-        .arg("--no-session-persistence")
-        .arg(prompt)
+    cmd.arg("--print").arg("--no-session-persistence");
+    if let Some(model) = model {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.arg("--input-format")
+        .arg("text")
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
@@ -76,10 +85,11 @@ fn fresh_claude_command(config: &Config, prompt: &str) -> tokio::process::Comman
 async fn drive(
     mut cmd: tokio::process::Command,
     name: &str,
+    prompt: &str,
     tx: &UnboundedSender<ChatEvent>,
     handle: impl Fn(&Value, &UnboundedSender<ChatEvent>) -> bool,
 ) -> Result<()> {
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -89,6 +99,7 @@ async fn drive(
         .with_context(|| format!("failed to launch `{name}` — is it installed and signed in?"))?;
     let stdout = child.stdout.take().context("no stdout")?;
     let stderr = child.stderr.take().context("no stderr")?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
 
     // Drain stderr concurrently so the pipe never blocks the child.
     let stderr_task = tokio::spawn(async move {
@@ -100,6 +111,12 @@ async fn drive(
         }
         buf
     });
+
+    // Send prompts through stdin instead of argv. This handles prompts that
+    // begin with `-`, avoids process-list exposure, and removes ARG_MAX as the
+    // conversation handoff grows.
+    stdin.write_all(prompt.as_bytes()).await?;
+    stdin.shutdown().await?;
 
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_result = false;
@@ -304,6 +321,63 @@ pub async fn codex_available() -> bool {
     command_available("codex").await
 }
 
+/// Exact model slugs advertised by the installed Codex CLI. Its experimental
+/// machine-readable catalog is the compatibility boundary; the bundled list
+/// remains a fallback when the locally refreshed catalog is unavailable.
+pub async fn codex_model_ids() -> Vec<String> {
+    let models = run_codex_model_catalog(&["debug", "models"]).await;
+    if !models.is_empty() {
+        return models;
+    }
+    run_codex_model_catalog(&["debug", "models", "--bundled"]).await
+}
+
+async fn run_codex_model_catalog(args: &[&str]) -> Vec<String> {
+    let mut command = tokio::process::Command::new("codex");
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(3), command.output())
+        .await
+        .ok()
+        .and_then(Result::ok);
+    output
+        .filter(|output| output.status.success())
+        .map_or_else(Vec::new, |output| parse_codex_model_ids(&output.stdout))
+}
+
+fn parse_codex_model_ids(bytes: &[u8]) -> Vec<String> {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(models) = value["models"].as_array() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut visible: Vec<(u64, usize, String)> = models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            if model["visibility"].as_str() != Some("list") {
+                return None;
+            }
+            let slug = model["slug"].as_str()?.trim();
+            if slug.is_empty() || !seen.insert(slug.to_owned()) {
+                return None;
+            }
+            Some((
+                model["priority"].as_u64().unwrap_or(u64::MAX),
+                index,
+                slug.to_owned(),
+            ))
+        })
+        .collect();
+    visible.sort_by_key(|(priority, index, _)| (*priority, *index));
+    visible.into_iter().map(|(_, _, slug)| slug).collect()
+}
+
 pub async fn stream_chat_codex(
     config: &Config,
     req: &ChatRequest,
@@ -313,17 +387,17 @@ pub async fn stream_chat_codex(
         anyhow::bail!("no user message to send");
     };
     if has_images(&req.messages) {
-        let _ = tx.send(ChatEvent::ToolActivity {
-            summary: "note: images are not yet forwarded to the Codex provider".into(),
-            is_error: false,
-        });
+        let _ = tx.send(ChatEvent::Notice(
+            "images are not yet forwarded to the Codex provider".into(),
+        ));
     }
 
-    let cmd = fresh_codex_command(config, &prompt);
-    drive(cmd, "codex", tx, handle_codex_event).await
+    let model = cli_model_override(&req.model, super::ProviderKind::Codex, "codex", "codex:")?;
+    let cmd = fresh_codex_command(config, model);
+    drive(cmd, "codex", &prompt, tx, handle_codex_event).await
 }
 
-fn fresh_codex_command(config: &Config, prompt: &str) -> tokio::process::Command {
+fn fresh_codex_command(config: &Config, model: Option<&str>) -> tokio::process::Command {
     // Every request starts in a fresh, explicitly sandboxed process. Context is
     // carried in `prompt`, never inferred from another cwd-global CLI session.
     let sandbox = if config.codex_full_access {
@@ -335,11 +409,46 @@ fn fresh_codex_command(config: &Config, prompt: &str) -> tokio::process::Command
     cmd.arg("exec")
         .arg("--ephemeral")
         .arg("--sandbox")
-        .arg(sandbox)
-        .arg("--json")
-        .arg("--skip-git-repo-check")
-        .arg(prompt);
+        .arg(sandbox);
+    if let Some(model) = model {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.arg("--json").arg("--skip-git-repo-check").arg("-");
     cmd
+}
+
+fn cli_model_override<'a>(
+    model: &'a super::ModelEntry,
+    expected_provider: super::ProviderKind,
+    default_id: &str,
+    prefix: &str,
+) -> Result<Option<&'a str>> {
+    if model.provider != expected_provider {
+        anyhow::bail!(
+            "model selector {} belongs to {}, not {}",
+            model.id,
+            model.provider.label(),
+            expected_provider.label()
+        );
+    }
+    if model.id == default_id {
+        return Ok(None);
+    }
+    let Some(raw) = model.id.strip_prefix(prefix) else {
+        anyhow::bail!(
+            "invalid {} model selector: {}",
+            expected_provider.label(),
+            model.id
+        );
+    };
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        anyhow::bail!(
+            "invalid {} model selector: {}",
+            expected_provider.label(),
+            model.id
+        );
+    }
+    Ok(Some(raw))
 }
 
 /// Translate one `codex exec --json` event. Returns true on `turn.completed`
@@ -590,13 +699,17 @@ mod tests {
     #[test]
     fn cli_commands_always_start_fresh() {
         let config = config();
-        let claude_args = command_args(&fresh_claude_command(&config, "prompt"));
+        let claude_args = command_args(&fresh_claude_command(&config, None));
         assert!(!claude_args.iter().any(|arg| arg == "--continue"));
         assert!(claude_args
             .iter()
             .any(|arg| arg == "--no-session-persistence"));
+        assert!(claude_args
+            .windows(2)
+            .any(|args| args[0] == "--input-format" && args[1] == "text"));
+        assert!(!claude_args.iter().any(|arg| arg == "prompt"));
 
-        let codex_args = command_args(&fresh_codex_command(&config, "prompt"));
+        let codex_args = command_args(&fresh_codex_command(&config, None));
         assert_eq!(codex_args.first().map(String::as_str), Some("exec"));
         assert!(!codex_args
             .iter()
@@ -605,6 +718,56 @@ mod tests {
         assert!(codex_args
             .windows(2)
             .any(|args| { args[0] == "--sandbox" && args[1] == "workspace-write" }));
+        assert_eq!(codex_args.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn explicit_cli_models_are_forwarded_once() {
+        let config = config();
+        let claude_args = command_args(&fresh_claude_command(&config, Some("sonnet")));
+        assert_eq!(
+            claude_args
+                .windows(2)
+                .filter(|args| args[0] == "--model" && args[1] == "sonnet")
+                .count(),
+            1
+        );
+
+        let codex_args = command_args(&fresh_codex_command(&config, Some("gpt-5.6-sol")));
+        assert_eq!(
+            codex_args
+                .windows(2)
+                .filter(|args| args[0] == "--model" && args[1] == "gpt-5.6-sol")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn model_selector_validation_rejects_malformed_ids() {
+        let malformed = ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:".into(),
+        };
+        assert!(cli_model_override(&malformed, ProviderKind::Codex, "codex", "codex:").is_err());
+        assert!(cli_model_override(
+            &malformed,
+            ProviderKind::ClaudeCode,
+            "claude-code",
+            "claude-code:"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn codex_catalog_filters_hidden_and_duplicate_models_by_priority() {
+        let bytes = br#"{"models":[
+            {"slug":"later","visibility":"list","priority":20},
+            {"slug":"hidden","visibility":"hide","priority":1},
+            {"slug":"first","visibility":"list","priority":2},
+            {"slug":"first","visibility":"list","priority":3}
+        ]}"#;
+        assert_eq!(parse_codex_model_ids(bytes), vec!["first", "later"]);
     }
 
     #[test]

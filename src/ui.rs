@@ -593,7 +593,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let model = app
         .model
         .as_ref()
-        .map(|m| format!("{} · {}", m.id, m.provider.label()))
+        .map(|m| format!("{} · {}", m.display_id(), m.provider.label()))
         .unwrap_or_else(|| {
             if app.discovering {
                 "finding models".into()
@@ -848,16 +848,30 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
 fn draw_model_picker(frame: &mut Frame, app: &App) {
     let theme = app.theme;
     let models = app.filtered_models();
+    let provider_width = models
+        .iter()
+        .map(|model| UnicodeWidthStr::width(model.provider.label()))
+        .max()
+        .unwrap_or(0);
     let items: Vec<ListItem> = models
         .iter()
         .map(|m| {
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
-                    format!("{:<10}", m.provider.label()),
+                    format!("{:<provider_width$}  ", m.provider.label()),
                     Style::new().fg(theme.accent2),
                 ),
-                Span::styled(m.id.clone(), Style::new().fg(theme.fg)),
-            ]))
+                Span::styled(m.display_id().to_owned(), Style::new().fg(theme.fg)),
+            ];
+            if m.provider.is_sub_agent() {
+                let detail = if m.is_claude_alias() {
+                    " · latest alias · subscription sub-agent"
+                } else {
+                    " · subscription sub-agent"
+                };
+                spans.push(Span::styled(detail, Style::new().fg(theme.dim)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let title = format!(

@@ -116,6 +116,42 @@ async fn slash_input_opens_the_command_menu() {
 }
 
 #[tokio::test]
+async fn model_picker_distinguishes_cli_defaults_aliases_and_exact_models() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.models = vec![
+        ModelEntry {
+            provider: ProviderKind::ClaudeCode,
+            id: "claude-code".into(),
+        },
+        ModelEntry {
+            provider: ProviderKind::ClaudeCode,
+            id: "claude-code:sonnet".into(),
+        },
+        ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:gpt-5.6-sol".into(),
+        },
+    ];
+    app.open_picker();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+
+    assert!(rendered.contains("claude-code  CLI default"), "{rendered}");
+    assert!(
+        rendered.contains("claude-code  sonnet · latest alias · subscription sub-agent"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("codex        gpt-5.6-sol · subscription sub-agent"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
 async fn statusline_shows_cwd_and_branch() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();

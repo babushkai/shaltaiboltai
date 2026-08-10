@@ -30,14 +30,16 @@ Providers are auto-discovered at startup:
 | Anthropic | `ANTHROPIC_API_KEY` | Claude (Fable, Opus, Sonnet, Haiku) |
 | OpenAI | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | fetched from `/v1/models` |
 | Ollama | running locally (`OLLAMA_HOST`, default `http://localhost:11434`) | fetched from `/api/tags` |
-| Claude Code | the `claude` CLI installed and signed in | `claude-code` (uses your Claude subscription) |
-| Codex | the `codex` CLI installed and signed in | `codex` (uses your ChatGPT subscription) |
+| Claude Code | the `claude` CLI installed and signed in | CLI default plus the documented Fable, Opus, and Sonnet aliases |
+| Codex | the `codex` CLI installed and signed in | CLI default plus exact models advertised by the local Codex catalog |
 
 No keys needed for Ollama — if it's running, its models just show up. Models without tool support automatically fall back to plain chat.
 
 ### Subscription providers (no API key)
 
-If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://github.com/openai/codex) is installed and signed in, a `claude-code` / `codex` model appears in the picker that runs on your **subscription** (Claude Pro/Max, ChatGPT Plus/Pro) instead of a metered API key. We never see or store a token — the CLI owns its own auth. shaltaiboltai spawns it headless (`claude --print --output-format stream-json`, `codex exec --json`) and renders its event stream, so it runs as a **sub-agent**: the CLI drives its own tool loop (read/edit/run) and you watch its activity in the transcript. shaltaiboltai's own tools and approval flow don't apply to these providers — the CLI's own permission/sandbox model does.
+If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://github.com/openai/codex) is installed and signed in, subscription-backed choices appear in the picker (Claude Pro/Max, ChatGPT Plus/Pro) instead of using a metered API key. `claude-code` and `codex` mean **use that CLI's configured default**. Explicit selectors pass a model override to the CLI: for example, `/model claude-code:sonnet` uses Claude's latest Sonnet alias and `/model codex:gpt-5.6-sol` requests that exact Codex model. The Codex rows come from its local machine-readable model catalog; Claude aliases come from the installed CLI's documented interface. You can also enter a provider-qualified full model ID directly with `/model`, even when it is not listed—the CLI remains authoritative about access.
+
+We never see or store a token — the CLI owns its own auth. shaltaiboltai spawns it headless (`claude --print --output-format stream-json`, `codex exec --json`) and renders its event stream, so it runs as a **sub-agent**: the CLI drives its own tool loop (read/edit/run) and you watch its activity in the transcript. shaltaiboltai's own tools and approval flow don't apply to these providers — the CLI's own permission/sandbox model does. An unavailable model is reported as an error; shaltaiboltai never silently falls back to another model.
 
 Safe defaults, each opt-out via config.toml:
 
@@ -48,7 +50,7 @@ Each CLI request starts an ephemeral fresh process with an explicit handoff of t
 
 ## Keys & commands
 
-Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered, and `/refresh` rediscovers providers. The statusline prioritizes the active state on narrow terminals, then adds the model, project, linked-worktree branch, and live context usage as space allows.
+Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered, `/model claude-code:opus` and `/model codex:gpt-5.6-sol` select subscription CLI models, and `/refresh` rediscovers providers. The statusline prioritizes the active state on narrow terminals, then adds the model, project, linked-worktree branch, and live context usage as space allows.
 
 The composer stays live while a response streams or a tool runs. Press `Enter` to queue one next message; it is sent automatically only after the current turn finishes cleanly (and after any context compaction). Cancellation, provider errors, truncation, or persistence/compaction failures restore that message to the composer instead. The one-message queue locks after capture, and slash commands wait until the active turn ends.
 
@@ -102,6 +104,8 @@ Commands time out after 60s and tool output is capped at 32 KB. If `AGENTS.md` o
 
 ```toml
 default_model = "qwen3.5:latest"
+# default_model = "claude-code:sonnet" # Claude Code subscription alias
+# default_model = "codex:gpt-5.6-sol"   # exact Codex subscription model
 # compact_threshold_chars = 80000  # auto-compact context beyond this size
 # ollama_num_ctx = 16384           # context window requested from Ollama (its default is ~4k)
 # anthropic_api_key = "sk-ant-..."

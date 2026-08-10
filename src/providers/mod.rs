@@ -49,6 +49,105 @@ pub struct ModelEntry {
     pub id: String,
 }
 
+impl ModelEntry {
+    /// Human-readable part of a selector. CLI models use provider-qualified
+    /// IDs so they cannot collide with API or Ollama model names, but the
+    /// picker already shows the provider in its own column.
+    pub fn display_id(&self) -> &str {
+        match self.provider {
+            ProviderKind::ClaudeCode if self.id == "claude-code" => "CLI default",
+            ProviderKind::ClaudeCode => self.id.strip_prefix("claude-code:").unwrap_or(&self.id),
+            ProviderKind::Codex if self.id == "codex" => "CLI default",
+            ProviderKind::Codex => self.id.strip_prefix("codex:").unwrap_or(&self.id),
+            _ => &self.id,
+        }
+    }
+
+    pub fn is_claude_alias(&self) -> bool {
+        self.provider == ProviderKind::ClaudeCode
+            && matches!(self.display_id(), "fable" | "opus" | "sonnet")
+    }
+}
+
+const CLAUDE_CODE_ALIASES: &[&str] = &["fable", "opus", "sonnet"];
+
+fn claude_code_models() -> Vec<ModelEntry> {
+    std::iter::once(ModelEntry {
+        provider: ProviderKind::ClaudeCode,
+        id: "claude-code".into(),
+    })
+    .chain(CLAUDE_CODE_ALIASES.iter().map(|alias| ModelEntry {
+        provider: ProviderKind::ClaudeCode,
+        id: format!("claude-code:{alias}"),
+    }))
+    .collect()
+}
+
+async fn codex_models() -> Vec<ModelEntry> {
+    std::iter::once(ModelEntry {
+        provider: ProviderKind::Codex,
+        id: "codex".into(),
+    })
+    .chain(
+        cli_agent::codex_model_ids()
+            .await
+            .into_iter()
+            .map(|id| ModelEntry {
+                provider: ProviderKind::Codex,
+                id: format!("codex:{id}"),
+            }),
+    )
+    .collect()
+}
+
+/// Parse a CLI selector. The backwards-compatible bare IDs select each CLI's
+/// default; qualified IDs select an explicit model, and `:default` is accepted
+/// as a convenience alias for the bare form.
+pub fn cli_model_selector(selector: &str) -> Option<ModelEntry> {
+    if selector == "claude-code" {
+        return Some(ModelEntry {
+            provider: ProviderKind::ClaudeCode,
+            id: selector.into(),
+        });
+    }
+    if selector == "codex" {
+        return Some(ModelEntry {
+            provider: ProviderKind::Codex,
+            id: selector.into(),
+        });
+    }
+    let (provider, prefix, default_id) = if selector.starts_with("claude-code:") {
+        (ProviderKind::ClaudeCode, "claude-code:", "claude-code")
+    } else if selector.starts_with("codex:") {
+        (ProviderKind::Codex, "codex:", "codex")
+    } else {
+        return None;
+    };
+    let raw = selector.strip_prefix(prefix)?.trim();
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(ModelEntry {
+        provider,
+        id: if raw == "default" {
+            default_id.to_owned()
+        } else {
+            format!("{prefix}{raw}")
+        },
+    })
+}
+
+/// Convert a CLI selector once the corresponding provider has been discovered.
+/// Callers that restore persisted state may provisionally retain
+/// [`cli_model_selector`] until discovery finishes.
+pub fn custom_cli_model(selector: &str, available: &[ModelEntry]) -> Option<ModelEntry> {
+    let model = cli_model_selector(selector)?;
+    available
+        .iter()
+        .any(|available| available.provider == model.provider)
+        .then_some(model)
+}
+
 /// A tool invocation requested by the model. `id` is provider-assigned where
 /// available (Anthropic/OpenAI) and synthesized for Ollama.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +243,9 @@ pub struct Usage {
 #[derive(Debug)]
 pub enum ChatEvent {
     TextDelta(String),
+    /// Local provider note that did not come from model output and therefore
+    /// must not make an otherwise rejected prompt look consumed.
+    Notice(String),
     /// A tool the model ran itself (sub-agent providers like Claude Code drive
     /// their own tool loop). Display-only — it is not executed by us and does
     /// not enter the approval flow.
@@ -261,20 +363,14 @@ pub async fn discover_dynamic_models(config: &Config, mut publish: impl FnMut(Ve
 
     probes.push(Box::pin(async {
         if cli_agent::claude_available().await {
-            vec![ModelEntry {
-                provider: ProviderKind::ClaudeCode,
-                id: "claude-code".into(),
-            }]
+            claude_code_models()
         } else {
             Vec::new()
         }
     }));
     probes.push(Box::pin(async {
         if cli_agent::codex_available().await {
-            vec![ModelEntry {
-                provider: ProviderKind::Codex,
-                id: "codex".into(),
-            }]
+            codex_models().await
         } else {
             Vec::new()
         }
@@ -318,5 +414,40 @@ mod tests {
             .iter()
             .all(|model| model.provider == ProviderKind::Anthropic));
         assert_eq!(models[0].id, "claude-fable-5");
+    }
+
+    #[test]
+    fn cli_catalogs_keep_the_cli_default_first() {
+        let claude = claude_code_models();
+        assert_eq!(claude[0].id, "claude-code");
+        assert_eq!(claude[1].id, "claude-code:fable");
+        assert_eq!(claude[1].display_id(), "fable");
+        assert!(claude[1].is_claude_alias());
+
+        let available = vec![ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex".into(),
+        }];
+        assert_eq!(
+            custom_cli_model("codex:gpt-future", &available).map(|model| model.id),
+            Some("codex:gpt-future".into())
+        );
+        assert_eq!(
+            custom_cli_model("codex:default", &available).map(|model| model.id),
+            Some("codex".into())
+        );
+        assert_eq!(
+            cli_model_selector("claude-code:claude-fable-5").map(|model| model.id),
+            Some("claude-code:claude-fable-5".into())
+        );
+        assert_eq!(
+            cli_model_selector("claude-code").map(|model| model.provider),
+            Some(ProviderKind::ClaudeCode)
+        );
+        assert_eq!(
+            cli_model_selector("codex").map(|model| model.provider),
+            Some(ProviderKind::Codex)
+        );
+        assert!(custom_cli_model("codex:", &available).is_none());
     }
 }
