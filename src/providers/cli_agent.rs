@@ -4,7 +4,7 @@
 //! our provider-agnostic [`ChatEvent`]s. The CLI runs its own tool loop, so our
 //! tool definitions and approval flow do not apply here.
 
-use super::{ChatEvent, ChatRequest, Config, Message, Usage};
+use super::{ChatEvent, ChatRequest, Config, Message, RequestPolicy, Usage};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -12,6 +12,8 @@ use std::fmt::Write as _;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
+
+const STDERR_CAPTURE_CHARS: usize = 16_000;
 
 /// Whether the `claude` CLI is installed and responds. Cheap version probe with
 /// a short timeout so discovery never hangs.
@@ -53,18 +55,25 @@ pub async fn stream_chat_claude(
         "claude-code",
         "claude-code:",
     )?;
-    let cmd = fresh_claude_command(config, model);
+    let cmd = fresh_claude_command(config, model, req.policy);
     drive(cmd, "claude", &prompt, tx, handle_claude_event).await
 }
 
-fn fresh_claude_command(config: &Config, model: Option<&str>) -> tokio::process::Command {
-    let permission_mode = if config.claude_code_bypass_permissions {
-        "bypassPermissions"
-    } else {
-        "acceptEdits"
+fn fresh_claude_command(
+    config: &Config,
+    model: Option<&str>,
+    policy: RequestPolicy,
+) -> tokio::process::Command {
+    let permission_mode = match policy {
+        RequestPolicy::ReadOnly => "plan",
+        RequestPolicy::Interactive if config.claude_code_bypass_permissions => "bypassPermissions",
+        RequestPolicy::Interactive => "acceptEdits",
     };
     let mut cmd = tokio::process::Command::new("claude");
     cmd.arg("--print").arg("--no-session-persistence");
+    if policy == RequestPolicy::ReadOnly {
+        cmd.arg("--safe-mode");
+    }
     if let Some(model) = model {
         cmd.arg("--model").arg(model);
     }
@@ -75,6 +84,9 @@ fn fresh_claude_command(config: &Config, model: Option<&str>) -> tokio::process:
         .arg("--verbose")
         .arg("--permission-mode")
         .arg(permission_mode);
+    if policy == RequestPolicy::ReadOnly {
+        cmd.arg("--tools").arg("Read,Glob,Grep");
+    }
     cmd
 }
 
@@ -104,10 +116,23 @@ async fn drive(
     // Drain stderr concurrently so the pipe never blocks the child.
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
+        let mut captured = 0;
+        let mut truncated = false;
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            buf.push_str(&line);
-            buf.push('\n');
+            let remaining = STDERR_CAPTURE_CHARS.saturating_sub(captured);
+            if remaining > 0 {
+                let part: String = line.chars().take(remaining).collect();
+                captured += part.chars().count();
+                buf.push_str(&part);
+                buf.push('\n');
+                truncated |= part.chars().count() < line.chars().count();
+            } else {
+                truncated = true;
+            }
+        }
+        if truncated {
+            buf.push_str("…[stderr truncated]\n");
         }
         buf
     });
@@ -238,8 +263,10 @@ fn first_line(s: &str) -> String {
 /// turn stays as terse as the user wrote it; later requests carry the complete
 /// provider-agnostic history because no cwd-global CLI session is resumed.
 fn prompt_for_request(req: &ChatRequest) -> Option<String> {
-    if let [Message::User(content)] = req.messages.as_slice() {
-        return Some(content.text().to_owned());
+    if !req.force_full_handoff {
+        if let [Message::User(content)] = req.messages.as_slice() {
+            return Some(content.text().to_owned());
+        }
     }
     if !req
         .messages
@@ -393,23 +420,30 @@ pub async fn stream_chat_codex(
     }
 
     let model = cli_model_override(&req.model, super::ProviderKind::Codex, "codex", "codex:")?;
-    let cmd = fresh_codex_command(config, model);
+    let cmd = fresh_codex_command(config, model, req.policy);
     drive(cmd, "codex", &prompt, tx, handle_codex_event).await
 }
 
-fn fresh_codex_command(config: &Config, model: Option<&str>) -> tokio::process::Command {
+fn fresh_codex_command(
+    config: &Config,
+    model: Option<&str>,
+    policy: RequestPolicy,
+) -> tokio::process::Command {
     // Every request starts in a fresh, explicitly sandboxed process. Context is
     // carried in `prompt`, never inferred from another cwd-global CLI session.
-    let sandbox = if config.codex_full_access {
-        "danger-full-access"
-    } else {
-        "workspace-write"
+    let sandbox = match policy {
+        RequestPolicy::ReadOnly => "read-only",
+        RequestPolicy::Interactive if config.codex_full_access => "danger-full-access",
+        RequestPolicy::Interactive => "workspace-write",
     };
     let mut cmd = tokio::process::Command::new("codex");
-    cmd.arg("exec")
-        .arg("--ephemeral")
-        .arg("--sandbox")
-        .arg(sandbox);
+    cmd.arg("exec").arg("--ephemeral");
+    if policy == RequestPolicy::ReadOnly {
+        // Worker runs must not inherit normal user configuration (including
+        // configured integrations) or user/project execution-policy rules.
+        cmd.arg("--ignore-user-config").arg("--ignore-rules");
+    }
+    cmd.arg("--sandbox").arg(sandbox);
     if let Some(model) = model {
         cmd.arg("--model").arg(model);
     }
@@ -545,6 +579,8 @@ mod tests {
             system: system.into(),
             messages,
             tools: Vec::new(),
+            policy: RequestPolicy::Interactive,
+            force_full_handoff: false,
         }
     }
 
@@ -650,6 +686,20 @@ mod tests {
     }
 
     #[test]
+    fn forced_first_turn_handoff_keeps_system_contract_and_user_prompt() {
+        let mut req = request(
+            "orchestration contract and worker evidence",
+            vec![Message::User("fix the tests".into())],
+        );
+        req.force_full_handoff = true;
+
+        let prompt = prompt_for_request(&req).unwrap();
+        assert!(prompt.contains("## System instructions"));
+        assert!(prompt.contains("orchestration contract and worker evidence"));
+        assert!(prompt.contains("### User\nfix the tests"));
+    }
+
+    #[test]
     fn multi_turn_prompt_contains_the_complete_handoff() {
         let req = request(
             "system context",
@@ -699,7 +749,11 @@ mod tests {
     #[test]
     fn cli_commands_always_start_fresh() {
         let config = config();
-        let claude_args = command_args(&fresh_claude_command(&config, None));
+        let claude_args = command_args(&fresh_claude_command(
+            &config,
+            None,
+            RequestPolicy::Interactive,
+        ));
         assert!(!claude_args.iter().any(|arg| arg == "--continue"));
         assert!(claude_args
             .iter()
@@ -709,7 +763,11 @@ mod tests {
             .any(|args| args[0] == "--input-format" && args[1] == "text"));
         assert!(!claude_args.iter().any(|arg| arg == "prompt"));
 
-        let codex_args = command_args(&fresh_codex_command(&config, None));
+        let codex_args = command_args(&fresh_codex_command(
+            &config,
+            None,
+            RequestPolicy::Interactive,
+        ));
         assert_eq!(codex_args.first().map(String::as_str), Some("exec"));
         assert!(!codex_args
             .iter()
@@ -724,7 +782,11 @@ mod tests {
     #[test]
     fn explicit_cli_models_are_forwarded_once() {
         let config = config();
-        let claude_args = command_args(&fresh_claude_command(&config, Some("sonnet")));
+        let claude_args = command_args(&fresh_claude_command(
+            &config,
+            Some("sonnet"),
+            RequestPolicy::Interactive,
+        ));
         assert_eq!(
             claude_args
                 .windows(2)
@@ -733,7 +795,11 @@ mod tests {
             1
         );
 
-        let codex_args = command_args(&fresh_codex_command(&config, Some("gpt-5.6-sol")));
+        let codex_args = command_args(&fresh_codex_command(
+            &config,
+            Some("gpt-5.6-sol"),
+            RequestPolicy::Interactive,
+        ));
         assert_eq!(
             codex_args
                 .windows(2)
@@ -757,6 +823,70 @@ mod tests {
             "claude-code:"
         )
         .is_err());
+    }
+
+    #[test]
+    fn read_only_cli_policy_overrides_elevated_config() {
+        let mut config = config();
+        config.claude_code_bypass_permissions = true;
+        config.codex_full_access = true;
+
+        let claude_args = command_args(&fresh_claude_command(
+            &config,
+            Some("sonnet"),
+            RequestPolicy::ReadOnly,
+        ));
+        assert!(claude_args.iter().any(|arg| arg == "--safe-mode"));
+        assert!(claude_args
+            .windows(2)
+            .any(|args| args[0] == "--permission-mode" && args[1] == "plan"));
+        assert!(claude_args
+            .windows(2)
+            .any(|args| args[0] == "--tools" && args[1] == "Read,Glob,Grep"));
+        assert!(!claude_args
+            .iter()
+            .any(|arg| arg == "acceptEdits" || arg == "bypassPermissions"));
+
+        let codex_args = command_args(&fresh_codex_command(
+            &config,
+            Some("gpt-5.6-sol"),
+            RequestPolicy::ReadOnly,
+        ));
+        assert!(codex_args
+            .windows(2)
+            .any(|args| args[0] == "--sandbox" && args[1] == "read-only"));
+        assert!(codex_args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(codex_args.iter().any(|arg| arg == "--ignore-rules"));
+        assert!(!codex_args.iter().any(|arg| arg == "danger-full-access"));
+    }
+
+    #[test]
+    fn interactive_cli_policy_preserves_configured_permissions() {
+        let mut config = config();
+        config.claude_code_bypass_permissions = true;
+        config.codex_full_access = true;
+
+        let claude_args = command_args(&fresh_claude_command(
+            &config,
+            None,
+            RequestPolicy::Interactive,
+        ));
+        assert!(!claude_args.iter().any(|arg| arg == "--safe-mode"));
+        assert!(!claude_args.iter().any(|arg| arg == "--tools"));
+        assert!(claude_args
+            .windows(2)
+            .any(|args| { args[0] == "--permission-mode" && args[1] == "bypassPermissions" }));
+
+        let codex_args = command_args(&fresh_codex_command(
+            &config,
+            None,
+            RequestPolicy::Interactive,
+        ));
+        assert!(codex_args
+            .windows(2)
+            .any(|args| args[0] == "--sandbox" && args[1] == "danger-full-access"));
+        assert!(!codex_args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(!codex_args.iter().any(|arg| arg == "--ignore-rules"));
     }
 
     #[test]

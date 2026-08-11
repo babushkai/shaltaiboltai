@@ -149,6 +149,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::Input => handle_input_key(app, key),
         Mode::Streaming | Mode::RunningTool => handle_active_key(app, key),
         Mode::Approval => handle_approval_key(app, key),
+        Mode::OrchestrationConfirm => handle_orchestration_confirm_key(app, key),
+        Mode::Orchestrating => handle_orchestrating_key(app, key),
         Mode::ModelPicker => handle_model_picker_key(app, key),
         Mode::SessionPicker => handle_session_picker_key(app, key),
         Mode::ThemePicker => match key.code {
@@ -162,6 +164,40 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) => app.close_help(),
             _ => {}
         },
+    }
+}
+
+fn handle_orchestration_confirm_key(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Esc || (key.modifiers.is_empty() && key.code == KeyCode::Char('n')) {
+        app.cancel_orchestration();
+        return;
+    }
+    if !key.modifiers.is_empty() {
+        return;
+    }
+    match key.code {
+        KeyCode::Tab => app.toggle_orchestration_confirm_focus(),
+        KeyCode::Enter | KeyCode::Char('y') if app.orchestration_confirm_focused => {
+            app.confirm_orchestration();
+        }
+        _ => {}
+    }
+}
+
+fn handle_orchestrating_key(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Esc {
+        app.cancel_orchestration();
+        return;
+    }
+    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        handle_scroll_key(app, key);
+        return;
+    }
+    // Only the concurrent worker phase exposes the existing one-slot
+    // lookahead composer. Planning and coordination keep it locked so a failed
+    // root prompt can still be restored without merging two drafts.
+    if app.composer_accepts_input() {
+        handle_lookahead_composer_key(app, key);
     }
 }
 
@@ -389,6 +425,7 @@ fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shaltaiboltai::orchestration::PlannedTask;
     use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -416,6 +453,35 @@ mod tests {
         app
     }
 
+    fn show_test_team_confirmation(app: &mut App) {
+        app.textarea.insert_str("/team 2");
+        app.submit_input();
+        app.textarea.insert_str("coordinate this safely");
+        app.submit_input();
+        let run_id = app
+            .orchestration_run_id()
+            .expect("team planning should own a run id");
+        let model = app.model.clone().expect("test model");
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![
+                PlannedTask {
+                    id: 1,
+                    title: "inspect state".into(),
+                    instructions: "read relevant files".into(),
+                    model: model.clone(),
+                },
+                PlannedTask {
+                    id: 2,
+                    title: "review risks".into(),
+                    instructions: "identify safety gaps".into(),
+                    model,
+                },
+            ]),
+        });
+        assert_eq!(app.mode, Mode::OrchestrationConfirm);
+    }
+
     #[test]
     fn approval_shortcuts_reject_modified_keys() {
         assert_eq!(
@@ -434,6 +500,40 @@ mod tests {
             approval_decision(&KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL)),
             Some(ApprovalDecision::Deny)
         );
+    }
+
+    #[tokio::test]
+    async fn team_plan_cannot_start_until_tab_arms_confirmation() {
+        let mut app = test_app();
+        show_test_team_confirmation(&mut app);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::OrchestrationConfirm);
+        assert!(!app.orchestration_confirm_focused);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.orchestration_confirm_focused);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Orchestrating);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Input);
+    }
+
+    #[tokio::test]
+    async fn unfocused_team_plan_can_always_be_cancelled_safely() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = test_app();
+            show_test_team_confirmation(&mut app);
+            handle_key(&mut app, KeyEvent::new(key, KeyModifiers::NONE));
+
+            assert_eq!(app.mode, Mode::Input);
+            assert_eq!(app.textarea.lines().join("\n"), "coordinate this safely");
+        }
     }
 
     #[tokio::test]

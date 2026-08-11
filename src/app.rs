@@ -1,12 +1,14 @@
 use crate::config::Config;
 use crate::images;
+use crate::orchestration::{self, PlannedTask, WorkerOutcome};
 use crate::providers::{
-    self, ChatEvent, ChatRequest, ImageData, Message, ModelEntry, ProviderKind, ToolCall, Usage,
-    UserContent,
+    self, ChatEvent, ChatRequest, ImageData, Message, ModelEntry, ProviderKind, RequestPolicy,
+    ToolCall, Usage, UserContent,
 };
 use crate::session;
 use crate::theme::{self, Theme};
 use crate::tools;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,11 @@ const COMPACT_FLATTEN_CAP: usize = 4_000;
 
 /// Cap on project instruction files injected into the system prompt.
 const PROJECT_CONTEXT_CAP: usize = 8_000;
+
+/// Reserve space beyond worker evidence for the lead's system prompt, root
+/// task, and generated answer/tool calls.
+const ORCHESTRATION_SYSTEM_HEADROOM: usize = 8_000;
+const MIN_SYNTHESIS_EVIDENCE_CHARS: usize = 4_000;
 
 /// One-turn lookahead keeps memory bounded and makes failure recovery exact:
 /// there can never be a second draft to merge with a restored queued prompt.
@@ -61,6 +68,32 @@ struct RestoredReferences {
     images: Vec<(String, ImageData)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchestrationPhase {
+    Planning,
+    Confirming,
+    Workers,
+    Coordinating,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamContextFit {
+    Fits,
+    NeedsCompaction,
+    Impossible,
+}
+
+struct OrchestrationRun {
+    id: u64,
+    worker_count: usize,
+    planner_model: ModelEntry,
+    prompt: Option<QueuedPrompt>,
+    tasks: Vec<PlannedTask>,
+    outcomes: Vec<WorkerOutcome>,
+    entry_indices: Vec<usize>,
+    phase: OrchestrationPhase,
+}
+
 /// The slash-command registry: drives the `/` completion menu, `/help`, and
 /// dispatch, so the three can never drift apart.
 pub struct SlashCommand {
@@ -72,6 +105,12 @@ pub struct SlashCommand {
 }
 
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "team",
+        aliases: &["orchestrate"],
+        args: Some("[2-4|off]"),
+        description: "orchestrate the next prompt with read-only workers",
+    },
     SlashCommand {
         name: "model",
         aliases: &["models"],
@@ -159,6 +198,17 @@ pub enum AppEvent {
         compaction_gen: u64,
         result: Result<String, String>,
     },
+    OrchestrationPlanned {
+        run_id: u64,
+        result: Result<Vec<PlannedTask>, String>,
+    },
+    OrchestrationWorkerFinished {
+        run_id: u64,
+        outcome: WorkerOutcome,
+    },
+    OrchestrationWorkersFinished {
+        run_id: u64,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -167,6 +217,8 @@ pub enum Mode {
     Streaming,
     RunningTool,
     Approval,
+    OrchestrationConfirm,
+    Orchestrating,
     ModelPicker,
     SessionPicker,
     ThemePicker,
@@ -187,6 +239,13 @@ pub enum Entry {
     Tool {
         summary: String,
         result: String,
+        is_error: bool,
+    },
+    Agent {
+        name: String,
+        model: String,
+        status: String,
+        summary: String,
         is_error: bool,
     },
     Info(String),
@@ -287,10 +346,19 @@ pub struct App {
     /// Exact ownership of the submitted root prompt until the provider emits
     /// activity. A launch/model error can then roll it back for lossless retry.
     active_root_prompt: Option<ActiveRootPrompt>,
+    /// One-shot worker count armed by `/team`; consumed by the next prompt.
+    team_workers: Option<usize>,
+    /// The planning/fan-out/coordinator state for one orchestration run.
+    orchestration_run: Option<OrchestrationRun>,
+    /// Ephemeral, untrusted worker evidence injected into coordinator requests.
+    orchestration_context: Option<String>,
+    pub orchestration_confirm_focused: bool,
+    orchestration_gen: u64,
     compaction_gen: u64,
     request_task: Option<JoinHandle<()>>,
     tool_task: Option<JoinHandle<()>>,
     compaction_task: Option<JoinHandle<()>>,
+    orchestration_task: Option<JoinHandle<()>>,
 
     tx: UnboundedSender<AppEvent>,
 }
@@ -365,10 +433,16 @@ impl App {
             active_turn_model: None,
             active_turn_can_promote_queue: true,
             active_root_prompt: None,
+            team_workers: None,
+            orchestration_run: None,
+            orchestration_context: None,
+            orchestration_confirm_focused: false,
+            orchestration_gen: 0,
             compaction_gen: 0,
             request_task: None,
             tool_task: None,
             compaction_task: None,
+            orchestration_task: None,
             tx,
         };
         app.transcript.push(Entry::Banner {
@@ -384,8 +458,10 @@ impl App {
     }
 
     pub fn is_busy(&self) -> bool {
-        matches!(self.mode, Mode::Streaming | Mode::RunningTool)
-            || self.compacting
+        matches!(
+            self.mode,
+            Mode::Streaming | Mode::RunningTool | Mode::Orchestrating
+        ) || self.compacting
             || self.discovering
     }
 
@@ -500,8 +576,62 @@ impl App {
         }
         match self.mode {
             Mode::Input | Mode::Streaming | Mode::RunningTool => true,
+            Mode::Orchestrating => self
+                .orchestration_run
+                .as_ref()
+                .is_some_and(|run| run.phase == OrchestrationPhase::Workers),
             Mode::Approval => !self.approval_focused,
             _ => false,
+        }
+    }
+
+    pub fn team_workers(&self) -> Option<usize> {
+        self.team_workers
+    }
+
+    pub fn orchestration_plan(&self) -> &[PlannedTask] {
+        self.orchestration_run
+            .as_ref()
+            .map_or(&[], |run| run.tasks.as_slice())
+    }
+
+    pub fn orchestration_planner(&self) -> Option<&ModelEntry> {
+        self.orchestration_run
+            .as_ref()
+            .map(|run| &run.planner_model)
+    }
+
+    pub fn orchestration_run_id(&self) -> Option<u64> {
+        self.orchestration_run.as_ref().map(|run| run.id)
+    }
+
+    pub fn orchestration_status(&self) -> Option<String> {
+        let run = self.orchestration_run.as_ref()?;
+        Some(match run.phase {
+            OrchestrationPhase::Planning => "TEAM · planning".into(),
+            OrchestrationPhase::Confirming => "TEAM · plan ready · Tab to review".into(),
+            OrchestrationPhase::Workers => format!(
+                "TEAM · workers {}/{} · Esc cancel",
+                run.outcomes.len(),
+                run.tasks.len()
+            ),
+            OrchestrationPhase::Coordinating => match self.mode {
+                Mode::Approval => "TEAM · applying · approval needed".into(),
+                Mode::RunningTool => "TEAM · applying changes · Esc cancel".into(),
+                _ => "TEAM · synthesizing · Esc cancel".into(),
+            },
+        })
+    }
+
+    pub fn focus_orchestration_confirm(&mut self) {
+        if self.mode == Mode::OrchestrationConfirm {
+            self.orchestration_confirm_focused = true;
+        }
+    }
+
+    pub fn toggle_orchestration_confirm_focus(&mut self) {
+        if self.mode == Mode::OrchestrationConfirm {
+            self.orchestration_confirm_focused = !self.orchestration_confirm_focused;
         }
     }
 
@@ -674,15 +804,47 @@ impl App {
                     self.finish_compaction(result);
                 }
             }
+            AppEvent::OrchestrationPlanned { run_id, result } => {
+                if self.orchestration_run.as_ref().is_some_and(|run| {
+                    run.id == run_id && run.phase == OrchestrationPhase::Planning
+                }) {
+                    self.orchestration_task = None;
+                    self.finish_orchestration_plan(result);
+                }
+            }
+            AppEvent::OrchestrationWorkerFinished { run_id, outcome } => {
+                if self
+                    .orchestration_run
+                    .as_ref()
+                    .is_some_and(|run| run.id == run_id && run.phase == OrchestrationPhase::Workers)
+                {
+                    self.finish_orchestration_worker(outcome);
+                }
+            }
+            AppEvent::OrchestrationWorkersFinished { run_id } => {
+                if self
+                    .orchestration_run
+                    .as_ref()
+                    .is_some_and(|run| run.id == run_id && run.phase == OrchestrationPhase::Workers)
+                {
+                    self.orchestration_task = None;
+                    self.finish_orchestration_workers();
+                }
+            }
         }
     }
 
     fn agent_turn_active(&self) -> bool {
         matches!(
             self.mode,
-            Mode::Streaming | Mode::RunningTool | Mode::Approval
+            Mode::Streaming
+                | Mode::RunningTool
+                | Mode::Approval
+                | Mode::OrchestrationConfirm
+                | Mode::Orchestrating
         ) || !self.pending_calls.is_empty()
             || self.queued_prompt.is_some()
+            || self.orchestration_run.is_some()
     }
 
     fn reconcile_discovered_model(&mut self, finished: bool) {
@@ -869,11 +1031,18 @@ impl App {
                 self.advance_tools();
             }
             ChatEvent::Error(message) => {
+                let rollback_team_root = self.team_coordinator_has_no_activity();
                 if let Some(task) = self.request_task.take() {
                     task.abort();
                 }
                 if let Some(task) = self.tool_task.take() {
                     task.abort();
+                }
+                if rollback_team_root {
+                    self.fail_orchestration_root(&format!(
+                        "team synthesis failed before producing output: {message}"
+                    ));
+                    return;
                 }
                 let active_root = self.active_root_prompt.take();
                 let composer_untouched = self.input_is_empty()
@@ -920,6 +1089,8 @@ impl App {
                 self.gen += 1;
                 self.agent_turns = 0;
                 self.mode = Mode::Input;
+                self.orchestration_run = None;
+                self.orchestration_context = None;
                 self.active_turn_model = None;
                 self.active_turn_can_promote_queue = true;
                 self.approval_focused = true;
@@ -944,6 +1115,8 @@ impl App {
         self.gen += 1;
         self.agent_turns = 0;
         self.mode = Mode::Input;
+        self.orchestration_run = None;
+        self.orchestration_context = None;
         self.active_turn_model = None;
         self.active_root_prompt = None;
         self.refresh_environment();
@@ -1072,6 +1245,11 @@ impl App {
         }
         // Slash commands stay available while compacting. A normal message is
         // captured as the one-turn lookahead and sent after compaction.
+        if self.compacting && !text.starts_with('/') && self.team_workers.is_some() {
+            self.composer_notice =
+                Some("team mode will start after context compaction — your draft is safe".into());
+            return;
+        }
         if self.compacting && !text.starts_with('/') {
             self.queue_input();
             return;
@@ -1085,6 +1263,86 @@ impl App {
                 "no model selected — configure a provider or run /refresh, then choose one with Ctrl+P"
             };
             self.transcript.push(Entry::Error(message.into()));
+            return;
+        }
+
+        if !text.starts_with('/') && self.team_workers.is_some() {
+            let worker_count = self.team_workers.expect("checked above");
+            if self.pending_image_count() > 0 || !images::extract_image_paths(&text).is_empty() {
+                self.transcript.push(Entry::Error(
+                    "team mode is text-only for now — attachments and prompt were preserved".into(),
+                ));
+                return;
+            }
+            if let Err(error) = orchestration::validate_root_task(&text) {
+                self.transcript.push(Entry::Error(format!(
+                    "could not start team mode: {error} — prompt preserved"
+                )));
+                return;
+            }
+            let model = self
+                .model
+                .clone()
+                .expect("a model was checked before team planning");
+            if providers::is_cli_default_model(&model) {
+                self.transcript.push(Entry::Error(format!(
+                    "team mode needs an explicit {} model so planning and synthesis stay pinned — choose one with /model or Ctrl+P; prompt preserved",
+                    model.provider.label()
+                )));
+                return;
+            }
+            if orchestration::choose_planner_model(&model, &self.models).is_none()
+                || orchestration::choose_worker_models(&model, &self.models, worker_count).len()
+                    != worker_count
+            {
+                self.transcript.push(Entry::Error(
+                    "team mode needs at least one workspace-scoped advisory model; Codex is kept as the post-confirmation lead because its read-only CLI sandbox can read outside the workspace — prompt preserved"
+                        .into(),
+                ));
+                return;
+            }
+            match self.team_context_fit(worker_count, text.chars().count()) {
+                TeamContextFit::Fits => {}
+                TeamContextFit::NeedsCompaction => {
+                    self.transcript.push(Entry::Info(
+                        "team run paused — compacting context before fan-out".into(),
+                    ));
+                    self.start_compaction();
+                    if self.compacting {
+                        self.composer_notice = Some(
+                            "prompt preserved — press Enter again after compaction finishes".into(),
+                        );
+                    } else {
+                        self.transcript.push(Entry::Error(
+                            "team context needs compaction, but compaction could not start — prompt preserved"
+                                .into(),
+                        ));
+                    }
+                    return;
+                }
+                TeamContextFit::Impossible => {
+                    self.transcript.push(Entry::Error(
+                        "team prompt and evidence reserve cannot fit the smallest selected context — shorten the prompt, clear context, or choose a larger-context model; prompt preserved"
+                            .into(),
+                    ));
+                    return;
+                }
+            }
+            let worker_count = self
+                .team_workers
+                .take()
+                .expect("team mode was checked above");
+            self.textarea = make_textarea(&self.theme);
+            self.remember_input(&text);
+            self.start_orchestration_plan(
+                QueuedPrompt {
+                    text,
+                    staged_images: Vec::new(),
+                    referenced_images: Vec::new(),
+                    model,
+                },
+                worker_count,
+            );
             return;
         }
         self.textarea = make_textarea(&self.theme);
@@ -1183,9 +1441,376 @@ impl App {
         });
     }
 
+    fn start_orchestration_plan(&mut self, prompt: QueuedPrompt, worker_count: usize) {
+        debug_assert!(self.orchestration_task.is_none());
+        self.orchestration_gen += 1;
+        let run_id = self.orchestration_gen;
+        let planner_model = orchestration::choose_planner_model(&prompt.model, &self.models)
+            .expect("team advisory availability is checked before planning");
+        let worker_models =
+            orchestration::choose_worker_models(&prompt.model, &self.models, worker_count);
+        let request = orchestration::planner_request(
+            &planner_model,
+            &self.history,
+            &prompt.text,
+            worker_count,
+        )
+        .expect("team planner safety is checked before planning");
+        self.orchestration_run = Some(OrchestrationRun {
+            id: run_id,
+            worker_count,
+            planner_model,
+            prompt: Some(prompt),
+            tasks: Vec::new(),
+            outcomes: Vec::new(),
+            entry_indices: Vec::new(),
+            phase: OrchestrationPhase::Planning,
+        });
+        self.mode = Mode::Orchestrating;
+        self.orchestration_confirm_focused = false;
+        self.transcript.push(Entry::Info(format!(
+            "Shaltaiboltai is planning work for {worker_count} read-only agents…"
+        )));
+
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        self.orchestration_task = Some(tokio::spawn(async move {
+            let result = orchestration::collect_planner_request(config, request)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    orchestration::parse_plan(&text, &worker_models, worker_count)
+                        .map_err(|error| error.to_string())
+                });
+            let _ = tx.send(AppEvent::OrchestrationPlanned { run_id, result });
+        }));
+    }
+
+    fn finish_orchestration_plan(&mut self, result: Result<Vec<PlannedTask>, String>) {
+        let Some(run) = self.orchestration_run.as_mut() else {
+            return;
+        };
+        let result = result.and_then(|tasks| {
+            orchestration::validate_plan_assignments(&tasks, run.worker_count)?;
+            Ok(tasks)
+        });
+        match result {
+            Ok(tasks) => {
+                run.tasks = tasks;
+                run.phase = OrchestrationPhase::Confirming;
+                self.mode = Mode::OrchestrationConfirm;
+                self.orchestration_confirm_focused = false;
+            }
+            Err(error) => {
+                let prompt = run.prompt.take();
+                self.team_workers = Some(run.worker_count);
+                self.orchestration_run = None;
+                self.mode = Mode::Input;
+                self.transcript
+                    .push(Entry::Error(format!("team planning failed: {error}")));
+                if let Some(prompt) = prompt {
+                    self.restore_prompt(prompt, "team planning failed before any worker started");
+                }
+                self.apply_deferred_model_reconciliation();
+            }
+        }
+    }
+
+    pub fn confirm_orchestration(&mut self) {
+        if self.mode != Mode::OrchestrationConfirm || !self.orchestration_confirm_focused {
+            return;
+        }
+        let Some(mut run) = self.orchestration_run.take() else {
+            self.mode = Mode::Input;
+            return;
+        };
+        let Some(prompt) = run.prompt.take() else {
+            self.mode = Mode::Input;
+            return;
+        };
+        let task_text = prompt.text.clone();
+        let history = self.history.clone();
+        self.begin_root_prompt(prompt);
+
+        run.entry_indices = run
+            .tasks
+            .iter()
+            .map(|task| {
+                let index = self.transcript.len();
+                self.transcript.push(Entry::Agent {
+                    name: format!("agent {} · {}", task.id, task.title),
+                    model: format!(
+                        "{} · {}",
+                        task.model.display_id(),
+                        task.model.provider.label()
+                    ),
+                    status: "RUNNING".into(),
+                    summary: "reviewing the task in a read-only sandbox…".into(),
+                    is_error: false,
+                });
+                index
+            })
+            .collect();
+        run.phase = OrchestrationPhase::Workers;
+        let run_id = run.id;
+        let tasks = run.tasks.clone();
+        self.orchestration_run = Some(run);
+        self.mode = Mode::Orchestrating;
+        self.orchestration_confirm_focused = false;
+
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        self.orchestration_task = Some(tokio::spawn(async move {
+            let mut workers = FuturesUnordered::new();
+            for task in tasks {
+                let config = config.clone();
+                let request = orchestration::worker_request(&history, &task_text, &task);
+                workers.push(async move {
+                    let result = match request {
+                        Ok(request) => orchestration::collect_worker_request(config, request)
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error),
+                    };
+                    WorkerOutcome {
+                        id: task.id,
+                        title: task.title,
+                        model: task.model,
+                        result,
+                    }
+                });
+            }
+            while let Some(outcome) = workers.next().await {
+                let _ = tx.send(AppEvent::OrchestrationWorkerFinished { run_id, outcome });
+            }
+            let _ = tx.send(AppEvent::OrchestrationWorkersFinished { run_id });
+        }));
+    }
+
+    fn finish_orchestration_worker(&mut self, outcome: WorkerOutcome) {
+        let Some(run) = self.orchestration_run.as_mut() else {
+            return;
+        };
+        if !run.tasks.iter().any(|task| task.id == outcome.id)
+            || run.outcomes.iter().any(|known| known.id == outcome.id)
+        {
+            return;
+        }
+        if let Some(index) = outcome
+            .id
+            .checked_sub(1)
+            .and_then(|id| run.entry_indices.get(id))
+            .copied()
+        {
+            if let Some(Entry::Agent {
+                status,
+                summary,
+                is_error,
+                ..
+            }) = self.transcript.get_mut(index)
+            {
+                match &outcome.result {
+                    Ok(report) => {
+                        *status = "DONE".into();
+                        *summary = orchestration::report_preview(report);
+                    }
+                    Err(error) => {
+                        *status = "FAILED".into();
+                        *summary = orchestration::report_preview(error);
+                        *is_error = true;
+                    }
+                }
+                self.transcript_dirty_from = Some(
+                    self.transcript_dirty_from
+                        .map_or(index, |earlier| earlier.min(index)),
+                );
+            }
+        }
+        run.outcomes.push(outcome);
+    }
+
+    fn finish_orchestration_workers(&mut self) {
+        let (outcomes, task_count) = {
+            let Some(run) = self.orchestration_run.as_mut() else {
+                return;
+            };
+            run.outcomes.sort_by_key(|outcome| outcome.id);
+            (run.outcomes.clone(), run.tasks.len())
+        };
+        let successful = outcomes
+            .iter()
+            .filter(|outcome| outcome.result.is_ok())
+            .count();
+        if successful == 0 {
+            self.fail_orchestration_root(
+                "all read-only workers failed; the coordinator was not started",
+            );
+            return;
+        }
+
+        let task = self
+            .active_root_prompt
+            .as_ref()
+            .map(|active| active.prompt.text.as_str())
+            .unwrap_or_default();
+        let synthesis_budget = self
+            .effective_compact_threshold_for(self.active_turn_model.as_ref())
+            .saturating_sub(
+                self.history_chars()
+                    .saturating_add(ORCHESTRATION_SYSTEM_HEADROOM),
+            )
+            .min(orchestration::MAX_SYNTHESIS_CHARS);
+        if synthesis_budget < MIN_SYNTHESIS_EVIDENCE_CHARS {
+            self.fail_orchestration_root(
+                "team evidence no longer fits the lead model context; compact and retry",
+            );
+            return;
+        }
+        self.orchestration_context = Some(orchestration::synthesis_context_with_limit(
+            task,
+            &outcomes,
+            synthesis_budget,
+        ));
+        if let Some(run) = self.orchestration_run.as_mut() {
+            run.phase = OrchestrationPhase::Coordinating;
+        }
+        self.transcript.push(Entry::Info(if successful == task_count {
+            format!(
+                "all {successful} agents reported — Shaltaiboltai is synthesizing and applying"
+            )
+        } else {
+            format!(
+                "{successful}/{} agents reported — Shaltaiboltai is continuing with partial evidence",
+                task_count
+            )
+        }));
+        self.mode = Mode::Input;
+        self.start_request();
+    }
+
+    fn fail_orchestration_root(&mut self, message: &str) {
+        // This path is used both before coordinator launch and for a
+        // coordinator that failed before producing canonical output. Own and
+        // fence every task here so callers cannot accidentally leave a late
+        // event capable of reviving the abandoned root.
+        self.gen += 1;
+        if let Some(task) = self.request_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.tool_task.take() {
+            task.abort();
+        }
+        self.streaming_text.clear();
+        self.pending_calls.clear();
+        self.approval_preview = None;
+        self.agent_turns = 0;
+        self.approval_focused = true;
+        let active = self.active_root_prompt.take();
+        let failure_details: Vec<String> = self
+            .orchestration_run
+            .as_ref()
+            .into_iter()
+            .flat_map(|run| &run.outcomes)
+            .filter_map(|outcome| {
+                outcome.result.as_ref().err().map(|error| {
+                    format!(
+                        "agent {} ({} · {}) failed: {}",
+                        outcome.id,
+                        outcome.model.display_id(),
+                        outcome.model.provider.label(),
+                        orchestration::report_preview(error)
+                    )
+                })
+            })
+            .collect();
+        let successor_in_composer = !self.input_is_empty()
+            || !self.pending_images.is_empty()
+            || self.restored_references.is_some()
+            || self.suppressed_reference_text.is_some();
+        let queued_successor = self.queued_prompt.is_some();
+
+        // Workers are advisory and have not produced canonical assistant/tool
+        // output. Always remove the abandoned root from provider history,
+        // even when a successor draft or queued message must be preserved.
+        if let Some(active) = active {
+            self.history.truncate(active.history_len);
+            self.history_chars_cache.set(None);
+            self.transcript.truncate(active.transcript_len);
+            self.transcript_rev += 1;
+            if !queued_successor && !successor_in_composer {
+                self.restore_prompt(active.prompt, message);
+            }
+        }
+        if queued_successor {
+            self.restore_queued_prompt(message);
+        } else if successor_in_composer {
+            self.composer_notice = Some(format!("team run stopped — draft preserved; {message}"));
+        }
+        self.transcript.push(Entry::Error(message.into()));
+        self.transcript
+            .extend(failure_details.into_iter().map(Entry::Error));
+        self.orchestration_context = None;
+        self.orchestration_run = None;
+        self.mode = Mode::Input;
+        self.active_turn_model = None;
+        self.active_turn_can_promote_queue = true;
+        self.apply_deferred_model_reconciliation();
+    }
+
+    fn team_coordinator_has_no_activity(&self) -> bool {
+        self.orchestration_run
+            .as_ref()
+            .is_some_and(|run| run.phase == OrchestrationPhase::Coordinating)
+            && self
+                .active_root_prompt
+                .as_ref()
+                .is_some_and(|active| !active.observed_activity)
+    }
+
+    pub fn cancel_orchestration(&mut self) {
+        let Some(mut run) = self.orchestration_run.take() else {
+            return;
+        };
+        self.orchestration_gen += 1;
+        if let Some(task) = self.orchestration_task.take() {
+            task.abort();
+        }
+        self.orchestration_context = None;
+        self.orchestration_confirm_focused = false;
+        match run.phase {
+            OrchestrationPhase::Planning | OrchestrationPhase::Confirming => {
+                self.mode = Mode::Input;
+                self.team_workers = Some(run.worker_count);
+                if let Some(prompt) = run.prompt.take() {
+                    self.restore_prompt(prompt, "team run cancelled before workers started");
+                }
+                self.transcript
+                    .push(Entry::Info("team run cancelled".into()));
+                self.apply_deferred_model_reconciliation();
+            }
+            OrchestrationPhase::Workers => {
+                self.orchestration_run = Some(run);
+                self.fail_orchestration_root("team run cancelled");
+            }
+            OrchestrationPhase::Coordinating => {
+                self.orchestration_run = Some(run);
+                self.cancel_request();
+            }
+        }
+    }
+
     fn dispatch_prompt(&mut self, prompt: QueuedPrompt) {
         debug_assert_eq!(self.mode, Mode::Input);
         debug_assert!(!self.compacting);
+        debug_assert!(self.request_task.is_none());
+        debug_assert!(self.tool_task.is_none());
+        debug_assert!(self.pending_calls.is_empty());
+
+        self.begin_root_prompt(prompt);
+        self.start_request();
+    }
+
+    fn begin_root_prompt(&mut self, prompt: QueuedPrompt) {
         debug_assert!(self.request_task.is_none());
         debug_assert!(self.tool_task.is_none());
         debug_assert!(self.pending_calls.is_empty());
@@ -1216,7 +1841,6 @@ impl App {
         self.history.push(Message::User(content));
         self.scroll_from_bottom = 0;
         self.agent_turns = 0;
-        self.start_request();
     }
 
     fn dispatch_queued_prompt(&mut self) {
@@ -1423,6 +2047,36 @@ impl App {
             return;
         };
         match (cmd.name, arg) {
+            ("team", Some("off")) => {
+                self.team_workers = None;
+                self.transcript
+                    .push(Entry::Info("team mode disabled".into()));
+            }
+            ("team", count) => {
+                let workers = match count {
+                    None => orchestration::DEFAULT_WORKERS,
+                    Some(raw) => match raw.parse::<usize>() {
+                        Ok(value)
+                            if (orchestration::MIN_WORKERS..=orchestration::MAX_WORKERS)
+                                .contains(&value) =>
+                        {
+                            value
+                        }
+                        _ => {
+                            self.transcript.push(Entry::Error(format!(
+                                "team size must be {}-{}, or /team off",
+                                orchestration::MIN_WORKERS,
+                                orchestration::MAX_WORKERS
+                            )));
+                            return;
+                        }
+                    },
+                };
+                self.team_workers = Some(workers);
+                self.transcript.push(Entry::Info(format!(
+                    "team mode armed: the next prompt starts one lead planning call, then asks before launching {workers} read-only workers"
+                )));
+            }
             ("model", Some(filter)) => self.select_model_by_filter(filter),
             ("model", None) => self.open_picker(),
             ("theme", Some(name)) => self.set_theme_by_name(name),
@@ -1562,18 +2216,7 @@ impl App {
         self.streaming_text.clear();
         self.transcript.push(Entry::Assistant(String::new()));
 
-        // Sub-agent providers run their own tool loop, so we don't send ours.
-        let tools = if model.provider.is_sub_agent() {
-            Vec::new()
-        } else {
-            tools::definitions()
-        };
-        let request = ChatRequest {
-            model,
-            system: system_prompt(),
-            messages: self.history.clone(),
-            tools,
-        };
+        let request = self.active_chat_request(model);
         self.gen += 1;
         let gen = self.gen;
         let config = self.config.clone();
@@ -1588,11 +2231,38 @@ impl App {
         }));
     }
 
+    fn active_chat_request(&self, model: ModelEntry) -> ChatRequest {
+        // Sub-agent providers run their own tool loop, so we don't send ours.
+        let tools = if model.provider.is_sub_agent() {
+            Vec::new()
+        } else {
+            tools::definitions()
+        };
+        let has_team_context = self.orchestration_context.is_some();
+        let request = ChatRequest {
+            model,
+            system: match self.orchestration_context.as_deref() {
+                Some(context) => format!("{}\n\n{context}", system_prompt()),
+                None => system_prompt(),
+            },
+            messages: if has_team_context {
+                orchestration::text_only_history(&self.history)
+            } else {
+                self.history.clone()
+            },
+            tools,
+            policy: RequestPolicy::Interactive,
+            force_full_handoff: has_team_context,
+        };
+        request
+    }
+
     pub fn cancel_request(&mut self) {
         self.cancel_request_inner(true);
     }
 
     fn cancel_request_inner(&mut self, restore_queue: bool) {
+        let rollback_team_root = self.team_coordinator_has_no_activity();
         // Invalidate in-flight work; late events from old generations are dropped.
         self.gen += 1;
         if let Some(task) = self.request_task.take() {
@@ -1600,6 +2270,13 @@ impl App {
         }
         if let Some(task) = self.tool_task.take() {
             task.abort();
+        }
+        if rollback_team_root {
+            self.fail_orchestration_root("team synthesis cancelled before producing output");
+            if !restore_queue {
+                self.queued_prompt = None;
+            }
+            return;
         }
         // Keep whatever streamed so far as a valid assistant turn.
         let text = std::mem::take(&mut self.streaming_text);
@@ -1622,6 +2299,8 @@ impl App {
         self.transcript.push(Entry::Info("cancelled".into()));
         self.agent_turns = 0;
         self.mode = Mode::Input;
+        self.orchestration_run = None;
+        self.orchestration_context = None;
         self.active_turn_model = None;
         self.active_turn_can_promote_queue = true;
         self.active_root_prompt = None;
@@ -1637,6 +2316,14 @@ impl App {
     /// Quit through the same cancellation path as Esc so partial text is
     /// preserved and dangling tool calls are repaired before session save.
     pub fn request_quit(&mut self) {
+        if matches!(self.mode, Mode::OrchestrationConfirm | Mode::Orchestrating) {
+            self.cancel_orchestration();
+            self.composer_notice = Some(
+                "team work cancelled and draft preserved — press Ctrl+C again to discard it and quit"
+                    .into(),
+            );
+            return;
+        }
         if self.queued_prompt.is_some() {
             if matches!(
                 self.mode,
@@ -1669,6 +2356,16 @@ impl App {
             task.abort();
         }
         self.compacting = false;
+    }
+
+    fn abort_orchestration(&mut self) {
+        self.orchestration_gen += 1;
+        if let Some(task) = self.orchestration_task.take() {
+            task.abort();
+        }
+        self.orchestration_run = None;
+        self.orchestration_context = None;
+        self.orchestration_confirm_focused = false;
     }
 
     pub fn cancel_compaction_request(&mut self) {
@@ -1872,6 +2569,7 @@ impl App {
             return;
         }
         self.cancel_compaction();
+        self.abort_orchestration();
         self.gen += 1;
         self.session_id = session::new_id();
         self.history.clear();
@@ -1891,6 +2589,7 @@ impl App {
         self.active_turn_model = None;
         self.active_turn_can_promote_queue = true;
         self.active_root_prompt = None;
+        self.team_workers = None;
         self.transcript
             .push(Entry::Info("started a new session".into()));
     }
@@ -1926,6 +2625,7 @@ impl App {
                     return;
                 }
                 self.cancel_compaction();
+                self.abort_orchestration();
                 self.gen += 1;
                 self.session_id = loaded.id;
                 self.history = loaded.history;
@@ -1945,6 +2645,7 @@ impl App {
                 self.active_turn_model = None;
                 self.active_turn_can_promote_queue = true;
                 self.active_root_prompt = None;
+                self.team_workers = None;
                 if let Some(saved) = loaded.model {
                     let available = self
                         .models
@@ -2003,7 +2704,13 @@ impl App {
             .history
             .iter()
             .map(|m| match m {
-                Message::User(c) => c.text().len() + c.images().len() * 4_000,
+                Message::User(c) => {
+                    c.text().len()
+                        + c.images()
+                            .iter()
+                            .map(|image| image.data.len())
+                            .sum::<usize>()
+                }
                 Message::Assistant { text, tool_calls } => {
                     text.len()
                         + tool_calls
@@ -2040,10 +2747,58 @@ impl App {
     /// Ollama models are bounded by the configured num_ctx, which is usually
     /// far smaller than the cloud-model threshold — compact well before it.
     fn effective_compact_threshold(&self) -> usize {
+        self.effective_compact_threshold_for(self.model.as_ref())
+    }
+
+    fn effective_compact_threshold_for(&self, model: Option<&ModelEntry>) -> usize {
         let configured = self.config.compact_threshold_chars;
-        match self.model.as_ref().map(|m| m.provider) {
-            Some(ProviderKind::Ollama) => configured.min(self.config.ollama_num_ctx * 3),
+        match model.map(|model| model.provider) {
+            Some(ProviderKind::Ollama) => {
+                configured.min(self.config.ollama_num_ctx.saturating_mul(3))
+            }
             _ => configured,
+        }
+    }
+
+    fn team_context_fit(&self, worker_count: usize, root_task_chars: usize) -> TeamContextFit {
+        let Some(coordinator) = self.model.as_ref() else {
+            return TeamContextFit::Impossible;
+        };
+        let Some(planner) = orchestration::choose_planner_model(coordinator, &self.models) else {
+            return TeamContextFit::Impossible;
+        };
+        let worker_models =
+            orchestration::choose_worker_models(coordinator, &self.models, worker_count);
+        if worker_models.len() != worker_count {
+            return TeamContextFit::Impossible;
+        }
+        let smallest_window = std::iter::once(coordinator)
+            .chain(std::iter::once(&planner))
+            .chain(worker_models.iter())
+            .map(|model| self.effective_compact_threshold_for(Some(model)))
+            .min()
+            .unwrap_or_else(|| self.effective_compact_threshold());
+        let reserved = orchestration::MAX_SYNTHESIS_CHARS + ORCHESTRATION_SYSTEM_HEADROOM;
+        let Some(available_for_history_and_root) = smallest_window.checked_sub(reserved) else {
+            return TeamContextFit::Impossible;
+        };
+        if root_task_chars > available_for_history_and_root {
+            return TeamContextFit::Impossible;
+        }
+        if self.history_chars().saturating_add(root_task_chars) <= available_for_history_and_root {
+            return TeamContextFit::Fits;
+        }
+        let already_compacted = matches!(
+            self.history.as_slice(),
+            [Message::User(content)]
+                if content
+                    .text()
+                    .starts_with("Context summary of our conversation so far (earlier messages were compacted):")
+        );
+        if self.history.is_empty() || already_compacted {
+            TeamContextFit::Impossible
+        } else {
+            TeamContextFit::NeedsCompaction
         }
     }
 
@@ -2081,6 +2836,8 @@ impl App {
                  Output only the summary.\n\n<conversation>\n{flat}\n</conversation>"
             )))],
             tools: Vec::new(),
+            policy: RequestPolicy::ReadOnly,
+            force_full_handoff: true,
         };
         let session_id = self.session_id.clone();
         let config = self.config.clone();
@@ -2461,6 +3218,629 @@ mod tests {
         assert_eq!(m, vec!["new"]);
 
         assert!(match_commands("zzz").is_empty());
+    }
+
+    #[tokio::test]
+    async fn team_command_arms_one_shot_and_validates_bounds() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+
+        app.set_input("/team 4");
+        app.submit_input();
+        assert_eq!(app.team_workers(), Some(4));
+
+        app.set_input("/team 9");
+        app.submit_input();
+        assert_eq!(app.team_workers(), Some(4));
+        assert!(
+            matches!(app.transcript.last(), Some(Entry::Error(error)) if error.contains("2-4"))
+        );
+
+        app.set_input("/team off");
+        app.submit_input();
+        assert_eq!(app.team_workers(), None);
+    }
+
+    #[tokio::test]
+    async fn team_prompt_with_attachment_is_preserved_without_a_provider_call() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "test-lead".into(),
+        });
+        app.team_workers = Some(2);
+        app.pending_images.push((
+            "evidence.png".into(),
+            ImageData {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            },
+        ));
+        app.set_input("review this screenshot");
+
+        app.submit_input();
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.team_workers(), Some(2));
+        assert_eq!(app.textarea.lines().join("\n"), "review this screenshot");
+        assert_eq!(app.pending_images.len(), 1);
+        assert!(app.orchestration_run.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_team_prompt_is_preserved_without_being_fanned_out() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "test-lead".into(),
+        });
+        app.team_workers = Some(2);
+        let oversized = "x".repeat(orchestration::MAX_ROOT_TASK_CHARS + 1);
+        app.set_input(&oversized);
+
+        app.submit_input();
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.team_workers(), Some(2));
+        assert_eq!(app.textarea.lines().join("\n"), oversized);
+        assert!(app.orchestration_run.is_none());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Entry::Error(error)) if error.contains("character limit")
+        ));
+    }
+
+    #[tokio::test]
+    async fn team_mode_rejects_unpinned_cli_defaults_without_consuming_the_draft() {
+        for (provider, id) in [
+            (ProviderKind::ClaudeCode, "claude-code"),
+            (ProviderKind::Codex, "codex"),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(offline_config(), tx);
+            app.model = Some(ModelEntry {
+                provider,
+                id: id.into(),
+            });
+            app.team_workers = Some(2);
+            app.set_input("keep this team prompt");
+
+            app.submit_input();
+
+            assert_eq!(app.mode, Mode::Input);
+            assert_eq!(app.team_workers(), Some(2));
+            assert_eq!(app.textarea.lines().join("\n"), "keep this team prompt");
+            assert!(app.orchestration_run.is_none());
+            assert!(matches!(
+                app.transcript.last(),
+                Some(Entry::Error(error)) if error.contains("explicit") && error.contains("pinned")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_team_lead_requires_and_uses_a_workspace_scoped_advisory_model() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let codex = ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:gpt-5.6-sol".into(),
+        };
+        app.model = Some(codex.clone());
+        app.models = vec![codex.clone()];
+        app.team_workers = Some(2);
+        app.set_input("review this repository safely");
+
+        app.submit_input();
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(
+            app.textarea.lines().join("\n"),
+            "review this repository safely"
+        );
+        assert!(app.orchestration_run.is_none());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Entry::Error(error)) if error.contains("workspace-scoped advisory model")
+        ));
+
+        let safe = ModelEntry {
+            provider: ProviderKind::OpenAi,
+            id: "safe-planner".into(),
+        };
+        app.models.push(safe.clone());
+        app.submit_input();
+
+        assert_eq!(app.mode, Mode::Orchestrating);
+        assert_eq!(
+            app.orchestration_planner()
+                .map(|model| (&model.provider, &model.id)),
+            Some((&safe.provider, &safe.id))
+        );
+        assert!(app
+            .orchestration_run
+            .as_ref()
+            .expect("team run")
+            .tasks
+            .is_empty());
+        app.orchestration_task.take().unwrap().abort();
+        app.cancel_orchestration();
+    }
+
+    #[tokio::test]
+    async fn injected_codex_worker_plan_is_rejected_before_confirmation() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "safe-lead".into(),
+        };
+        let codex = ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:gpt-5.6-sol".into(),
+        };
+        app.model = Some(lead.clone());
+        app.models = vec![lead.clone(), codex.clone()];
+        app.start_orchestration_plan(
+            QueuedPrompt {
+                text: "preserve this root".into(),
+                staged_images: Vec::new(),
+                referenced_images: Vec::new(),
+                model: lead,
+            },
+            2,
+        );
+        let run_id = app.orchestration_run_id().unwrap();
+        app.orchestration_task.take().unwrap().abort();
+
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![planned_task(1, &codex), planned_task(2, &codex)]),
+        });
+
+        assert_eq!(app.mode, Mode::Input);
+        assert!(app.orchestration_run.is_none());
+        assert_eq!(app.textarea.lines().join("\n"), "preserve this root");
+        assert!(app.transcript.iter().any(|entry| {
+            matches!(entry, Entry::Error(error) if error.contains("workspace-scoped"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn impossible_team_context_never_starts_a_futile_compaction() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = offline_config();
+        config.compact_threshold_chars =
+            orchestration::MAX_SYNTHESIS_CHARS + ORCHESTRATION_SYSTEM_HEADROOM - 1;
+        let mut app = App::new(config, tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::OpenAi,
+            id: "tiny-context".into(),
+        };
+        app.model = Some(lead.clone());
+        app.models = vec![lead];
+        app.team_workers = Some(2);
+        app.set_input("small root");
+
+        app.submit_input();
+
+        assert_eq!(app.mode, Mode::Input);
+        assert!(!app.compacting);
+        assert!(app.compaction_task.is_none());
+        assert_eq!(app.team_workers(), Some(2));
+        assert_eq!(app.textarea.lines().join("\n"), "small root");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Entry::Error(error)) if error.contains("cannot fit")
+        ));
+    }
+
+    #[tokio::test]
+    async fn pre_worker_cancel_restores_prompt_and_rearms_team_mode() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "lead".into(),
+        };
+        app.start_orchestration_plan(
+            QueuedPrompt {
+                text: "revise and retry".into(),
+                staged_images: Vec::new(),
+                referenced_images: Vec::new(),
+                model: lead,
+            },
+            3,
+        );
+        app.cancel_orchestration();
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.team_workers(), Some(3));
+        assert_eq!(app.textarea.lines().join("\n"), "revise and retry");
+    }
+
+    fn planned_task(id: usize, model: &ModelEntry) -> PlannedTask {
+        PlannedTask {
+            id,
+            title: format!("review {id}"),
+            instructions: format!("inspect lens {id}"),
+            model: model.clone(),
+        }
+    }
+
+    fn start_confirmed_test_team(app: &mut App, lead: &ModelEntry, text: &str) -> u64 {
+        app.start_orchestration_plan(
+            QueuedPrompt {
+                text: text.into(),
+                staged_images: Vec::new(),
+                referenced_images: Vec::new(),
+                model: lead.clone(),
+            },
+            2,
+        );
+        let run_id = app.orchestration_run_id().unwrap();
+        app.orchestration_task.take().unwrap().abort();
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![planned_task(1, lead), planned_task(2, lead)]),
+        });
+        app.focus_orchestration_confirm();
+        app.confirm_orchestration();
+        app.orchestration_task.take().unwrap().abort();
+        run_id
+    }
+
+    #[tokio::test]
+    async fn orchestrated_workers_feed_one_pinned_coordinator_turn() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "lead".into(),
+        };
+        app.model = Some(lead.clone());
+        app.start_orchestration_plan(
+            QueuedPrompt {
+                text: "build the feature".into(),
+                staged_images: Vec::new(),
+                referenced_images: Vec::new(),
+                model: lead.clone(),
+            },
+            2,
+        );
+        let run_id = app.orchestration_run_id().unwrap();
+        app.orchestration_task.take().unwrap().abort();
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![planned_task(1, &lead), planned_task(2, &lead)]),
+        });
+        assert_eq!(app.mode, Mode::OrchestrationConfirm);
+        app.on_event(AppEvent::ModelsDiscovered {
+            models: vec![ModelEntry {
+                provider: ProviderKind::OpenAi,
+                id: "late-discovery".into(),
+            }],
+            finished: true,
+        });
+        assert_eq!(
+            app.model.as_ref().map(|model| (&model.provider, &model.id)),
+            Some((&lead.provider, &lead.id)),
+            "discovery must not replace the pinned lead while a team plan is active"
+        );
+        app.focus_orchestration_confirm();
+        app.confirm_orchestration();
+        app.orchestration_task.take().unwrap().abort();
+
+        for id in [2, 1] {
+            app.on_event(AppEvent::OrchestrationWorkerFinished {
+                run_id,
+                outcome: WorkerOutcome {
+                    id,
+                    title: format!("review {id}"),
+                    model: lead.clone(),
+                    result: Ok(format!("evidence from {id}")),
+                },
+            });
+        }
+        app.on_event(AppEvent::OrchestrationWorkersFinished { run_id });
+
+        assert_eq!(app.mode, Mode::Streaming);
+        assert_eq!(
+            app.active_turn_model.as_ref().map(|model| &model.id),
+            Some(&lead.id)
+        );
+        let context = app.orchestration_context.as_deref().unwrap();
+        assert!(context.find("worker 1").unwrap() < context.find("worker 2").unwrap());
+        assert_eq!(
+            app.history
+                .iter()
+                .filter(|message| matches!(message, Message::User(_)))
+                .count(),
+            1,
+            "worker prompts and reports must stay out of canonical history"
+        );
+        app.cancel_request();
+    }
+
+    #[tokio::test]
+    async fn first_turn_cli_synthesis_forces_worker_evidence_into_the_handoff() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:test".into(),
+        };
+        app.history
+            .push(Message::User("the first root task".into()));
+
+        let ordinary = app.active_chat_request(lead.clone());
+        assert!(!ordinary.force_full_handoff);
+
+        app.orchestration_context = Some("UNTRUSTED WORKER EVIDENCE".into());
+        let synthesis = app.active_chat_request(lead);
+        assert!(synthesis.force_full_handoff);
+        assert!(synthesis.system.contains("UNTRUSTED WORKER EVIDENCE"));
+        assert_eq!(synthesis.policy, RequestPolicy::Interactive);
+    }
+
+    #[tokio::test]
+    async fn team_synthesis_omits_historical_image_payloads() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::OpenAi,
+            id: "lead".into(),
+        };
+        app.history.push(Message::User(UserContent::Rich {
+            text: "historical screenshot".into(),
+            images: vec![ImageData {
+                media_type: "image/png".into(),
+                data: "SECRET-BASE64-PAYLOAD".into(),
+            }],
+        }));
+        app.history.push(Message::User("team root".into()));
+        app.orchestration_context = Some("UNTRUSTED WORKER EVIDENCE".into());
+
+        let synthesis = app.active_chat_request(lead);
+        let serialized = serde_json::to_string(&synthesis.messages).unwrap();
+        assert!(!serialized.contains("SECRET-BASE64-PAYLOAD"));
+        assert!(serialized.contains("historical image omitted"));
+        assert!(serialized.contains("team root"));
+    }
+
+    #[tokio::test]
+    async fn team_context_budget_uses_the_smallest_participant_and_image_bytes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::OpenAi,
+            id: "cloud-lead".into(),
+        };
+        let local = ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "local-worker".into(),
+        };
+        app.model = Some(lead.clone());
+        app.models = vec![lead.clone(), local];
+        app.history.push(Message::User("x".repeat(18_000).into()));
+
+        assert_eq!(
+            app.team_context_fit(2, 0),
+            TeamContextFit::NeedsCompaction,
+            "an Ollama worker's smaller context must gate fan-out"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut root_heavy = App::new(offline_config(), tx);
+        root_heavy.model = Some(lead.clone());
+        root_heavy.models = vec![
+            lead.clone(),
+            ModelEntry {
+                provider: ProviderKind::Ollama,
+                id: "local-worker".into(),
+            },
+        ];
+        root_heavy
+            .history
+            .push(Message::User("x".repeat(2_000).into()));
+        assert_eq!(
+            root_heavy.team_context_fit(2, 16_000),
+            TeamContextFit::NeedsCompaction,
+            "the root prompt itself must count before fan-out"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = App::new(offline_config(), tx);
+        images.model = Some(lead.clone());
+        images.models = vec![lead];
+        images.history.push(Message::User(UserContent::Rich {
+            text: "historical screenshot".into(),
+            images: vec![ImageData {
+                media_type: "image/png".into(),
+                data: "a".repeat(50_000),
+            }],
+        }));
+
+        assert!(images.history_chars() >= 50_000);
+        assert_eq!(
+            images.team_context_fit(2, 0),
+            TeamContextFit::NeedsCompaction,
+            "base64 image bytes must count toward the team context budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_worker_failures_restore_the_root_and_fence_late_events() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let lead = ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "lead".into(),
+        };
+        app.model = Some(lead.clone());
+        app.start_orchestration_plan(
+            QueuedPrompt {
+                text: "do not lose me".into(),
+                staged_images: Vec::new(),
+                referenced_images: Vec::new(),
+                model: lead.clone(),
+            },
+            2,
+        );
+        let run_id = app.orchestration_run_id().unwrap();
+        app.orchestration_task.take().unwrap().abort();
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![planned_task(1, &lead), planned_task(2, &lead)]),
+        });
+        app.focus_orchestration_confirm();
+        app.confirm_orchestration();
+        app.orchestration_task.take().unwrap().abort();
+        for id in [1, 2] {
+            app.on_event(AppEvent::OrchestrationWorkerFinished {
+                run_id,
+                outcome: WorkerOutcome {
+                    id,
+                    title: format!("review {id}"),
+                    model: lead.clone(),
+                    result: Err("offline".into()),
+                },
+            });
+        }
+        app.on_event(AppEvent::OrchestrationWorkersFinished { run_id });
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.textarea.lines().join("\n"), "do not lose me");
+        assert!(app.history.is_empty());
+        assert!(app.orchestration_run.is_none());
+
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![planned_task(1, &lead), planned_task(2, &lead)]),
+        });
+        assert_eq!(app.mode, Mode::Input);
+        assert!(app.orchestration_run.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_failed_team_root_never_leaks_behind_a_successor() {
+        for (queue_successor, all_workers_fail) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(offline_config(), tx);
+            let lead = ModelEntry {
+                provider: ProviderKind::Ollama,
+                id: "lead".into(),
+            };
+            app.model = Some(lead.clone());
+            let run_id = start_confirmed_test_team(&mut app, &lead, "cancel this root");
+            app.pending_images.push((
+                "successor.png".into(),
+                ImageData {
+                    media_type: "image/png".into(),
+                    data: "c3VjY2Vzc29y".into(),
+                },
+            ));
+            app.textarea.insert_str("preserve the successor");
+            if queue_successor {
+                app.queue_input();
+            }
+
+            if all_workers_fail {
+                for id in [1, 2] {
+                    app.on_event(AppEvent::OrchestrationWorkerFinished {
+                        run_id,
+                        outcome: WorkerOutcome {
+                            id,
+                            title: format!("review {id}"),
+                            model: lead.clone(),
+                            result: Err(format!("worker {id} unavailable")),
+                        },
+                    });
+                }
+                app.on_event(AppEvent::OrchestrationWorkersFinished { run_id });
+            } else {
+                app.cancel_orchestration();
+            }
+
+            assert_eq!(app.mode, Mode::Input);
+            assert!(app.history.is_empty(), "cancelled root leaked into history");
+            assert_eq!(app.textarea.lines().join("\n"), "preserve the successor");
+            assert_eq!(app.pending_images.len(), 1);
+            assert_eq!(app.pending_images[0].0, "successor.png");
+            assert!(!app
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::User(text) if text == "cancel this root")));
+            if all_workers_fail {
+                assert!(app.transcript.iter().any(|entry| {
+                    matches!(entry, Entry::Error(error) if error.contains("worker 1 unavailable"))
+                }));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_pre_output_cancel_or_error_removes_root_behind_successor() {
+        for (queue_successor, provider_error) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(offline_config(), tx);
+            let lead = ModelEntry {
+                provider: ProviderKind::Ollama,
+                id: "lead".into(),
+            };
+            app.model = Some(lead.clone());
+            let run_id = start_confirmed_test_team(&mut app, &lead, "abandon this root");
+            app.pending_images.push((
+                "next.png".into(),
+                ImageData {
+                    media_type: "image/png".into(),
+                    data: "bmV4dA==".into(),
+                },
+            ));
+            app.textarea.insert_str("preserve this successor");
+            if queue_successor {
+                app.queue_input();
+            }
+
+            for id in [1, 2] {
+                app.on_event(AppEvent::OrchestrationWorkerFinished {
+                    run_id,
+                    outcome: WorkerOutcome {
+                        id,
+                        title: format!("review {id}"),
+                        model: lead.clone(),
+                        result: Ok(format!("evidence {id}")),
+                    },
+                });
+            }
+            app.on_event(AppEvent::OrchestrationWorkersFinished { run_id });
+            assert_eq!(app.mode, Mode::Streaming);
+            assert!(app.team_coordinator_has_no_activity());
+
+            if provider_error {
+                app.on_chat_event(ChatEvent::Error("lead unavailable".into()));
+            } else {
+                app.cancel_request();
+            }
+
+            assert_eq!(app.mode, Mode::Input);
+            assert!(app.history.is_empty(), "abandoned team root leaked");
+            assert_eq!(app.textarea.lines().join("\n"), "preserve this successor");
+            assert_eq!(app.pending_images.len(), 1);
+            assert_eq!(app.pending_images[0].0, "next.png");
+            assert!(!app
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::User(text) if text == "abandon this root")));
+            assert!(app.orchestration_run.is_none());
+            assert!(app.request_task.is_none());
+        }
     }
 
     #[test]

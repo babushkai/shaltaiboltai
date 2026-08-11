@@ -50,9 +50,17 @@ Each CLI request starts an ephemeral fresh process with an explicit handoff of t
 
 ## Keys & commands
 
-Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered, `/model claude-code:opus` and `/model codex:gpt-5.6-sol` select subscription CLI models, and `/refresh` rediscovers providers. The statusline prioritizes the active state on narrow terminals, then adds the model, project, linked-worktree branch, and live context usage as space allows.
+Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered, `/model claude-code:opus` and `/model codex:gpt-5.6-sol` select subscription CLI models, `/team 3` arms a coordinated run, and `/refresh` rediscovers providers. The statusline prioritizes the active state on narrow terminals, then adds the model, project, linked-worktree branch, and live context usage as space allows.
 
 The composer stays live while a response streams or a tool runs. Press `Enter` to queue one next message; it is sent automatically only after the current turn finishes cleanly (and after any context compaction). Cancellation, provider errors, truncation, or persistence/compaction failures restore that message to the composer instead. The one-message queue locks after capture, and slash commands wait until the active turn ends.
+
+### Team orchestration
+
+`/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent—the small mascot in the transcript title dances while it works. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan.
+
+After confirmation, workers run concurrently under a read-only policy and cannot use Shaltaiboltai's mutating tools. API workers whose models support tools get a bounded, app-owned read-only repository tool loop. Claude Code uses safe mode with `Read`, `Glob`, and `Grep`; a local model without tool support instead reasons from the supplied conversation. Codex CLI is deliberately excluded from planning and worker assignments: its `read-only` sandbox blocks writes but allows reads outside the workspace. An explicitly selected Codex model can still be the post-confirmation lead that synthesizes and edits under its normal sandbox. Every selected advisory provider receives the text conversation, so review the provider/model rows before sharing it. Images are omitted from team fan-out; use `/team off` for a vision prompt. Shaltaiboltai waits for every worker request to finish, synthesizes their reports, and becomes the only agent allowed to edit through the normal approval or CLI sandbox rules. This prevents concurrent team edits; it cannot prevent an unrelated process or person from changing the workspace at the same time.
+
+The selected lead provider/model is pinned for synthesis and is also the planner when it has an enforceable workspace-read boundary. With a Codex lead, the overlay identifies the safe alternate planner; team mode requires at least one such advisory model to be available. Because a bare `codex` or `claude-code` selector delegates model choice to that CLI, team mode asks you to choose an explicit row such as `codex:gpt-5.6-sol` or `claude-code:sonnet` first. Worker assignments may deliberately use other providers for diversity; their exact provider/selectors are snapshotted in the plan and never silently replaced. Reaching the confirmation has already used **1 planner call**; accepting it adds at least **N worker calls + 1 synthesis call**, with additional calls possible when workers use read tools or the lead later uses tools. `Esc` cancels planning, workers, or streaming synthesis and terminates their owned requests. Once synthesis reaches a normal tool approval, the usual approval controls apply: `Tab` focuses the review, then `n` or `Esc` denies it. During the worker phase the normal one-message lookahead remains available.
 
 | Key | Action |
 |---|---|
@@ -63,9 +71,11 @@ The composer stays live while a response streams or a tool runs. Press `Enter` t
 | `Up` / `Down` | recall previous prompts (when the input is empty), shell-style |
 | `Ctrl+U` | clear the input |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
+| `/team [2-4\|off]` | arm one lead-and-workers run, or turn it off |
 | `F1` or `/help` | focused keyboard guide |
 | `Esc` | cancel an in-flight response or running tool (including CLI sub-agents); in a tool approval, first focus its review controls and then deny the tool |
 | `Tab`, then `y` / `a` / `n` | focus a newly arrived tool approval, then approve once / allow only this path, search, or exact command for the current session / deny |
+| `Tab`, then `y` / `Enter`; `n` / `Esc` | review and start a team plan; or cancel it |
 | `Up` / `Down`, `PgUp` / `PgDn` | scroll a tool approval preview while its actions stay pinned |
 | `PgUp` / `PgDn` or mouse wheel | scroll transcript |
 | `Ctrl+Home` / `Ctrl+End` | jump to the oldest / latest transcript line |

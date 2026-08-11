@@ -137,6 +137,16 @@ pub fn cli_model_selector(selector: &str) -> Option<ModelEntry> {
     })
 }
 
+/// Bare CLI selectors delegate model choice to the CLI's own configuration.
+/// They are suitable for ordinary one-off turns, but not for multi-request
+/// workflows that promise one exact model across every phase.
+pub fn is_cli_default_model(model: &ModelEntry) -> bool {
+    matches!(
+        (&model.provider, model.id.as_str()),
+        (ProviderKind::ClaudeCode, "claude-code") | (ProviderKind::Codex, "codex")
+    )
+}
+
 /// Convert a CLI selector once the corresponding provider has been discovered.
 /// Callers that restore persisted state may provisionally retain
 /// [`cli_model_selector`] until discovery finishes.
@@ -266,6 +276,21 @@ pub struct ChatRequest {
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
+    pub policy: RequestPolicy,
+    /// Force CLI transports to include `system` and role-labelled history even
+    /// for a single-user first turn. Orchestration relies on this for planner,
+    /// worker, and synthesis contracts; ordinary first turns stay concise.
+    pub force_full_handoff: bool,
+}
+
+/// Execution authority for a provider request. Interactive requests preserve
+/// the user's configured CLI permissions; read-only requests enforce a
+/// provider-specific non-mutating sandbox for advisory workers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestPolicy {
+    #[default]
+    Interactive,
+    ReadOnly,
 }
 
 pub async fn stream_chat(config: Config, req: ChatRequest, tx: UnboundedSender<ChatEvent>) {

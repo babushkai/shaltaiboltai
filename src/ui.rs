@@ -46,6 +46,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::SessionPicker => draw_session_picker(frame, app),
         Mode::ThemePicker => draw_theme_picker(frame, app),
         Mode::Approval => draw_approval(frame, app),
+        Mode::OrchestrationConfirm => draw_orchestration_confirm(frame, app),
         Mode::Help => draw_help(frame, app),
         _ => {}
     }
@@ -74,8 +75,9 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let lookahead = app.compacting
         || matches!(
             app.mode,
-            Mode::Streaming | Mode::RunningTool | Mode::Approval
+            Mode::Streaming | Mode::RunningTool | Mode::Approval | Mode::Orchestrating
         );
+    let team_workers = app.team_workers();
     let border = if focused {
         theme.accent
     } else if queued {
@@ -87,6 +89,10 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
         " queued "
     } else if queued {
         " next message queued "
+    } else if team_workers.is_some() && area.width < 40 {
+        " team prompt "
+    } else if team_workers.is_some() {
+        " team · next prompt "
     } else if lookahead {
         " next message "
     } else {
@@ -135,6 +141,11 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
             "Esc cancel · Enter queue · Alt+Enter newline".into(),
             theme.dim,
         ))
+    } else if let Some(workers) = team_workers {
+        Some((
+            format!("Enter starts 1 planning call · {workers} workers after review"),
+            theme.accent2,
+        ))
     } else if queued && app.mode == Mode::Approval {
         Some(("waiting for tool decision · n / Esc deny".into(), theme.dim))
     } else if queued {
@@ -161,6 +172,8 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let placeholder = if queued {
         "Waiting for the current turn to finish…"
+    } else if team_workers.is_some() {
+        "Describe what Shaltaiboltai should coordinate…"
     } else if lookahead {
         "Type the next request while this one runs…"
     } else {
@@ -274,13 +287,26 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
+    let mascot = lead_mascot_frame(matches!(
+        app.mode,
+        Mode::Streaming
+            | Mode::RunningTool
+            | Mode::Approval
+            | Mode::OrchestrationConfirm
+            | Mode::Orchestrating
+    ));
+    let brand = if area.width >= 28 {
+        format!(" ◆ shaltaiboltai {mascot} ")
+    } else {
+        format!(" ◆ {mascot} ")
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.border))
         .padding(Padding::horizontal(1))
         .title(Line::styled(
-            " ◆ shaltaiboltai ",
+            brand,
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
     if app.scroll_from_bottom > 0 {
@@ -459,6 +485,57 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
                 }
             }
         }
+        Entry::Agent {
+            name,
+            model,
+            status,
+            summary,
+            is_error,
+        } => {
+            let running = status == "RUNNING";
+            let (glyph, color) = if *is_error {
+                ("✗ ", theme.error)
+            } else if running {
+                ("◆ ", theme.accent2)
+            } else {
+                ("✓ ", theme.success)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    glyph,
+                    Style::new()
+                        .fg(semantic_foreground(color, theme.bg, theme.fg))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {status} "),
+                    Style::new()
+                        .fg(on_color(color))
+                        .bg(color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  AGENT · ", Style::new().fg(theme.dim)),
+                Span::styled(model.clone(), Style::new().fg(theme.accent2)),
+            ]));
+            push_wrapped(
+                &mut lines,
+                "│ ",
+                Style::new().fg(theme.border),
+                name,
+                width,
+                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+            );
+            if !summary.is_empty() {
+                push_wrapped(
+                    &mut lines,
+                    "│   ",
+                    Style::new().fg(theme.border),
+                    summary,
+                    width,
+                    Style::new().fg(if *is_error { theme.error } else { theme.dim }),
+                );
+            }
+        }
         Entry::Info(text) => {
             push_wrapped(
                 &mut lines,
@@ -519,10 +596,25 @@ fn push_wrapped(
     }
 }
 
-fn spinner_frame() -> char {
-    let ms = std::time::SystemTime::now()
+fn animation_millis() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
+        .map_or(0, |duration| duration.as_millis())
+}
+
+/// Shaltaiboltai is the visible lead agent. During work the compact mascot
+/// cycles through three terminal-native dance poses without consuming a row.
+fn lead_mascot_frame(active: bool) -> &'static str {
+    const DANCE: [&str; 3] = ["\\o/", "-o-", "/o\\"];
+    if active {
+        DANCE[(animation_millis() / 240) as usize % DANCE.len()]
+    } else {
+        "-o-"
+    }
+}
+
+fn spinner_frame() -> char {
+    let ms = animation_millis();
     SPINNER[(ms / 120) as usize % SPINNER.len()]
 }
 
@@ -537,41 +629,47 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
     let wide = area.width >= 52;
-    let (state, state_color) = if app.compacting {
-        ("compacting context…", theme.accent)
+    let (state, state_color) = if let Some(status) = app.orchestration_status() {
+        (status, theme.accent2)
+    } else if app.compacting {
+        ("compacting context…".into(), theme.accent)
     } else if app.discovering && app.mode == Mode::Input {
-        ("discovering models…", theme.accent)
+        ("discovering models…".into(), theme.accent)
+    } else if let Some(workers) = app.team_workers().filter(|_| app.mode == Mode::Input) {
+        (format!("TEAM · {workers} workers armed"), theme.accent2)
     } else {
         match app.mode {
-            Mode::Input => ("ready", theme.success),
+            Mode::Input => ("ready".into(), theme.success),
             Mode::Streaming => (
                 if wide {
-                    "thinking — Esc to cancel"
+                    "thinking — Esc to cancel".into()
                 } else {
-                    "thinking"
+                    "thinking".into()
                 },
                 theme.accent,
             ),
             Mode::RunningTool => (
                 if wide {
-                    "running tool — Esc to cancel"
+                    "running tool — Esc to cancel".into()
                 } else {
-                    "running tool"
+                    "running tool".into()
                 },
                 theme.accent2,
             ),
-            Mode::Approval => ("approval needed", theme.warning),
-            Mode::ModelPicker => ("selecting model", theme.accent2),
-            Mode::SessionPicker => ("selecting session", theme.accent2),
+            Mode::Approval => ("approval needed".into(), theme.warning),
+            Mode::OrchestrationConfirm => ("TEAM · plan ready".into(), theme.warning),
+            Mode::Orchestrating => ("TEAM · working — Esc cancel".into(), theme.accent2),
+            Mode::ModelPicker => ("selecting model".into(), theme.accent2),
+            Mode::SessionPicker => ("selecting session".into(), theme.accent2),
             Mode::ThemePicker => (
                 if wide {
-                    "previewing theme — Enter keep · Esc revert"
+                    "previewing theme — Enter keep · Esc revert".into()
                 } else {
-                    "previewing theme"
+                    "previewing theme".into()
                 },
                 theme.accent2,
             ),
-            Mode::Help => ("keyboard guide", theme.accent2),
+            Mode::Help => ("keyboard guide".into(), theme.accent2),
         }
     };
     let state = if app.mode == Mode::Approval && !app.approval_focused {
@@ -583,7 +681,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.queued_prompt_count() > 0 {
         format!("{state} · next queued")
     } else {
-        state.to_owned()
+        state
     };
     let spinner_width = if app.is_busy() { 3 } else { 1 };
     let state_width = UnicodeWidthStr::width(state.as_str());
@@ -995,6 +1093,246 @@ fn draw_overlay_list(
     let mut state = ListState::default();
     state.select((!empty).then_some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
+    let theme = app.theme;
+    let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
+    let tasks = app.orchestration_plan();
+    let workers = tasks.len();
+    let focused = app.orchestration_confirm_focused;
+    let detailed_height = (workers as u16).saturating_mul(3).saturating_add(9);
+    let show_instructions =
+        frame.area().width >= 64 && frame.area().height.saturating_sub(2) >= detailed_height;
+    let preferred_height = if show_instructions {
+        detailed_height
+    } else {
+        (workers as u16 + 8).clamp(8, 16)
+    };
+    let area = modal_area(frame.area(), 92, preferred_height);
+    frame.render_widget(Clear, area);
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(warning))
+        .padding(Padding::horizontal(1))
+        .title(Line::styled(
+            if focused {
+                " team plan · review focus "
+            } else {
+                " team plan ready · press Tab "
+            },
+            Style::new().fg(warning).add_modifier(Modifier::BOLD),
+        ));
+    if let Some(surface) = theme.surface {
+        block = block.style(Style::new().bg(surface).fg(theme.fg));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let actions = orchestration_confirm_action_lines(focused, inner.width as usize, &theme);
+    let action_height = (actions.len() as u16).min(inner.height);
+    let desired_header_height = 3;
+    let header_height = inner
+        .height
+        .saturating_sub(action_height)
+        .min(desired_header_height);
+    let [header_area, tasks_area, action_area] = Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Min(0),
+        Constraint::Length(action_height),
+    ])
+    .areas(inner);
+
+    let start_line = if show_instructions {
+        format!("at least {workers} worker calls → 1 synthesis call")
+    } else {
+        format!("≥{workers} worker calls → synthesis")
+    };
+    let planner_line = app.orchestration_planner().map_or_else(
+        || "1 planner call already ran".to_owned(),
+        |model| {
+            format!(
+                "1 planner call already ran · {} · {}",
+                model.display_id(),
+                model.provider.label()
+            )
+        },
+    );
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled("USED   ", Style::new().fg(theme.dim)),
+            Span::styled(
+                truncate_width(&planner_line, inner.width.saturating_sub(7) as usize),
+                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("START  ", Style::new().fg(theme.dim)),
+            Span::styled(
+                truncate_width(&start_line, inner.width.saturating_sub(7) as usize),
+                Style::new().fg(theme.warning),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("SCOPE  ", Style::new().fg(theme.dim)),
+            Span::styled(
+                truncate_width(
+                    if show_instructions {
+                        "text → listed providers · workers read-only · only lead may edit"
+                    } else {
+                        "text shared · read-only"
+                    },
+                    inner.width.saturating_sub(7) as usize,
+                ),
+                Style::new().fg(theme.accent2),
+            ),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(
+            header_lines
+                .into_iter()
+                .take(header_area.height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        header_area,
+    );
+
+    let row_width = tasks_area.width as usize;
+    let mut task_lines = vec![Line::styled(
+        if show_instructions {
+            "TASK SUMMARIES · EXACT MODELS"
+        } else {
+            "TASKS · EXACT MODELS"
+        },
+        Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+    )];
+    for task in tasks {
+        let id = format!("{}  ", task.id);
+        let mut model = format!(
+            "{} · {}",
+            task.model.display_id(),
+            task.model.provider.label()
+        );
+        let model_budget = row_width
+            .saturating_sub(id.width() + 4)
+            .min(if show_instructions { 32 } else { 22 });
+        model = truncate_width(&model, model_budget);
+        let title_budget = row_width
+            .saturating_sub(id.width() + UnicodeWidthStr::width(model.as_str()) + 3)
+            .max(1);
+        let title = truncate_width(&task.title, title_budget);
+        let used = id.width()
+            + UnicodeWidthStr::width(title.as_str())
+            + UnicodeWidthStr::width(model.as_str());
+        let gap = " ".repeat(row_width.saturating_sub(used).max(1));
+        task_lines.push(Line::from(vec![
+            Span::styled(
+                id,
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(title, Style::new().fg(theme.fg)),
+            Span::raw(gap),
+            Span::styled(model, Style::new().fg(theme.dim)),
+        ]));
+
+        if show_instructions {
+            let prefix = "   ↳ ";
+            let preview_width = row_width.saturating_sub(prefix.width()).max(1);
+            for (index, preview) in instruction_preview(&task.instructions, preview_width, 2)
+                .into_iter()
+                .enumerate()
+            {
+                task_lines.push(Line::from(vec![
+                    Span::styled(
+                        if index == 0 { prefix } else { "     " },
+                        Style::new().fg(theme.accent2),
+                    ),
+                    Span::styled(preview, Style::new().fg(theme.dim)),
+                ]));
+            }
+        }
+    }
+    task_lines.truncate(tasks_area.height as usize);
+    frame.render_widget(Paragraph::new(task_lines), tasks_area);
+    frame.render_widget(Paragraph::new(actions), action_area);
+}
+
+fn instruction_preview(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let wrapped = textwrap::wrap(&normalized, width.max(1));
+    let was_truncated = wrapped.len() > max_lines;
+    let mut preview = wrapped
+        .into_iter()
+        .take(max_lines)
+        .map(|line| line.into_owned())
+        .collect::<Vec<_>>();
+    if was_truncated {
+        if let Some(last) = preview.last_mut() {
+            *last = truncate_width(&format!("{last} …"), width);
+        }
+    }
+    preview
+}
+
+fn orchestration_confirm_action_lines(
+    focused: bool,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let success = semantic_foreground(theme.success, theme.surface, theme.fg);
+    let error = semantic_foreground(theme.error, theme.surface, theme.fg);
+    if !focused {
+        let wide = Line::from(vec![
+            key_span("Tab", theme.accent),
+            Span::styled(" review plan   ·   ", Style::new().fg(theme.fg)),
+            key_span("n / Esc", error),
+            Span::styled(" cancel", Style::new().fg(theme.fg)),
+        ]);
+        if wide.width() <= width {
+            return vec![wide];
+        }
+        return vec![
+            Line::from(vec![
+                key_span("Tab", theme.accent),
+                Span::styled(" review", Style::new().fg(theme.fg)),
+            ]),
+            Line::from(vec![
+                key_span("n / Esc", error),
+                Span::styled(" cancel", Style::new().fg(theme.fg)),
+            ]),
+        ];
+    }
+
+    let wide = Line::from(vec![
+        key_span("y / Enter", success),
+        Span::styled(" start   ·   ", Style::new().fg(theme.fg)),
+        key_span("n / Esc", error),
+        Span::styled(" cancel   ·   ", Style::new().fg(theme.fg)),
+        key_span("Tab", theme.accent),
+        Span::styled(" back", Style::new().fg(theme.fg)),
+    ]);
+    if wide.width() <= width {
+        vec![wide]
+    } else {
+        vec![
+            Line::from(vec![
+                key_span("y / Enter", success),
+                Span::styled(" start", Style::new().fg(theme.fg)),
+            ]),
+            Line::from(vec![
+                key_span("n / Esc", error),
+                Span::styled(" cancel · ", Style::new().fg(theme.fg)),
+                key_span("Tab", theme.accent),
+                Span::styled(" back", Style::new().fg(theme.fg)),
+            ]),
+        ]
+    }
 }
 
 fn draw_approval(frame: &mut Frame, app: &mut App) {
@@ -1415,8 +1753,8 @@ fn draw_help(frame: &mut Frame, app: &App) {
             key("↑ / ↓", "recall prompts or move in menus"),
             key("PgUp / PgDn", "scroll conversation or approval"),
             key("Ctrl+Home/End", "oldest / latest message"),
-            Line::raw(""),
             section("AGENT"),
+            key("/team [2-4]", "Shaltaiboltai lead + read-only workers"),
             key("Esc", "cancel work; focus / deny approval"),
             key("Tab · y/a/n", "focus approval · decide"),
             key("Ctrl+C", "restore queued, then quit"),
@@ -1425,7 +1763,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
         vec![
             key("Enter", "send / queue next"),
             key("Alt+Enter", "newline"),
-            key("Ctrl+P", "models"),
+            key("/team [2-4]", "lead + read-only workers"),
             key("/", "commands"),
             key("PgUp/PgDn", "scroll"),
             key("Esc", "cancel / deny"),
@@ -1439,6 +1777,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
             key("Esc", "cancel / deny"),
             key("Tab · y/a/n", "approval"),
             key("Ctrl+C", "queue-safe quit"),
+            key("/team", "lead + workers"),
             key("Enter", "send"),
             key("/", "commands"),
             key("PgUp/PgDn", "scroll"),
@@ -1465,5 +1804,190 @@ fn modal_area(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::AppEvent;
+    use crate::config::Config;
+    use crate::orchestration::PlannedTask;
+    use crate::providers::{ModelEntry, ProviderKind};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn test_app() -> App {
+        let data_dir =
+            std::env::temp_dir().join(format!("shaltai-orchestration-ui-{}", std::process::id()));
+        std::env::set_var("SHALTAIBOLTAI_DATA_DIR", data_dir);
+        let config = Config {
+            anthropic_api_key: None,
+            openai_api_key: None,
+            openai_base_url: "http://127.0.0.1:9".into(),
+            ollama_host: "http://127.0.0.1:9".into(),
+            default_model: None,
+            compact_threshold_chars: 80_000,
+            ollama_num_ctx: 16_384,
+            theme: None,
+            claude_code_bypass_permissions: false,
+            codex_full_access: false,
+        };
+        let (tx, _rx) = unbounded_channel();
+        let mut app = App::new(config, tx);
+        app.discovering = false;
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "team-test".into(),
+        });
+        app
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    fn has_dancing_mascot(rendered: &str) -> bool {
+        ["\\o/", "-o-", "/o\\"]
+            .into_iter()
+            .any(|pose| rendered.contains(pose))
+    }
+
+    fn show_confirmation(app: &mut App) {
+        app.textarea.insert_str("/team 2");
+        app.submit_input();
+        app.textarea.insert_str("coordinate this change");
+        app.submit_input();
+        let run_id = app.orchestration_run_id().expect("orchestration run");
+        let model = app.model.clone().expect("test model");
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![
+                PlannedTask {
+                    id: 1,
+                    title: "inspect state".into(),
+                    instructions:
+                        "read the relevant files and summarize concrete evidence without edits"
+                            .into(),
+                    model: model.clone(),
+                },
+                PlannedTask {
+                    id: 2,
+                    title: "review risks".into(),
+                    instructions: "identify safety gaps".into(),
+                    model,
+                },
+            ]),
+        });
+    }
+
+    #[tokio::test]
+    async fn lead_mascot_and_worker_card_render_at_standard_size() {
+        let mut app = test_app();
+        app.mode = Mode::Orchestrating;
+        app.transcript = vec![Entry::Agent {
+            name: "agent 1 · inspect state".into(),
+            model: "team-test · ollama".into(),
+            status: "RUNNING".into(),
+            summary: "reviewing the task in a read-only sandbox…".into(),
+            is_error: false,
+        }];
+        app.transcript_rev += 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
+        assert!(has_dancing_mascot(&rendered), "{rendered}");
+        assert!(rendered.contains("RUNNING"), "{rendered}");
+        assert!(
+            rendered.contains("AGENT · team-test · ollama"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("read-only sandbox"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn lead_mascot_remains_visible_at_narrow_size() {
+        let mut app = test_app();
+        app.mode = Mode::Orchestrating;
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
+        assert!(has_dancing_mascot(&rendered), "{rendered}");
+        assert!(rendered.contains("TEAM"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn armed_team_composer_discloses_the_planning_call() {
+        let mut app = test_app();
+        app.textarea.insert_str("/team 2");
+        app.submit_input();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(
+            rendered.contains("Enter starts 1 planning call · 2 workers after review"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_confirmation_is_responsive_and_keeps_safety_controls_visible() {
+        let mut app = test_app();
+        show_confirmation(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("team plan ready"), "{rendered}");
+        assert!(
+            rendered.contains("1 planner call already ran"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("2 worker calls"), "{rendered}");
+        assert!(rendered.contains("1 synthesis call"), "{rendered}");
+        assert!(rendered.contains("listed providers"), "{rendered}");
+        assert!(rendered.contains("workers read-only"), "{rendered}");
+        assert!(
+            rendered.contains("TASK SUMMARIES · EXACT MODELS"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("read the relevant files"), "{rendered}");
+        assert!(rendered.contains("team-test · ollama"), "{rendered}");
+        assert!(rendered.contains("Tab"), "{rendered}");
+        assert!(rendered.contains("n / Esc"), "{rendered}");
+
+        let mut app = test_app();
+        show_confirmation(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("team plan ready"), "{rendered}");
+        assert!(
+            rendered.contains("1 planner call already ran"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("2 worker calls"), "{rendered}");
+        assert!(rendered.contains("synthesis"), "{rendered}");
+        assert!(rendered.contains("text shared · read-only"), "{rendered}");
+        assert!(rendered.contains("TASKS · EXACT MODELS"), "{rendered}");
+        assert!(rendered.contains("team-test · ollama"), "{rendered}");
+        assert!(rendered.contains("Tab"), "{rendered}");
+        assert!(rendered.contains("n / Esc"), "{rendered}");
     }
 }

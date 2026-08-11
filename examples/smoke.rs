@@ -4,7 +4,7 @@
 //! the chosen model, auto-approving tool calls.
 
 use shaltaiboltai::config::Config;
-use shaltaiboltai::providers::{self, ChatEvent, ChatRequest, Message};
+use shaltaiboltai::providers::{self, ChatEvent, ChatRequest, Message, RequestPolicy};
 use shaltaiboltai::tools;
 
 #[tokio::main]
@@ -38,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
             system: "You are a test agent. Use tools when asked.".into(),
             messages: history.clone(),
             tools: tools::definitions(),
+            policy: RequestPolicy::Interactive,
+            force_full_handoff: false,
         };
         tokio::spawn(providers::stream_chat(config.clone(), req, tx));
 

@@ -4,7 +4,9 @@
 //! This bills the corresponding subscription one trivial read-only turn.
 
 use shaltaiboltai::config::Config;
-use shaltaiboltai::providers::{self, ChatEvent, ChatRequest, Message, ModelEntry, ProviderKind};
+use shaltaiboltai::providers::{
+    self, ChatEvent, ChatRequest, Message, ModelEntry, ProviderKind, RequestPolicy,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,6 +39,8 @@ async fn main() -> anyhow::Result<()> {
             "Reply with exactly the word: pong. Do not use any tools.".into(),
         )],
         tools: Vec::new(),
+        policy: RequestPolicy::Interactive,
+        force_full_handoff: false,
     };
     tokio::spawn(providers::stream_chat(Config::load(), req, tx));
 
