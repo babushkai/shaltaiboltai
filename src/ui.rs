@@ -12,6 +12,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::Frame;
+use ratatui_image::Image as TerminalImage;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
@@ -22,6 +23,20 @@ const LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT: u16 = 19;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    draw_frame(frame, app, None);
+}
+
+/// Production renderer with a high-resolution Kitty image cache. Tests and
+/// unsupported terminals keep using [`draw`] and the deterministic cell art.
+pub fn draw_with_native_mascot(
+    frame: &mut Frame,
+    app: &mut App,
+    native_mascot: &mascot::NativeMascot,
+) {
+    draw_frame(frame, app, Some(native_mascot));
+}
+
+fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::NativeMascot>) {
     let theme = app.theme;
     if let Some(bg) = theme.bg {
         frame.render_widget(
@@ -40,7 +55,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let (lead_stage, conversation_area) = lead_stage_layout(transcript_area);
     if let Some(area) = lead_stage {
-        draw_lead_stage(frame, app, area);
+        // Kitty uses skip-marked placeholder cells. Keep modal frames entirely
+        // cell-rendered so Clear can own every overlay cell and accessibility
+        // text can never sit behind a terminal image plane.
+        let native_mascot = native_mascot.filter(|_| {
+            !matches!(
+                app.mode,
+                Mode::ModelPicker
+                    | Mode::SessionPicker
+                    | Mode::ThemePicker
+                    | Mode::Approval
+                    | Mode::OrchestrationConfirm
+                    | Mode::Help
+            )
+        });
+        draw_lead_stage(frame, app, area, native_mascot);
     }
     draw_transcript(frame, app, conversation_area, lead_stage.is_some());
     draw_status(frame, app, status_area);
@@ -74,7 +103,12 @@ fn lead_stage_layout(area: Rect) -> (Option<Rect>, Rect) {
     (Some(stage), conversation)
 }
 
-fn draw_lead_stage(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_lead_stage(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    native_mascot: Option<&mascot::NativeMascot>,
+) {
     let theme = app.theme;
     let state = app.mascot_state();
     let mut block = Block::default()
@@ -96,6 +130,21 @@ fn draw_lead_stage(frame: &mut Frame, app: &App, area: Rect) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if let Some(native_mascot) = native_mascot {
+        let image = native_mascot.protocol(state, app.animation_tick());
+        let size = image.area();
+        if size.width <= inner.width && size.height <= inner.height {
+            let image_area = Rect::new(
+                inner.x + (inner.width - size.width) / 2,
+                inner.y + (inner.height - size.height) / 2,
+                size.width,
+                size.height,
+            );
+            frame.render_widget(TerminalImage::new(image), image_area);
+            return;
+        }
+    }
 
     let pose = mascot::frame(state, app.animation_tick());
     let art = pose
@@ -1904,6 +1953,7 @@ mod tests {
     use crate::providers::{ModelEntry, ProviderKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui_image::picker::{Picker, ProtocolType};
     use tokio::sync::mpsc::unbounded_channel;
 
     fn test_app() -> App {
@@ -1963,6 +2013,20 @@ mod tests {
                     })
                 })
         })
+    }
+
+    fn has_native_graphics(terminal: &Terminal<TestBackend>) -> bool {
+        terminal.backend().buffer().content().iter().any(|cell| {
+            cell.skip || cell.symbol().contains('\u{10eeee}') || cell.symbol().contains('\x1b')
+        })
+    }
+
+    fn native_mascot() -> mascot::NativeMascot {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        mascot::NativeMascot::from_picker(picker)
+            .unwrap()
+            .expect("forced Kitty renderer")
     }
 
     fn buffer_region(
@@ -2050,6 +2114,34 @@ mod tests {
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
         assert!(!has_full_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("TEAM"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn native_mascot_yields_to_modals_and_compact_layouts() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.mode = Mode::Streaming;
+        let native = native_mascot();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(has_native_graphics(&terminal));
+
+        app.mode = Mode::Help;
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(!has_native_graphics(&terminal));
+
+        app.mode = Mode::Streaming;
+        terminal.backend_mut().resize(60, 20);
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(!has_native_graphics(&terminal));
+        assert!(screen(&terminal).contains("◆ shaltaiboltai"));
     }
 
     #[tokio::test]

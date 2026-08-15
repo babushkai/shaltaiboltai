@@ -1,4 +1,4 @@
-use shaltaiboltai::{app, config, ui};
+use shaltaiboltai::{app, config, mascot, ui};
 
 use app::{App, AppEvent, Mode};
 use config::Config;
@@ -64,8 +64,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    // Detect direct Ghostty/Kitty sessions after alternate-screen setup and
+    // before EventStream starts. Unsupported/error paths keep the deterministic
+    // half-block mascot without a blocking terminal capability query.
+    let native_mascot = mascot::NativeMascot::detect().ok().flatten();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, native_mascot.as_ref()).await;
+    // Remove Kitty placeholder cells before leaving the alternate screen.
+    // The terminal then releases every virtual placement owned by this UI.
+    if let Some(native_mascot) = &native_mascot {
+        let _ = native_mascot.clear();
+    }
+    let _ = terminal.clear();
     let _ = execute!(
         std::io::stdout(),
         DisableMouseCapture,
@@ -75,7 +85,10 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
+async fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    native_mascot: Option<&mascot::NativeMascot>,
+) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(Config::load(), tx);
     let mut term_events = EventStream::new();
@@ -89,7 +102,13 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
     environment.tick().await;
 
     while !app.should_quit {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| {
+            if let Some(native_mascot) = native_mascot {
+                ui::draw_with_native_mascot(frame, &mut app, native_mascot);
+            } else {
+                ui::draw(frame, &mut app);
+            }
+        })?;
 
         tokio::select! {
             Some(event) = rx.recv() => {

@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let sheet = image::open(SOURCE)?.to_rgba8();
     let frames = isolate_poses(&sheet)?;
+    let output_dir = PathBuf::from(std::env::var("OUT_DIR")?);
 
     let mut generated = String::new();
     writeln!(
@@ -43,7 +44,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         "pub static GENERATED_FRAMES: [MascotFrame; {}] = [",
         frames.len()
     )?;
-    for frame in frames {
+    for (index, source_frame) in frames.into_iter().enumerate() {
+        // Keep a lossless, high-resolution pose for terminal graphics
+        // protocols. The cell renderer below remains the portable fallback.
+        source_frame.save(output_dir.join(format!("mascot_pose_{index}.png")))?;
+        let frame = imageops::resize(
+            &source_frame,
+            LOGICAL_WIDTH,
+            LOGICAL_HEIGHT,
+            FilterType::Lanczos3,
+        );
         writeln!(generated, "    MascotFrame {{ cells: [")?;
         for row in 0..(LOGICAL_HEIGHT / 2) {
             write!(generated, "        [")?;
@@ -58,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     writeln!(generated, "];")?;
 
-    let output = PathBuf::from(std::env::var("OUT_DIR")?).join("mascot_frames.rs");
+    let output = output_dir.join("mascot_frames.rs");
     fs::write(output, generated)?;
     Ok(())
 }
@@ -154,12 +164,7 @@ fn isolate_poses(sheet: &RgbaImage) -> Result<Vec<RgbaImage>, Box<dyn Error>> {
                     *sheet.get_pixel(source_x, source_y),
                 );
             }
-            Ok(imageops::resize(
-                &normalized,
-                LOGICAL_WIDTH,
-                LOGICAL_HEIGHT,
-                FilterType::Triangle,
-            ))
+            Ok(normalized)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
