@@ -53,13 +53,13 @@ async fn renders_themed_frame() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
 
-    // Rounded border corner of the lead-agent stage.
+    // Rounded border corner of the mascot rail.
     assert_eq!(buffer[(0, 0)].symbol(), "╭");
-    // The lead stage uses the elevated surface over the painted base canvas.
+    // The mascot rail uses the elevated surface beside the conversation.
     assert_eq!(app.theme.name, theme::DEFAULT.name);
     assert_eq!(buffer[(0, 0)].bg, theme::DEFAULT.surface.unwrap());
-    assert_eq!(buffer[(0, 8)].bg, theme::DEFAULT.bg.unwrap());
-    // The full character is promoted to a dedicated stage without explaining
+    assert_eq!(buffer[(30, 0)].bg, theme::DEFAULT.bg.unwrap());
+    // The full character is promoted to a dedicated rail without explaining
     // its role or motion in redundant labels.
     let top_row: String = (0..80)
         .map(|x| buffer[(x, 0)].symbol().to_owned())
@@ -533,9 +533,9 @@ async fn scrolled_transcript_stays_anchored_when_tail_reflows() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (9..19)
+        (1..19)
             .map(|y| {
-                (1..79)
+                (31..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect::<String>()
             })
@@ -562,9 +562,9 @@ async fn error_and_cancel_replacements_keep_scrolled_content_anchored() {
     isolate_data_dir();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (9..19)
+        (1..19)
             .map(|y| {
-                (1..79)
+                (31..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect::<String>()
             })

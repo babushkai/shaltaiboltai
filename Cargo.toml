@@ -31,6 +31,9 @@ globset = "0.4"
 ignore = "0.4"
 base64 = "0.22"
 
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [profile.release]
 lto = true
 strip = true

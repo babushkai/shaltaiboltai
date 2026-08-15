@@ -16,9 +16,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
 const MAX_INPUT_LINES: u16 = 8;
-const LEAD_STAGE_HEIGHT: u16 = 8;
-const LEAD_STAGE_MIN_WIDTH: u16 = 64;
-const LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT: u16 = 12;
+const LEAD_STAGE_WIDTH: u16 = 30;
+const LEAD_STAGE_MIN_WIDTH: u16 = 78;
+const LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT: u16 = 19;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -63,14 +63,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// Keep the full mascot's footprint geometry-only. Busy/idle transitions can
 /// change its pose, but never the transcript height or scroll anchor.
 fn lead_stage_layout(area: Rect) -> (Option<Rect>, Rect) {
-    if area.width < LEAD_STAGE_MIN_WIDTH
-        || area.height < LEAD_STAGE_HEIGHT + LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT
-    {
+    if area.width < LEAD_STAGE_MIN_WIDTH || area.height < LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT {
         return (None, area);
     }
-    let [stage, conversation] = Layout::vertical([
-        Constraint::Length(LEAD_STAGE_HEIGHT),
-        Constraint::Min(LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT),
+    let [stage, conversation] = Layout::horizontal([
+        Constraint::Length(LEAD_STAGE_WIDTH),
+        Constraint::Min(LEAD_STAGE_MIN_WIDTH - LEAD_STAGE_WIDTH),
     ])
     .areas(area);
     (Some(stage), conversation)
@@ -101,45 +99,68 @@ fn draw_lead_stage(frame: &mut Frame, app: &App, area: Rect) {
 
     let pose = mascot::frame(state, app.animation_tick());
     let art = pose
-        .rows
+        .cells
         .iter()
-        .enumerate()
-        .map(|(row, text)| styled_mascot_row(text, row, &theme))
+        .map(|row| mascot_line(row, &theme))
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(art).alignment(Alignment::Center), inner);
+    let art_width = mascot::FRAME_WIDTH as u16;
+    let art_height = mascot::FRAME_HEIGHT as u16;
+    let art_area = Rect::new(
+        inner.x + inner.width.saturating_sub(art_width) / 2,
+        inner.y + inner.height.saturating_sub(art_height) / 2,
+        art_width.min(inner.width),
+        art_height.min(inner.height),
+    );
+    frame.render_widget(Paragraph::new(art), art_area);
 }
 
-fn styled_mascot_row(text: &str, row: usize, theme: &Theme) -> Line<'static> {
+fn mascot_line(row: &[mascot::MascotCell; mascot::FRAME_WIDTH], theme: &Theme) -> Line<'static> {
     let panel_bg = theme.surface.or(theme.bg);
-    let visor_bg = theme.bg.map(|_| Color::Rgb(7, 35, 48));
-    let shell = semantic_foreground(theme.fg, panel_bg, theme.fg);
-    let scarf = semantic_foreground(theme.warning, panel_bg, theme.fg);
-    let boots = semantic_foreground(theme.accent2, panel_bg, theme.fg);
-    let face_background = visor_bg.or(panel_bg);
-    let face_fallback = visor_bg.map_or(theme.fg, on_color);
-    let face = semantic_foreground(theme.code, face_background, face_fallback);
-    let core = semantic_foreground(theme.code, panel_bg, theme.fg);
-    let spans = text
-        .chars()
-        .enumerate()
-        .map(|(column, ch)| {
-            let mut style = Style::new().fg(shell);
-            if matches!(row, 1 | 2) && (8..17).contains(&column) {
-                style = style.fg(face).add_modifier(Modifier::BOLD);
-                if let Some(bg) = visor_bg {
-                    style = style.bg(bg);
+    Line::from(
+        row.iter()
+            .map(|cell| {
+                let top = mascot_color(cell.top(), theme);
+                let bottom = mascot_color(cell.bottom(), theme);
+                let mut style = Style::new();
+                if let Some(background) = panel_bg {
+                    style = style.bg(background);
                 }
-            } else if row == 3 && !ch.is_whitespace() {
-                style = style.fg(scarf).add_modifier(Modifier::BOLD);
-            } else if row == 4 && ch == '●' {
-                style = style.fg(core).add_modifier(Modifier::BOLD);
-            } else if row == 5 && !ch.is_whitespace() {
-                style = style.fg(boots).add_modifier(Modifier::BOLD);
-            }
-            Span::styled(ch.to_string(), style)
-        })
-        .collect::<Vec<_>>();
-    Line::from(spans)
+                match (top, bottom) {
+                    (None, None) => Span::styled(" ", style),
+                    (Some(color), None) => Span::styled("▀", style.fg(color)),
+                    (None, Some(color)) => Span::styled("▄", style.fg(color)),
+                    (Some(top), Some(bottom)) if top == bottom => Span::styled("█", style.fg(top)),
+                    (Some(top), Some(bottom)) => Span::styled("▀", style.fg(top).bg(bottom)),
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn mascot_color(pixel: u32, theme: &Theme) -> Option<Color> {
+    mascot::color(pixel).map(|(red, green, blue)| {
+        if theme.name == "terminal" {
+            terminal_mascot_color(red, green, blue)
+        } else {
+            Color::Rgb(red, green, blue)
+        }
+    })
+}
+
+fn terminal_mascot_color(red: u8, green: u8, blue: u8) -> Color {
+    if red > 175 && green > 135 && blue > 90 {
+        Color::White
+    } else if red > 105 && red > green.saturating_add(30) {
+        Color::Red
+    } else if blue > 55 && green > red.saturating_add(15) {
+        Color::Cyan
+    } else if blue > 45 && blue > red && blue > green {
+        Color::Blue
+    } else if red > 65 && green > 35 && blue < 75 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    }
 }
 
 fn input_height(app: &App, total_height: u16) -> u16 {
@@ -380,9 +401,9 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect, full_mascot: bo
     let brand = if full_mascot {
         " ◆ conversation ".to_owned()
     } else if area.width >= 28 {
-        " ◆ shaltaiboltai ╭⌒▾⌒╮ ".to_owned()
+        " ◆ shaltaiboltai ".to_owned()
     } else {
-        " ◆ ╭⌒▾⌒╮ ".to_owned()
+        " ◆ chat ".to_owned()
     };
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -394,7 +415,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect, full_mascot: bo
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
     if app.scroll_from_bottom > 0 {
-        let label = if area.width >= 52 {
+        let label = if area.width >= 48 {
             format!(
                 " ↑ {} lines from latest · Ctrl+End jump ",
                 app.scroll_from_bottom
@@ -1925,11 +1946,38 @@ mod tests {
             .collect()
     }
 
-    fn has_full_mascot(rendered: &str) -> bool {
-        rendered.contains("⌒   ⌒")
-            && rendered.contains("≋≋≋≋≋")
-            && rendered.contains('●')
-            && rendered.contains("▟▛")
+    fn is_mascot_cell(cell: &ratatui::buffer::Cell) -> bool {
+        matches!(cell.symbol(), "▀" | "▄" | "█")
+    }
+
+    fn has_full_mascot(terminal: &Terminal<TestBackend>) -> bool {
+        let buffer = terminal.backend().buffer();
+        let stage = lead_stage_layout(Rect::new(0, 0, buffer.area.width, 20)).0;
+        stage.is_some_and(|stage| {
+            stage.width > 0
+                && stage.height > 0
+                && (stage.y..stage.bottom()).any(|y| {
+                    (stage.x..stage.right()).any(|x| {
+                        let cell = &buffer[(x, y)];
+                        is_mascot_cell(cell)
+                    })
+                })
+        })
+    }
+
+    fn buffer_region(
+        terminal: &Terminal<TestBackend>,
+        area: Rect,
+    ) -> Vec<(String, Color, Color, Modifier)> {
+        let buffer = terminal.backend().buffer();
+        area.rows()
+            .flat_map(|row| {
+                row.columns().map(|position| {
+                    let cell = &buffer[position];
+                    (cell.symbol().to_owned(), cell.fg, cell.bg, cell.modifier)
+                })
+            })
+            .collect()
     }
 
     fn show_confirmation(app: &mut App) {
@@ -1980,7 +2028,7 @@ mod tests {
         assert!(rendered.contains("SHALTAIBOLTAI"), "{rendered}");
         assert!(!rendered.contains("REAL AGENT"), "{rendered}");
         assert!(!rendered.contains("DANCING"), "{rendered}");
-        assert!(has_full_mascot(&rendered), "{rendered}");
+        assert!(has_full_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("RUNNING"), "{rendered}");
         assert!(
             rendered.contains("AGENT · team-test · ollama"),
@@ -1999,8 +2047,8 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
-        assert!(rendered.contains("╭⌒▾⌒╮"), "{rendered}");
-        assert!(!rendered.contains("≋≋≋≋≋"), "{rendered}");
+        assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
+        assert!(!has_full_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("TEAM"), "{rendered}");
     }
 
@@ -2013,8 +2061,9 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("◆ shaltaiboltai ╭⌒▾⌒╮"), "{rendered}");
-        assert!(!has_full_mascot(&rendered), "{rendered}");
+        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
+        assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
+        assert!(!has_full_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("Ready to build"), "{rendered}");
         assert!(rendered.contains("TEAM"), "{rendered}");
         assert!(rendered.contains("next message"), "{rendered}");
@@ -2024,14 +2073,18 @@ mod tests {
     fn full_stage_layout_is_geometry_only_and_keeps_a_conversation_viewport() {
         let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 80, 20));
         let stage = stage.expect("standard terminal should show the full mascot");
-        assert_eq!(stage, Rect::new(0, 0, 80, LEAD_STAGE_HEIGHT));
-        assert_eq!(conversation, Rect::new(0, LEAD_STAGE_HEIGHT, 80, 12));
+        assert_eq!(stage, Rect::new(0, 0, LEAD_STAGE_WIDTH, 20));
+        assert_eq!(conversation, Rect::new(LEAD_STAGE_WIDTH, 0, 50, 20));
+
+        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 80, 19));
+        assert_eq!(stage, Some(Rect::new(0, 0, LEAD_STAGE_WIDTH, 19)));
+        assert_eq!(conversation, Rect::new(LEAD_STAGE_WIDTH, 0, 50, 19));
 
         let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 40, 8));
         assert!(stage.is_none());
         assert_eq!(conversation, Rect::new(0, 0, 40, 8));
 
-        for constrained in [Rect::new(0, 0, 58, 15), Rect::new(0, 0, 80, 19)] {
+        for constrained in [Rect::new(0, 0, 77, 20), Rect::new(0, 0, 80, 18)] {
             let (stage, conversation) = lead_stage_layout(constrained);
             assert!(stage.is_none());
             assert_eq!(conversation, constrained);
@@ -2052,12 +2105,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         app.scroll_from_bottom = 7;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let before = screen(&terminal)
-            .lines()
-            .skip(LEAD_STAGE_HEIGHT as usize)
-            .take(12)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 80, 20));
+        let stage = stage.expect("full mascot stage");
+        let before = buffer_region(&terminal, conversation);
+        let stage_before = buffer_region(&terminal, stage);
         let cache_len = app.render_cache.len();
         let cache_starts = app.render_cache_starts.clone();
         let cache_total = app.render_cache_total_lines;
@@ -2068,21 +2119,17 @@ mod tests {
         app.advance_animation();
         app.advance_animation();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let after = screen(&terminal)
-            .lines()
-            .skip(LEAD_STAGE_HEIGHT as usize)
-            .take(12)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let after = buffer_region(&terminal, conversation);
+        let stage_after = buffer_region(&terminal, stage);
 
         assert_eq!(before, after);
+        assert_ne!(stage_before, stage_after);
         assert_eq!(app.render_cache.len(), cache_len);
         assert_eq!(app.render_cache_starts, cache_starts);
         assert_eq!(app.render_cache_total_lines, cache_total);
         assert_eq!(app.render_cache_rev, cache_rev);
         assert_eq!(app.scroll_from_bottom, scroll);
-        let rendered = screen(&terminal);
-        assert!(rendered.contains("╭──╮╭─────────╮"), "{rendered}");
+        assert!(has_full_mascot(&terminal));
     }
 
     #[tokio::test]
@@ -2115,7 +2162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mascot_palette_is_semantic_and_terminal_theme_keeps_reset_background() {
+    async fn mascot_keeps_source_colors_and_terminal_theme_keeps_reset_background() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         for selected in theme::all() {
             let mut app = test_app();
@@ -2157,45 +2204,69 @@ mod tests {
                 assert_contrast("brand", brand.fg, background);
             }
 
-            let face_x = (0..80)
-                .find(|x| buffer[(*x, 2)].symbol() == "⌒")
-                .expect("mascot face");
-            let face = &buffer[(face_x, 2)];
-            assert_eq!(face.symbol(), "⌒", "{}", selected.name);
-            let visor_bg = selected.bg.map(|_| Color::Rgb(7, 35, 48));
-            assert_eq!(
-                face.fg,
-                semantic_foreground(
-                    selected.code,
-                    visor_bg.or(selected.surface).or(selected.bg),
-                    visor_bg.map_or(selected.fg, on_color),
-                ),
-                "{}",
-                selected.name
-            );
-
-            let scarf_x = (0..80)
-                .find(|x| buffer[(*x, 4)].symbol() == "≋")
-                .expect("mascot scarf");
-            let scarf = &buffer[(scarf_x, 4)];
-            assert_eq!(scarf.symbol(), "≋", "{}", selected.name);
-            assert_eq!(
-                scarf.fg,
-                semantic_foreground(
-                    selected.warning,
-                    selected.surface.or(selected.bg),
-                    selected.fg,
-                ),
-                "{}",
-                selected.name
-            );
-
+            let stage = lead_stage_layout(Rect::new(0, 0, 80, 20))
+                .0
+                .expect("mascot stage");
+            let mascot_cells = stage
+                .rows()
+                .flat_map(|row| row.columns())
+                .filter(|position| is_mascot_cell(&buffer[*position]))
+                .map(|position| buffer[position].clone())
+                .collect::<Vec<_>>();
+            let colors = mascot_cells
+                .iter()
+                .flat_map(|cell| [cell.fg, cell.bg])
+                .filter_map(|color| match color {
+                    Color::Rgb(r, g, b) => Some((r, g, b)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             if selected.name == "terminal" {
-                assert_eq!(face.bg, Color::Reset);
-                assert_eq!(scarf.bg, Color::Reset);
-            } else {
-                assert_eq!(face.bg, Color::Rgb(7, 35, 48), "{}", selected.name);
-                assert_contrast("visor", face.fg, face.bg);
+                assert!(colors.is_empty(), "terminal mascot emitted truecolor");
+                let ansi = mascot_cells
+                    .iter()
+                    .flat_map(|cell| [cell.fg, cell.bg])
+                    .collect::<Vec<_>>();
+                for expected in [
+                    Color::White,
+                    Color::Blue,
+                    Color::Red,
+                    Color::Cyan,
+                    Color::Yellow,
+                ] {
+                    assert!(
+                        ansi.contains(&expected),
+                        "terminal mascot missing {expected:?}"
+                    );
+                }
+                assert_eq!(buffer[(1, 1)].bg, Color::Reset);
+                continue;
+            }
+            for (label, present) in [
+                (
+                    "warm egg shell",
+                    colors
+                        .iter()
+                        .any(|&(r, g, b)| r > 190 && g > 155 && b > 105),
+                ),
+                (
+                    "navy coat",
+                    colors.iter().any(|&(r, g, b)| b > 45 && b > r && b > g),
+                ),
+                (
+                    "red waistcoat",
+                    colors
+                        .iter()
+                        .any(|&(r, g, _)| r > 120 && r > g.saturating_add(35)),
+                ),
+                (
+                    "teal breeches",
+                    colors
+                        .iter()
+                        .any(|&(r, g, b)| b > 65 && g > r.saturating_add(20)),
+                ),
+            ] {
+                assert!(present, "{} missing source-derived {label}", selected.name);
             }
         }
     }

@@ -1,10 +1,11 @@
 # Shaltaiboltai mascot reference
 
-`shaltaiboltai-reference.png` is the canonical visual reference for the lead
-agent: warm ivory egg shell, dark teal visor, cyan expression and chest core,
-orange scarf, dark limbs, and purple-blue boots.
+`shaltaiboltai-humpty-sprites.png` is the canonical four-pose source for the
+lead character: the classic Humpty Dumpty egg gentleman with his face directly
+on the shell, a cravat, navy coat, red waistcoat, teal breeches, and boots.
 
 The image was generated specifically for this project as a four-pose pixel-art
-dance sheet. The runtime TUI does not decode or ship the PNG beside the binary;
-`src/mascot.rs` translates its identity into fixed-width terminal cells and
-Ratatui theme colors so it remains portable over SSH and ordinary terminals.
+sheet. At build time, `build.rs` identifies each connected pose, centers it on
+one fixed canvas while retaining the shared baseline, and samples the source
+colors directly into terminal half-blocks. The binary needs no sidecar image at
+runtime, and smaller terminals do not substitute a separately drawn icon.
