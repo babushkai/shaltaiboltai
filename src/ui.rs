@@ -1,5 +1,6 @@
 use crate::app::{App, Entry, Mode};
 use crate::markdown;
+use crate::mascot::{self, MascotState};
 use crate::session;
 use crate::theme::{self, Theme};
 use crate::tools;
@@ -15,6 +16,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
 const MAX_INPUT_LINES: u16 = 8;
+const LEAD_STAGE_HEIGHT: u16 = 8;
+const LEAD_STAGE_MIN_WIDTH: u16 = 64;
+const LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT: u16 = 12;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -34,7 +38,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    draw_transcript(frame, app, transcript_area);
+    let (lead_stage, conversation_area) = lead_stage_layout(transcript_area);
+    if let Some(area) = lead_stage {
+        draw_lead_stage(frame, app, area);
+    }
+    draw_transcript(frame, app, conversation_area, lead_stage.is_some());
     draw_status(frame, app, status_area);
     draw_input(frame, app, input_area);
     if app.mode == Mode::Input && app.slash_menu_active() {
@@ -50,6 +58,147 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(frame, app),
         _ => {}
     }
+}
+
+/// Keep the full mascot's footprint geometry-only. Busy/idle transitions can
+/// change its pose, but never the transcript height or scroll anchor.
+fn lead_stage_layout(area: Rect) -> (Option<Rect>, Rect) {
+    if area.width < LEAD_STAGE_MIN_WIDTH
+        || area.height < LEAD_STAGE_HEIGHT + LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT
+    {
+        return (None, area);
+    }
+    let [stage, conversation] = Layout::vertical([
+        Constraint::Length(LEAD_STAGE_HEIGHT),
+        Constraint::Min(LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT),
+    ])
+    .areas(area);
+    (Some(stage), conversation)
+}
+
+fn draw_lead_stage(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
+    let state = app.mascot_state();
+    let state_color = match state {
+        MascotState::Idle => theme.success,
+        MascotState::Working => theme.accent2,
+        MascotState::Waiting => theme.warning,
+        MascotState::Thinking => theme.accent,
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.accent))
+        .title(Line::styled(
+            " SHALTAIBOLTAI · REAL AGENT ",
+            Style::new()
+                .fg(semantic_foreground(
+                    theme.accent,
+                    theme.surface.or(theme.bg),
+                    theme.fg,
+                ))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title(
+            Line::styled(
+                format!(" {} ", state.label()),
+                Style::new()
+                    .fg(semantic_foreground(
+                        state_color,
+                        theme.surface.or(theme.bg),
+                        theme.fg,
+                    ))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Right),
+        );
+    if let Some(surface) = theme.surface {
+        block = block.style(Style::new().bg(surface).fg(theme.fg));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [art_area, _, detail_area] = Layout::horizontal([
+        Constraint::Length(mascot::FRAME_WIDTH as u16),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    let pose = mascot::frame(state, app.animation_tick());
+    let art = pose
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row, text)| styled_mascot_row(text, row, &theme))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(art), art_area);
+
+    let model = app
+        .model
+        .as_ref()
+        .map(|model| format!("{} · {}", model.display_id(), model.provider.label()))
+        .unwrap_or_else(|| "model not selected".into());
+    let details = vec![
+        Line::styled(
+            "SHALTAIBOLTAI",
+            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            state.label(),
+            Style::new()
+                .fg(semantic_foreground(
+                    state_color,
+                    theme.surface.or(theme.bg),
+                    theme.fg,
+                ))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(state.detail(), Style::new().fg(theme.dim)),
+        Line::raw(""),
+        Line::styled("lead model", Style::new().fg(theme.dim)),
+        Line::styled(
+            model,
+            Style::new().fg(semantic_foreground(
+                theme.accent2,
+                theme.surface.or(theme.bg),
+                theme.fg,
+            )),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(details), detail_area);
+}
+
+fn styled_mascot_row(text: &str, row: usize, theme: &Theme) -> Line<'static> {
+    let panel_bg = theme.surface.or(theme.bg);
+    let visor_bg = theme.bg.map(|_| Color::Rgb(7, 35, 48));
+    let shell = semantic_foreground(theme.fg, panel_bg, theme.fg);
+    let scarf = semantic_foreground(theme.warning, panel_bg, theme.fg);
+    let boots = semantic_foreground(theme.accent2, panel_bg, theme.fg);
+    let face_background = visor_bg.or(panel_bg);
+    let face_fallback = visor_bg.map_or(theme.fg, on_color);
+    let face = semantic_foreground(theme.code, face_background, face_fallback);
+    let core = semantic_foreground(theme.code, panel_bg, theme.fg);
+    let spans = text
+        .chars()
+        .enumerate()
+        .map(|(column, ch)| {
+            let mut style = Style::new().fg(shell);
+            if matches!(row, 1 | 2) && (8..17).contains(&column) {
+                style = style.fg(face).add_modifier(Modifier::BOLD);
+                if let Some(bg) = visor_bg {
+                    style = style.bg(bg);
+                }
+            } else if row == 3 && !ch.is_whitespace() {
+                style = style.fg(scarf).add_modifier(Modifier::BOLD);
+            } else if row == 4 && ch == '●' {
+                style = style.fg(core).add_modifier(Modifier::BOLD);
+            } else if row == 5 && !ch.is_whitespace() {
+                style = style.fg(boots).add_modifier(Modifier::BOLD);
+            }
+            Span::styled(ch.to_string(), style)
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 fn input_height(app: &App, total_height: u16) -> u16 {
@@ -192,7 +341,7 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Renders the transcript through a per-entry line cache with cumulative line
 /// offsets. Only dirty/new entries are parsed, and locating the viewport is a
 /// binary search rather than a walk from the beginning of the conversation.
-fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect, full_mascot: bool) {
     let theme = app.theme;
     // Borders (2) + horizontal padding (2).
     let width = area.width.saturating_sub(4).max(10) as usize;
@@ -287,18 +436,12 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let mascot = lead_mascot_frame(matches!(
-        app.mode,
-        Mode::Streaming
-            | Mode::RunningTool
-            | Mode::Approval
-            | Mode::OrchestrationConfirm
-            | Mode::Orchestrating
-    ));
-    let brand = if area.width >= 28 {
-        format!(" ◆ shaltaiboltai {mascot} ")
+    let brand = if full_mascot {
+        " ◆ shaltaiboltai · conversation ".to_owned()
+    } else if area.width >= 28 {
+        " ◆ shaltaiboltai ╭⌒▾⌒╮ ".to_owned()
     } else {
-        format!(" ◆ {mascot} ")
+        " ◆ ╭⌒▾⌒╮ ".to_owned()
     };
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -596,26 +739,8 @@ fn push_wrapped(
     }
 }
 
-fn animation_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis())
-}
-
-/// Shaltaiboltai is the visible lead agent. During work the compact mascot
-/// cycles through three terminal-native dance poses without consuming a row.
-fn lead_mascot_frame(active: bool) -> &'static str {
-    const DANCE: [&str; 3] = ["\\o/", "-o-", "/o\\"];
-    if active {
-        DANCE[(animation_millis() / 240) as usize % DANCE.len()]
-    } else {
-        "-o-"
-    }
-}
-
-fn spinner_frame() -> char {
-    let ms = animation_millis();
-    SPINNER[(ms / 120) as usize % SPINNER.len()]
+fn spinner_frame(tick: u64) -> char {
+    SPINNER[tick as usize % SPINNER.len()]
 }
 
 /// One-line status bar on the surface elevation: accent model chip, state
@@ -709,7 +834,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     }
     if app.is_busy() {
         spans.push(Span::styled(
-            format!(" {} ", spinner_frame()),
+            format!(" {} ", spinner_frame(app.animation_tick())),
             Style::new().fg(theme.accent),
         ));
     } else {
@@ -1833,6 +1958,7 @@ mod tests {
             theme: None,
             claude_code_bypass_permissions: false,
             codex_full_access: false,
+            reduced_motion: false,
         };
         let (tx, _rx) = unbounded_channel();
         let mut app = App::new(config, tx);
@@ -1857,10 +1983,11 @@ mod tests {
             .collect()
     }
 
-    fn has_dancing_mascot(rendered: &str) -> bool {
-        ["\\o/", "-o-", "/o\\"]
-            .into_iter()
-            .any(|pose| rendered.contains(pose))
+    fn has_full_mascot(rendered: &str) -> bool {
+        rendered.contains("⌒   ⌒")
+            && rendered.contains("≋≋≋≋≋")
+            && rendered.contains('●')
+            && rendered.contains("▟▛")
     }
 
     fn show_confirmation(app: &mut App) {
@@ -1893,6 +2020,7 @@ mod tests {
 
     #[tokio::test]
     async fn lead_mascot_and_worker_card_render_at_standard_size() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Orchestrating;
         app.transcript = vec![Entry::Agent {
@@ -1907,8 +2035,12 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
-        assert!(has_dancing_mascot(&rendered), "{rendered}");
+        assert!(
+            rendered.contains("SHALTAIBOLTAI · REAL AGENT"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("DANCING"), "{rendered}");
+        assert!(has_full_mascot(&rendered), "{rendered}");
         assert!(rendered.contains("RUNNING"), "{rendered}");
         assert!(
             rendered.contains("AGENT · team-test · ollama"),
@@ -1919,6 +2051,7 @@ mod tests {
 
     #[tokio::test]
     async fn lead_mascot_remains_visible_at_narrow_size() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Orchestrating;
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
@@ -1926,12 +2059,233 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
-        assert!(has_dancing_mascot(&rendered), "{rendered}");
+        assert!(rendered.contains("╭⌒▾⌒╮"), "{rendered}");
+        assert!(!rendered.contains("≋≋≋≋≋"), "{rendered}");
         assert!(rendered.contains("TEAM"), "{rendered}");
     }
 
     #[tokio::test]
+    async fn medium_terminal_keeps_conversation_space_and_uses_compact_signature() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.mode = Mode::Orchestrating;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("◆ shaltaiboltai ╭⌒▾⌒╮"), "{rendered}");
+        assert!(
+            !rendered.contains("SHALTAIBOLTAI · REAL AGENT"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Ready to build"), "{rendered}");
+        assert!(rendered.contains("TEAM"), "{rendered}");
+        assert!(rendered.contains("next message"), "{rendered}");
+    }
+
+    #[test]
+    fn full_stage_layout_is_geometry_only_and_keeps_a_conversation_viewport() {
+        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 80, 20));
+        let stage = stage.expect("standard terminal should show the full mascot");
+        assert_eq!(stage, Rect::new(0, 0, 80, LEAD_STAGE_HEIGHT));
+        assert_eq!(conversation, Rect::new(0, LEAD_STAGE_HEIGHT, 80, 12));
+
+        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 40, 8));
+        assert!(stage.is_none());
+        assert_eq!(conversation, Rect::new(0, 0, 40, 8));
+
+        for constrained in [Rect::new(0, 0, 58, 15), Rect::new(0, 0, 80, 19)] {
+            let (stage, conversation) = lead_stage_layout(constrained);
+            assert!(stage.is_none());
+            assert_eq!(conversation, constrained);
+        }
+    }
+
+    #[tokio::test]
+    async fn working_pose_advances_without_touching_transcript_cache_or_scroll() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.mode = Mode::Orchestrating;
+        app.transcript = (0..30)
+            .map(|index| Entry::Info(format!("evidence line {index}")))
+            .collect();
+        app.transcript_rev += 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.scroll_from_bottom = 7;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let before = screen(&terminal)
+            .lines()
+            .skip(LEAD_STAGE_HEIGHT as usize)
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_len = app.render_cache.len();
+        let cache_starts = app.render_cache_starts.clone();
+        let cache_total = app.render_cache_total_lines;
+        let cache_rev = app.render_cache_rev;
+        let scroll = app.scroll_from_bottom;
+
+        app.advance_animation();
+        app.advance_animation();
+        app.advance_animation();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let after = screen(&terminal)
+            .lines()
+            .skip(LEAD_STAGE_HEIGHT as usize)
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(before, after);
+        assert_eq!(app.render_cache.len(), cache_len);
+        assert_eq!(app.render_cache_starts, cache_starts);
+        assert_eq!(app.render_cache_total_lines, cache_total);
+        assert_eq!(app.render_cache_rev, cache_rev);
+        assert_eq!(app.scroll_from_bottom, scroll);
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("╭──╮╭─────────╮"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn mascot_state_tracks_agent_lifecycle_without_animating_consent_screens() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        assert_eq!(app.mascot_state(), MascotState::Idle);
+        assert!(!app.needs_animation());
+
+        app.mode = Mode::Streaming;
+        assert_eq!(app.mascot_state(), MascotState::Working);
+        assert!(app.needs_animation());
+
+        app.mode = Mode::Approval;
+        assert_eq!(app.mascot_state(), MascotState::Waiting);
+        assert!(!app.needs_animation());
+
+        app.mode = Mode::Input;
+        app.compacting = true;
+        assert_eq!(app.mascot_state(), MascotState::Thinking);
+        assert!(app.needs_animation());
+
+        app.compacting = false;
+        app.mode = Mode::Streaming;
+        app.config.reduced_motion = true;
+        app.advance_animation();
+        assert_eq!(app.mascot_state(), MascotState::Working);
+        assert!(!app.needs_animation());
+        assert_eq!(app.animation_tick(), 0);
+    }
+
+    #[tokio::test]
+    async fn mascot_palette_is_semantic_and_terminal_theme_keeps_reset_background() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        for selected in theme::all() {
+            let mut app = test_app();
+            app.theme = *selected;
+            app.mode = Mode::Orchestrating;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let luminance = |color| match color {
+                Color::White => Some(1.0),
+                Color::Black => Some(0.0),
+                _ => relative_luminance(color),
+            };
+            let assert_contrast = |label: &str, foreground: Color, background: Color| {
+                let foreground = luminance(foreground).expect("known foreground");
+                let background = luminance(background).expect("known background");
+                let contrast =
+                    (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+                assert!(
+                    contrast >= 4.5,
+                    "{} {label} contrast is {contrast:.2}:1",
+                    selected.name
+                );
+            };
+            let stage_bg = selected.surface.or(selected.bg);
+
+            let brand_x = (0..80)
+                .find(|x| buffer[(*x, 0)].symbol() == "S")
+                .expect("SHALTAIBOLTAI title");
+            let brand = &buffer[(brand_x, 0)];
+            assert_eq!(
+                brand.fg,
+                semantic_foreground(selected.accent, stage_bg, selected.fg),
+                "{}",
+                selected.name
+            );
+
+            let title_state_x = (0..80)
+                .find(|x| buffer[(*x, 0)].symbol() == "D")
+                .expect("DANCING title");
+            let title_state = &buffer[(title_state_x, 0)];
+            assert_eq!(
+                title_state.fg,
+                semantic_foreground(
+                    selected.accent2,
+                    selected.surface.or(selected.bg),
+                    selected.fg,
+                ),
+                "{}",
+                selected.name
+            );
+            let model_x = (0..80)
+                .find(|x| buffer[(*x, 6)].symbol() == "t")
+                .expect("team-test model label");
+            let model = &buffer[(model_x, 6)];
+            assert_eq!(
+                model.fg,
+                semantic_foreground(selected.accent2, stage_bg, selected.fg),
+                "{}",
+                selected.name
+            );
+            if let Some(background) = stage_bg {
+                assert_contrast("brand", brand.fg, background);
+                assert_contrast("stage-title", title_state.fg, background);
+                assert_contrast("model", model.fg, background);
+            }
+
+            let face = &buffer[(11, 2)];
+            assert_eq!(face.symbol(), "⌒", "{}", selected.name);
+            let visor_bg = selected.bg.map(|_| Color::Rgb(7, 35, 48));
+            assert_eq!(
+                face.fg,
+                semantic_foreground(
+                    selected.code,
+                    visor_bg.or(selected.surface).or(selected.bg),
+                    visor_bg.map_or(selected.fg, on_color),
+                ),
+                "{}",
+                selected.name
+            );
+
+            let scarf = &buffer[(11, 4)];
+            assert_eq!(scarf.symbol(), "≋", "{}", selected.name);
+            assert_eq!(
+                scarf.fg,
+                semantic_foreground(
+                    selected.warning,
+                    selected.surface.or(selected.bg),
+                    selected.fg,
+                ),
+                "{}",
+                selected.name
+            );
+
+            if selected.name == "terminal" {
+                assert_eq!(face.bg, Color::Reset);
+                assert_eq!(scarf.bg, Color::Reset);
+            } else {
+                assert_eq!(face.bg, Color::Rgb(7, 35, 48), "{}", selected.name);
+                assert_contrast("visor", face.fg, face.bg);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn armed_team_composer_discloses_the_planning_call() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.textarea.insert_str("/team 2");
         app.submit_input();
@@ -1947,6 +2301,7 @@ mod tests {
 
     #[tokio::test]
     async fn team_confirmation_is_responsive_and_keeps_safety_controls_visible() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         show_confirmation(&mut app);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

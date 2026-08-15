@@ -56,7 +56,7 @@ The composer stays live while a response streams or a tool runs. Press `Enter` t
 
 ### Team orchestration
 
-`/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent—the small mascot in the transcript title dances while it works. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan.
+`/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent: on standard terminals his full ivory-shell, cyan-visor character dances in a dedicated lead stage while he works; small terminals retain a compact visor signature without sacrificing the conversation. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan.
 
 After confirmation, workers run concurrently under a read-only policy and cannot use Shaltaiboltai's mutating tools. API workers whose models support tools get a bounded, app-owned read-only repository tool loop. Claude Code uses safe mode with `Read`, `Glob`, and `Grep`; a local model without tool support instead reasons from the supplied conversation. Codex CLI is deliberately excluded from planning and worker assignments: its `read-only` sandbox blocks writes but allows reads outside the workspace. An explicitly selected Codex model can still be the post-confirmation lead that synthesizes and edits under its normal sandbox. Every selected advisory provider receives the text conversation, so review the provider/model rows before sharing it. Images are omitted from team fan-out; use `/team off` for a vision prompt. Shaltaiboltai waits for every worker request to finish, synthesizes their reports, and becomes the only agent allowed to edit through the normal approval or CLI sandbox rules. This prevents concurrent team edits; it cannot prevent an unrelated process or person from changing the workspace at the same time.
 
@@ -122,9 +122,12 @@ default_model = "qwen3.5:latest"
 # openai_api_key = "sk-..."
 # openai_base_url = "https://api.openai.com/v1"   # any OpenAI-compatible server
 # ollama_host = "http://localhost:11434"
+# reduced_motion = false                           # freeze the mascot pose while retaining status text
 # claude_code_bypass_permissions = false          # let the claude-code sub-agent run shell commands unsupervised
 # codex_full_access = false                        # remove the codex sub-agent's OS sandbox (danger-full-access)
 ```
+
+Set `SHALTAIBOLTAI_REDUCED_MOTION=1` for the same motion-free behavior without changing the file.
 
 ## Development
 

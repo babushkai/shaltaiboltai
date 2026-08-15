@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::images;
+use crate::mascot::MascotState;
 use crate::orchestration::{self, PlannedTask, WorkerOutcome};
 use crate::providers::{
     self, ChatEvent, ChatRequest, ImageData, Message, ModelEntry, ProviderKind, RequestPolicy,
@@ -333,6 +334,9 @@ pub struct App {
     pub render_cache_total_lines: usize,
     pub render_cache_width: usize,
     pub render_cache_rev: u64,
+    /// Monotonic UI-only clock. Advancing the mascot never dirties transcript
+    /// entries or changes persisted session state.
+    animation_tick: u64,
 
     gen: u64,
     streaming_text: String,
@@ -425,6 +429,7 @@ impl App {
             render_cache_total_lines: 0,
             render_cache_width: 0,
             render_cache_rev: 0,
+            animation_tick: 0,
             gen: 0,
             streaming_text: String::new(),
             pending_calls: VecDeque::new(),
@@ -463,6 +468,37 @@ impl App {
             Mode::Streaming | Mode::RunningTool | Mode::Orchestrating
         ) || self.compacting
             || self.discovering
+    }
+
+    pub fn mascot_state(&self) -> MascotState {
+        if matches!(
+            self.mode,
+            Mode::Streaming | Mode::RunningTool | Mode::Orchestrating
+        ) {
+            MascotState::Working
+        } else if matches!(self.mode, Mode::Approval | Mode::OrchestrationConfirm) {
+            MascotState::Waiting
+        } else if self.compacting || self.discovering {
+            MascotState::Thinking
+        } else {
+            MascotState::Idle
+        }
+    }
+
+    pub fn needs_animation(&self) -> bool {
+        !self.config.reduced_motion && self.mascot_state().is_animated()
+    }
+
+    pub fn animation_tick(&self) -> u64 {
+        if self.config.reduced_motion {
+            0
+        } else {
+            self.animation_tick
+        }
+    }
+
+    pub fn advance_animation(&mut self) {
+        self.animation_tick = self.animation_tick.wrapping_add(1);
     }
 
     /// Cwd and git branch for the statusline. Cheap (one small file read);
@@ -3188,8 +3224,6 @@ fn system_prompt() -> String {
 mod tests {
     use super::*;
 
-    static DATA_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn offline_config() -> Config {
         Config {
             anthropic_api_key: None,
@@ -3202,6 +3236,7 @@ mod tests {
             theme: None,
             claude_code_bypass_permissions: false,
             codex_full_access: false,
+            reduced_motion: false,
         }
     }
 
@@ -3999,7 +4034,7 @@ mod tests {
             }
         }
 
-        let _data_dir_guard = DATA_DIR_ENV_LOCK.lock().await;
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let previous_data_dir = std::env::var_os("SHALTAIBOLTAI_DATA_DIR");
         let data_dir =
             std::env::temp_dir().join(format!("shaltai-compaction-session-{}", session::new_id()));
@@ -4034,7 +4069,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_grants_end_on_new_and_resume() {
-        let _data_dir_guard = DATA_DIR_ENV_LOCK.lock().await;
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let previous_data_dir = std::env::var_os("SHALTAIBOLTAI_DATA_DIR");
         let data_dir =
             std::env::temp_dir().join(format!("shaltai-approval-session-{}", session::new_id()));
@@ -4102,7 +4137,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_prompt_waits_for_successful_compaction() {
-        let _data_dir_guard = DATA_DIR_ENV_LOCK.lock().await;
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let previous_data_dir = std::env::var_os("SHALTAIBOLTAI_DATA_DIR");
         let data_dir =
             std::env::temp_dir().join(format!("shaltai-queued-compact-{}", session::new_id()));
@@ -4159,7 +4194,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_failure_restores_queued_prompt_without_dispatching() {
-        let _data_dir_guard = DATA_DIR_ENV_LOCK.lock().await;
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let previous_data_dir = std::env::var_os("SHALTAIBOLTAI_DATA_DIR");
         let data_dir =
             std::env::temp_dir().join(format!("shaltai-queued-save-{}", session::new_id()));

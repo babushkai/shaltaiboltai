@@ -26,6 +26,7 @@ fn offline_config() -> Config {
         theme: None,
         claude_code_bypass_permissions: false,
         codex_full_access: false,
+        reduced_motion: false,
     }
 }
 
@@ -52,16 +53,17 @@ async fn renders_themed_frame() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
 
-    // Rounded border corner of the transcript block.
+    // Rounded border corner of the lead-agent stage.
     assert_eq!(buffer[(0, 0)].symbol(), "╭");
-    // Default theme (mocha) background is painted.
+    // The lead stage uses the elevated surface over the painted base canvas.
     assert_eq!(app.theme.name, theme::DEFAULT.name);
-    assert_eq!(buffer[(0, 0)].bg, theme::DEFAULT.bg.unwrap());
-    // Title with the diamond brand mark is present.
+    assert_eq!(buffer[(0, 0)].bg, theme::DEFAULT.surface.unwrap());
+    assert_eq!(buffer[(0, 8)].bg, theme::DEFAULT.bg.unwrap());
+    // The full character is promoted to a dedicated lead-agent stage.
     let top_row: String = (0..80)
         .map(|x| buffer[(x, 0)].symbol().to_owned())
         .collect();
-    assert!(top_row.contains("◆ shaltaiboltai"), "{top_row}");
+    assert!(top_row.contains("SHALTAIBOLTAI · REAL AGENT"), "{top_row}");
 }
 
 #[tokio::test]
@@ -79,7 +81,7 @@ async fn theme_switch_restyles_the_frame() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    assert_eq!(buffer[(0, 0)].bg, app.theme.bg.unwrap());
+    assert_eq!(buffer[(0, 0)].bg, app.theme.surface.unwrap());
 
     // Esc must restore the original theme.
     app.revert_theme();
@@ -529,7 +531,7 @@ async fn scrolled_transcript_stays_anchored_when_tail_reflows() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (1..19)
+        (9..19)
             .map(|y| {
                 (1..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
@@ -558,7 +560,7 @@ async fn error_and_cancel_replacements_keep_scrolled_content_anchored() {
     isolate_data_dir();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (1..19)
+        (9..19)
             .map(|y| {
                 (1..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())

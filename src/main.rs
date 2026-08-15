@@ -79,6 +79,14 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(Config::load(), tx);
     let mut term_events = EventStream::new();
+    let mut animation = tokio::time::interval(std::time::Duration::from_millis(120));
+    animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut environment = tokio::time::interval(std::time::Duration::from_secs(2));
+    environment.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Tokio intervals fire immediately once. Consume that initial pulse so a
+    // new working state starts at the first authored mascot pose.
+    animation.tick().await;
+    environment.tick().await;
 
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -102,11 +110,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
                 Event::Paste(text) => app.paste(&text),
                 _ => {}
             },
-            // Keep the status-bar spinner animating while the agent works.
-            _ = tokio::time::sleep(std::time::Duration::from_millis(120)), if app.is_busy() => {}
+            // A persistent clock keeps the mascot moving even during dense
+            // provider streams; recreating sleeps on every event can starve it.
+            _ = animation.tick(), if app.needs_animation() => app.advance_animation(),
             // Idle: pick up external changes (e.g. a branch switch in another
             // terminal) for the statusline.
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if !app.is_busy() => {
+            _ = environment.tick(), if !app.is_busy() => {
                 app.refresh_environment();
             }
         }
@@ -443,6 +452,7 @@ mod tests {
             theme: None,
             claude_code_bypass_permissions: false,
             codex_full_access: false,
+            reduced_motion: false,
         };
         let (tx, _rx) = unbounded_channel();
         let mut app = App::new(config, tx);

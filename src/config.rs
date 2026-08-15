@@ -25,6 +25,8 @@ pub struct Config {
     /// Run the Codex sub-agent with `danger-full-access` (no sandbox) instead of
     /// the default OS-sandboxed `workspace-write`. Off by default.
     pub codex_full_access: bool,
+    /// Freeze decorative motion while keeping state labels and progress text.
+    pub reduced_motion: bool,
 }
 
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 80_000;
@@ -42,6 +44,7 @@ struct FileConfig {
     theme: Option<String>,
     claude_code_bypass_permissions: Option<bool>,
     codex_full_access: Option<bool>,
+    reduced_motion: Option<bool>,
 }
 
 impl Config {
@@ -70,10 +73,39 @@ impl Config {
             theme: file.theme,
             claude_code_bypass_permissions: file.claude_code_bypass_permissions.unwrap_or(false),
             codex_full_access: file.codex_full_access.unwrap_or(false),
+            reduced_motion: env("SHALTAIBOLTAI_REDUCED_MOTION")
+                .as_deref()
+                .and_then(parse_bool)
+                .or(file.reduced_motion)
+                .unwrap_or(false),
         }
     }
 
     pub fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("shaltaiboltai").join("config.toml"))
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool;
+
+    #[test]
+    fn reduced_motion_environment_values_are_explicit() {
+        for enabled in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(parse_bool(enabled), Some(true));
+        }
+        for disabled in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(parse_bool(disabled), Some(false));
+        }
+        assert_eq!(parse_bool("sometimes"), None);
     }
 }

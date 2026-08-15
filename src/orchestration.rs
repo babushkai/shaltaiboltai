@@ -1052,6 +1052,7 @@ mod tests {
             theme: None,
             claude_code_bypass_permissions: false,
             codex_full_access: false,
+            reduced_motion: false,
         }
     }
 
