@@ -1,6 +1,6 @@
 use crate::app::{App, Entry, Mode};
 use crate::markdown;
-use crate::mascot::{self, MascotState};
+use crate::mascot;
 use crate::session;
 use crate::theme::{self, Theme};
 use crate::tools;
@@ -79,18 +79,12 @@ fn lead_stage_layout(area: Rect) -> (Option<Rect>, Rect) {
 fn draw_lead_stage(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
     let state = app.mascot_state();
-    let state_color = match state {
-        MascotState::Idle => theme.success,
-        MascotState::Working => theme.accent2,
-        MascotState::Waiting => theme.warning,
-        MascotState::Thinking => theme.accent,
-    };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.accent))
         .title(Line::styled(
-            " SHALTAIBOLTAI · REAL AGENT ",
+            " SHALTAIBOLTAI ",
             Style::new()
                 .fg(semantic_foreground(
                     theme.accent,
@@ -98,32 +92,13 @@ fn draw_lead_stage(frame: &mut Frame, app: &App, area: Rect) {
                     theme.fg,
                 ))
                 .add_modifier(Modifier::BOLD),
-        ))
-        .title(
-            Line::styled(
-                format!(" {} ", state.label()),
-                Style::new()
-                    .fg(semantic_foreground(
-                        state_color,
-                        theme.surface.or(theme.bg),
-                        theme.fg,
-                    ))
-                    .add_modifier(Modifier::BOLD),
-            )
-            .alignment(Alignment::Right),
-        );
+        ));
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [art_area, _, detail_area] = Layout::horizontal([
-        Constraint::Length(mascot::FRAME_WIDTH as u16),
-        Constraint::Length(2),
-        Constraint::Min(1),
-    ])
-    .areas(inner);
     let pose = mascot::frame(state, app.animation_tick());
     let art = pose
         .rows
@@ -131,41 +106,7 @@ fn draw_lead_stage(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(row, text)| styled_mascot_row(text, row, &theme))
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(art), art_area);
-
-    let model = app
-        .model
-        .as_ref()
-        .map(|model| format!("{} · {}", model.display_id(), model.provider.label()))
-        .unwrap_or_else(|| "model not selected".into());
-    let details = vec![
-        Line::styled(
-            "SHALTAIBOLTAI",
-            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            state.label(),
-            Style::new()
-                .fg(semantic_foreground(
-                    state_color,
-                    theme.surface.or(theme.bg),
-                    theme.fg,
-                ))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(state.detail(), Style::new().fg(theme.dim)),
-        Line::raw(""),
-        Line::styled("lead model", Style::new().fg(theme.dim)),
-        Line::styled(
-            model,
-            Style::new().fg(semantic_foreground(
-                theme.accent2,
-                theme.surface.or(theme.bg),
-                theme.fg,
-            )),
-        ),
-    ];
-    frame.render_widget(Paragraph::new(details), detail_area);
+    frame.render_widget(Paragraph::new(art).alignment(Alignment::Center), inner);
 }
 
 fn styled_mascot_row(text: &str, row: usize, theme: &Theme) -> Line<'static> {
@@ -437,7 +378,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect, full_mascot: bo
     }
 
     let brand = if full_mascot {
-        " ◆ shaltaiboltai · conversation ".to_owned()
+        " ◆ conversation ".to_owned()
     } else if area.width >= 28 {
         " ◆ shaltaiboltai ╭⌒▾⌒╮ ".to_owned()
     } else {
@@ -1937,6 +1878,7 @@ mod tests {
     use super::*;
     use crate::app::AppEvent;
     use crate::config::Config;
+    use crate::mascot::MascotState;
     use crate::orchestration::PlannedTask;
     use crate::providers::{ModelEntry, ProviderKind};
     use ratatui::backend::TestBackend;
@@ -2035,11 +1977,9 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(
-            rendered.contains("SHALTAIBOLTAI · REAL AGENT"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("DANCING"), "{rendered}");
+        assert!(rendered.contains("SHALTAIBOLTAI"), "{rendered}");
+        assert!(!rendered.contains("REAL AGENT"), "{rendered}");
+        assert!(!rendered.contains("DANCING"), "{rendered}");
         assert!(has_full_mascot(&rendered), "{rendered}");
         assert!(rendered.contains("RUNNING"), "{rendered}");
         assert!(
@@ -2074,10 +2014,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains("◆ shaltaiboltai ╭⌒▾⌒╮"), "{rendered}");
-        assert!(
-            !rendered.contains("SHALTAIBOLTAI · REAL AGENT"),
-            "{rendered}"
-        );
+        assert!(!has_full_mascot(&rendered), "{rendered}");
         assert!(rendered.contains("Ready to build"), "{rendered}");
         assert!(rendered.contains("TEAM"), "{rendered}");
         assert!(rendered.contains("next message"), "{rendered}");
@@ -2216,37 +2153,14 @@ mod tests {
                 selected.name
             );
 
-            let title_state_x = (0..80)
-                .find(|x| buffer[(*x, 0)].symbol() == "D")
-                .expect("DANCING title");
-            let title_state = &buffer[(title_state_x, 0)];
-            assert_eq!(
-                title_state.fg,
-                semantic_foreground(
-                    selected.accent2,
-                    selected.surface.or(selected.bg),
-                    selected.fg,
-                ),
-                "{}",
-                selected.name
-            );
-            let model_x = (0..80)
-                .find(|x| buffer[(*x, 6)].symbol() == "t")
-                .expect("team-test model label");
-            let model = &buffer[(model_x, 6)];
-            assert_eq!(
-                model.fg,
-                semantic_foreground(selected.accent2, stage_bg, selected.fg),
-                "{}",
-                selected.name
-            );
             if let Some(background) = stage_bg {
                 assert_contrast("brand", brand.fg, background);
-                assert_contrast("stage-title", title_state.fg, background);
-                assert_contrast("model", model.fg, background);
             }
 
-            let face = &buffer[(11, 2)];
+            let face_x = (0..80)
+                .find(|x| buffer[(*x, 2)].symbol() == "⌒")
+                .expect("mascot face");
+            let face = &buffer[(face_x, 2)];
             assert_eq!(face.symbol(), "⌒", "{}", selected.name);
             let visor_bg = selected.bg.map(|_| Color::Rgb(7, 35, 48));
             assert_eq!(
@@ -2260,7 +2174,10 @@ mod tests {
                 selected.name
             );
 
-            let scarf = &buffer[(11, 4)];
+            let scarf_x = (0..80)
+                .find(|x| buffer[(*x, 4)].symbol() == "≋")
+                .expect("mascot scarf");
+            let scarf = &buffer[(scarf_x, 4)];
             assert_eq!(scarf.symbol(), "≋", "{}", selected.name);
             assert_eq!(
                 scarf.fg,

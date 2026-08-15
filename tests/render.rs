@@ -59,11 +59,13 @@ async fn renders_themed_frame() {
     assert_eq!(app.theme.name, theme::DEFAULT.name);
     assert_eq!(buffer[(0, 0)].bg, theme::DEFAULT.surface.unwrap());
     assert_eq!(buffer[(0, 8)].bg, theme::DEFAULT.bg.unwrap());
-    // The full character is promoted to a dedicated lead-agent stage.
+    // The full character is promoted to a dedicated stage without explaining
+    // its role or motion in redundant labels.
     let top_row: String = (0..80)
         .map(|x| buffer[(x, 0)].symbol().to_owned())
         .collect();
-    assert!(top_row.contains("SHALTAIBOLTAI · REAL AGENT"), "{top_row}");
+    assert!(top_row.contains("SHALTAIBOLTAI"), "{top_row}");
+    assert!(!top_row.contains("REAL AGENT"), "{top_row}");
 }
 
 #[tokio::test]

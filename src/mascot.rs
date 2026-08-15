@@ -16,24 +16,6 @@ pub enum MascotState {
 }
 
 impl MascotState {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "READY",
-            Self::Working => "DANCING",
-            Self::Waiting => "WAITING",
-            Self::Thinking => "THINKING",
-        }
-    }
-
-    pub const fn detail(self) -> &'static str {
-        match self {
-            Self::Idle => "ready for the next mission",
-            Self::Working => "the real agent is on it",
-            Self::Waiting => "waiting for your decision",
-            Self::Thinking => "mapping the next move",
-        }
-    }
-
     pub const fn is_animated(self) -> bool {
         matches!(self, Self::Working | Self::Thinking)
     }
