@@ -142,6 +142,11 @@ async fn drive(
     // conversation handoff grows.
     stdin.write_all(prompt.as_bytes()).await?;
     stdin.shutdown().await?;
+    // `ChildStdin::shutdown` flushes pending bytes but does not guarantee that
+    // the pipe handle is dropped. Both supported CLIs read stdin to EOF before
+    // starting a turn, so keeping this handle alive deadlocks the child while
+    // we wait for its stdout.
+    drop(stdin);
 
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_result = false;
@@ -504,7 +509,11 @@ fn handle_codex_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
                 "reasoning" | "agent_message" | "todo_list" => {}
                 "error" => {
                     let msg = item["message"].as_str().or_else(|| item["text"].as_str());
-                    let _ = tx.send(ChatEvent::Error(
+                    // Codex can emit recoverable warnings (for example, an
+                    // unstable-feature warning) as an item-level `error` and
+                    // then continue with the assistant response. Only the
+                    // top-level `error` / `turn.failed` events are terminal.
+                    let _ = tx.send(ChatEvent::Notice(
                         msg.unwrap_or("codex reported an error").to_owned(),
                     ));
                 }
@@ -932,6 +941,33 @@ mod tests {
         assert!(has_images(&messages));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drive_closes_stdin_before_waiting_for_stdout() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(
+            r#"while IFS= read -r line || [ -n "$line" ]; do :; done
+printf '%s\n' '{"type":"turn.completed","usage":{}}'"#,
+        );
+        let (tx, mut rx) = unbounded_channel();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drive(
+                command,
+                "test-cli",
+                "prompt without newline",
+                &tx,
+                handle_codex_event,
+            ),
+        )
+        .await
+        .expect("driver should close stdin so the child can observe EOF")
+        .expect("driver should accept the terminal event");
+
+        assert!(matches!(rx.try_recv(), Ok(ChatEvent::Completed { .. })));
+    }
+
     #[test]
     fn codex_agent_message_and_completion_map_to_events() {
         let (tx, mut rx) = unbounded_channel();
@@ -957,6 +993,42 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_item_warning_does_not_swallow_the_later_response() {
+        let (tx, mut rx) = unbounded_channel();
+        assert!(!handle_codex_event(
+            &json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "error",
+                    "message": "unstable feature warning"
+                }
+            }),
+            &tx,
+        ));
+        assert!(!handle_codex_event(
+            &json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Luna replied"}
+            }),
+            &tx,
+        ));
+        assert!(handle_codex_event(
+            &json!({"type": "turn.completed", "usage": {}}),
+            &tx,
+        ));
+
+        let events = drain(&mut rx);
+        assert!(
+            matches!(&events[0], ChatEvent::Notice(message) if message.contains("unstable feature"))
+        );
+        assert!(matches!(&events[1], ChatEvent::TextDelta(text) if text == "Luna replied"));
+        assert!(matches!(&events[2], ChatEvent::Completed { .. }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Error(_))));
     }
 
     #[test]
