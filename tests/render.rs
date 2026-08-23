@@ -53,19 +53,13 @@ async fn renders_themed_frame() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
 
-    // Rounded border corner of the mascot rail.
-    assert_eq!(buffer[(0, 0)].symbol(), "╭");
-    // The mascot rail uses the elevated surface beside the conversation.
-    assert_eq!(app.theme.name, theme::DEFAULT.name);
-    assert_eq!(buffer[(0, 0)].bg, theme::DEFAULT.surface.unwrap());
-    assert_eq!(buffer[(30, 0)].bg, theme::DEFAULT.bg.unwrap());
-    // The full character is promoted to a dedicated rail without explaining
-    // its role or motion in redundant labels.
     let top_row: String = (0..80)
         .map(|x| buffer[(x, 0)].symbol().to_owned())
         .collect();
-    assert!(top_row.contains("SHALTAIBOLTAI"), "{top_row}");
+    assert!(top_row.contains("◆ shaltaiboltai"), "{top_row}");
     assert!(!top_row.contains("REAL AGENT"), "{top_row}");
+    assert!(!top_row.contains("DANCING"), "{top_row}");
+    assert_eq!(app.render_cache_width, 76);
 }
 
 #[tokio::test]
@@ -83,7 +77,7 @@ async fn theme_switch_restyles_the_frame() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    assert_eq!(buffer[(0, 0)].bg, app.theme.surface.unwrap());
+    assert_eq!(buffer[(0, 0)].bg, app.theme.bg.unwrap());
 
     // Esc must restore the original theme.
     app.revert_theme();
@@ -535,7 +529,7 @@ async fn scrolled_transcript_stays_anchored_when_tail_reflows() {
         let buffer = terminal.backend().buffer();
         (1..19)
             .map(|y| {
-                (31..79)
+                (2..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect::<String>()
             })
@@ -564,7 +558,7 @@ async fn error_and_cancel_replacements_keep_scrolled_content_anchored() {
         let buffer = terminal.backend().buffer();
         (1..19)
             .map(|y| {
-                (31..79)
+                (2..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect::<String>()
             })

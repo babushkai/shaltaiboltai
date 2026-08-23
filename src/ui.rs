@@ -17,9 +17,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
 const MAX_INPUT_LINES: u16 = 8;
-const LEAD_STAGE_WIDTH: u16 = 30;
-const LEAD_STAGE_MIN_WIDTH: u16 = 78;
-const LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT: u16 = 19;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -53,28 +50,24 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
     ])
     .areas(frame.area());
 
-    let (lead_stage, conversation_area) = lead_stage_layout(transcript_area);
-    if let Some(area) = lead_stage {
-        // Kitty uses skip-marked placeholder cells. Keep modal frames entirely
-        // cell-rendered so Clear can own every overlay cell and accessibility
-        // text can never sit behind a terminal image plane.
-        let native_mascot = native_mascot.filter(|_| {
-            !matches!(
-                app.mode,
-                Mode::ModelPicker
-                    | Mode::SessionPicker
-                    | Mode::ThemePicker
-                    | Mode::Approval
-                    | Mode::OrchestrationConfirm
-                    | Mode::Help
-            )
-        });
-        draw_lead_stage(frame, app, area, native_mascot);
+    draw_transcript(frame, app, transcript_area);
+    let slash_menu_active = app.mode == Mode::Input && app.slash_menu_active();
+    if !slash_menu_active
+        && !matches!(
+            app.mode,
+            Mode::ModelPicker
+                | Mode::SessionPicker
+                | Mode::ThemePicker
+                | Mode::Approval
+                | Mode::OrchestrationConfirm
+                | Mode::Help
+        )
+    {
+        draw_inline_mascot(frame, app, transcript_area, native_mascot);
     }
-    draw_transcript(frame, app, conversation_area, lead_stage.is_some());
     draw_status(frame, app, status_area);
     draw_input(frame, app, input_area);
-    if app.mode == Mode::Input && app.slash_menu_active() {
+    if slash_menu_active {
         draw_slash_menu(frame, app, input_area);
     }
 
@@ -89,21 +82,7 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
     }
 }
 
-/// Keep the full mascot's footprint geometry-only. Busy/idle transitions can
-/// change its pose, but never the transcript height or scroll anchor.
-fn lead_stage_layout(area: Rect) -> (Option<Rect>, Rect) {
-    if area.width < LEAD_STAGE_MIN_WIDTH || area.height < LEAD_STAGE_MIN_TRANSCRIPT_HEIGHT {
-        return (None, area);
-    }
-    let [stage, conversation] = Layout::horizontal([
-        Constraint::Length(LEAD_STAGE_WIDTH),
-        Constraint::Min(LEAD_STAGE_MIN_WIDTH - LEAD_STAGE_WIDTH),
-    ])
-    .areas(area);
-    (Some(stage), conversation)
-}
-
-fn draw_lead_stage(
+fn draw_inline_mascot(
     frame: &mut Frame,
     app: &App,
     area: Rect,
@@ -111,60 +90,85 @@ fn draw_lead_stage(
 ) {
     let theme = app.theme;
     let state = app.mascot_state();
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.accent))
-        .title(Line::styled(
-            " SHALTAIBOLTAI ",
-            Style::new()
-                .fg(semantic_foreground(
-                    theme.accent,
-                    theme.surface.or(theme.bg),
-                    theme.fg,
-                ))
-                .add_modifier(Modifier::BOLD),
-        ));
-    if let Some(surface) = theme.surface {
-        block = block.style(Style::new().bg(surface).fg(theme.fg));
-    }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     if let Some(native_mascot) = native_mascot {
         let image = native_mascot.protocol(state, app.animation_tick());
         let size = image.area();
-        if size.width <= inner.width && size.height <= inner.height {
-            let image_area = Rect::new(
-                inner.x + (inner.width - size.width) / 2,
-                inner.y + (inner.height - size.height) / 2,
-                size.width,
-                size.height,
-            );
+        if let Some(image_area) = inline_mascot_area(area, size) {
+            if !mascot_region_is_clear(frame, image_area, theme.bg) {
+                return;
+            }
             frame.render_widget(TerminalImage::new(image), image_area);
             return;
         }
+        return;
     }
 
+    let size = Rect::new(
+        0,
+        0,
+        mascot::FRAME_WIDTH as u16,
+        mascot::FRAME_HEIGHT as u16,
+    );
+    let Some(art_area) = inline_mascot_area(area, size) else {
+        return;
+    };
+    if !mascot_region_is_clear(frame, art_area, theme.bg) {
+        return;
+    }
     let pose = mascot::frame(state, app.animation_tick());
     let art = pose
         .cells
         .iter()
         .map(|row| mascot_line(row, &theme))
         .collect::<Vec<_>>();
-    let art_width = mascot::FRAME_WIDTH as u16;
-    let art_height = mascot::FRAME_HEIGHT as u16;
-    let art_area = Rect::new(
-        inner.x + inner.width.saturating_sub(art_width) / 2,
-        inner.y + inner.height.saturating_sub(art_height) / 2,
-        art_width.min(inner.width),
-        art_height.min(inner.height),
-    );
     frame.render_widget(Paragraph::new(art), art_area);
 }
 
+/// Place the mascot inside the transcript border without changing transcript
+/// width. If the full artwork does not fit, the title remains the compact
+/// signature instead.
+fn inline_mascot_area(area: Rect, size: Rect) -> Option<Rect> {
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    if size.width > inner.width || size.height > inner.height {
+        return None;
+    }
+    Some(Rect::new(
+        inner.right() - size.width,
+        inner.bottom() - size.height,
+        size.width,
+        size.height,
+    ))
+}
+
+/// The mascot is decoration, so transcript content always wins. Inspect the
+/// already-rendered main pane and draw only over untouched background cells;
+/// this also keeps code-card surfaces and Kitty placeholders intact.
+fn mascot_region_is_clear(frame: &mut Frame, area: Rect, background: Option<Color>) -> bool {
+    let expected_background = background.unwrap_or(Color::Reset);
+    let left_guard = (area.x > frame.area().x).then_some(area.x - 1);
+    let buffer = frame.buffer_mut();
+    let body_is_clear = area.rows().flat_map(|row| row.columns()).all(|position| {
+        buffer.cell(position).is_some_and(|cell| {
+            !cell.skip
+                && cell.bg == expected_background
+                && cell.symbol().chars().all(char::is_whitespace)
+        })
+    });
+    body_is_clear
+        && left_guard.is_none_or(|x| {
+            (area.y..area.bottom()).all(|y| {
+                buffer
+                    .cell((x, y))
+                    .is_none_or(|cell| cell.symbol().width() <= 1)
+            })
+        })
+}
+
 fn mascot_line(row: &[mascot::MascotCell; mascot::FRAME_WIDTH], theme: &Theme) -> Line<'static> {
-    let panel_bg = theme.surface.or(theme.bg);
+    let panel_bg = theme.bg;
     Line::from(
         row.iter()
             .map(|cell| {
@@ -352,7 +356,7 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Renders the transcript through a per-entry line cache with cumulative line
 /// offsets. Only dirty/new entries are parsed, and locating the viewport is a
 /// binary search rather than a walk from the beginning of the conversation.
-fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect, full_mascot: bool) {
+fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     // Borders (2) + horizontal padding (2).
     let width = area.width.saturating_sub(4).max(10) as usize;
@@ -447,9 +451,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect, full_mascot: bo
         }
     }
 
-    let brand = if full_mascot {
-        " ◆ conversation ".to_owned()
-    } else if area.width >= 28 {
+    let brand = if area.width >= 28 {
         " ◆ shaltaiboltai ".to_owned()
     } else {
         " ◆ chat ".to_owned()
@@ -2000,19 +2002,32 @@ mod tests {
         matches!(cell.symbol(), "▀" | "▄" | "█")
     }
 
-    fn has_full_mascot(terminal: &Terminal<TestBackend>) -> bool {
+    fn has_inline_mascot(terminal: &Terminal<TestBackend>) -> bool {
         let buffer = terminal.backend().buffer();
-        let stage = lead_stage_layout(Rect::new(0, 0, buffer.area.width, 20)).0;
-        stage.is_some_and(|stage| {
-            stage.width > 0
-                && stage.height > 0
-                && (stage.y..stage.bottom()).any(|y| {
-                    (stage.x..stage.right()).any(|x| {
-                        let cell = &buffer[(x, y)];
-                        is_mascot_cell(cell)
-                    })
-                })
+        let transcript = Rect::new(
+            0,
+            0,
+            buffer.area.width,
+            buffer.area.height.saturating_sub(4),
+        );
+        let Some(region) = mascot_region(transcript) else {
+            return false;
+        };
+        (region.y..region.bottom()).any(|y| {
+            (region.x..region.right()).any(|x| buffer.cell((x, y)).is_some_and(is_mascot_cell))
         })
+    }
+
+    fn mascot_region(area: Rect) -> Option<Rect> {
+        inline_mascot_area(
+            area,
+            Rect::new(
+                0,
+                0,
+                crate::mascot::FRAME_WIDTH as u16,
+                crate::mascot::FRAME_HEIGHT as u16,
+            ),
+        )
     }
 
     fn has_native_graphics(terminal: &Terminal<TestBackend>) -> bool {
@@ -2073,7 +2088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lead_mascot_and_worker_card_render_at_standard_size() {
+    async fn inline_mascot_and_worker_card_render_at_standard_size() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Orchestrating;
@@ -2089,10 +2104,10 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("SHALTAIBOLTAI"), "{rendered}");
+        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
         assert!(!rendered.contains("REAL AGENT"), "{rendered}");
         assert!(!rendered.contains("DANCING"), "{rendered}");
-        assert!(has_full_mascot(&terminal), "{rendered}");
+        assert!(has_inline_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("RUNNING"), "{rendered}");
         assert!(
             rendered.contains("AGENT · team-test · ollama"),
@@ -2102,7 +2117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lead_mascot_remains_visible_at_narrow_size() {
+    async fn inline_mascot_remains_compact_at_narrow_size() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Orchestrating;
@@ -2112,15 +2127,17 @@ mod tests {
         let rendered = screen(&terminal);
         assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
-        assert!(!has_full_mascot(&terminal), "{rendered}");
+        assert!(!has_inline_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("TEAM"), "{rendered}");
     }
 
     #[tokio::test]
-    async fn native_mascot_yields_to_modals_and_compact_layouts() {
+    async fn inline_native_mascot_yields_to_modals_and_compact_layouts() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Streaming;
+        app.transcript.clear();
+        app.transcript_rev += 1;
         let native = native_mascot();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -2128,6 +2145,12 @@ mod tests {
             .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
             .unwrap();
         assert!(has_native_graphics(&terminal));
+
+        app.mode = Mode::Approval;
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(!has_native_graphics(&terminal));
 
         app.mode = Mode::Help;
         terminal
@@ -2145,6 +2168,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_mascot_never_covers_right_edge_transcript_text() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.mode = Mode::Streaming;
+        app.transcript = vec![Entry::Assistant(format!(
+            "{} RIGHT_EDGE_SENTINEL",
+            "x".repeat(54)
+        ))];
+        app.transcript_rev += 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("RIGHT_EDGE_SENTINEL"), "{rendered}");
+        assert!(!has_inline_mascot(&terminal), "{rendered}");
+
+        let native = native_mascot();
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("RIGHT_EDGE_SENTINEL"), "{rendered}");
+        assert!(!has_native_graphics(&terminal), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn inline_mascot_yields_to_the_slash_menu_during_discovery() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.discovering = true;
+        app.transcript.clear();
+        app.transcript_rev += 1;
+        app.textarea.insert_str("/");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(
+            rendered.contains("orchestrate the next prompt with read-only workers"),
+            "{rendered}"
+        );
+        assert!(!has_inline_mascot(&terminal), "{rendered}");
+
+        let native = native_mascot();
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(
+            rendered.contains("orchestrate the next prompt with read-only workers"),
+            "{rendered}"
+        );
+        assert!(!has_native_graphics(&terminal), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn idle_and_reduced_motion_keep_a_static_inline_mascot() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.transcript.clear();
+        app.transcript_rev += 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(has_inline_mascot(&terminal));
+
+        app.mode = Mode::Streaming;
+        app.config.reduced_motion = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = mascot_region(Rect::new(0, 0, 80, 20)).expect("mascot area");
+        let before = buffer_region(&terminal, area);
+        app.advance_animation();
+        app.advance_animation();
+        app.advance_animation();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(has_inline_mascot(&terminal));
+        assert_eq!(buffer_region(&terminal, area), before);
+
+        let native = native_mascot();
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(has_native_graphics(&terminal));
+        assert_eq!(app.animation_tick(), 0);
+        app.advance_animation();
+        app.advance_animation();
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(has_native_graphics(&terminal));
+        assert_eq!(app.animation_tick(), 0);
+    }
+
+    #[tokio::test]
     async fn medium_terminal_keeps_conversation_space_and_uses_compact_signature() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
@@ -2155,32 +2272,86 @@ mod tests {
         let rendered = screen(&terminal);
         assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
-        assert!(!has_full_mascot(&terminal), "{rendered}");
+        assert!(!has_inline_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("Ready to build"), "{rendered}");
         assert!(rendered.contains("TEAM"), "{rendered}");
         assert!(rendered.contains("next message"), "{rendered}");
     }
 
     #[test]
-    fn full_stage_layout_is_geometry_only_and_keeps_a_conversation_viewport() {
-        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 80, 20));
-        let stage = stage.expect("standard terminal should show the full mascot");
-        assert_eq!(stage, Rect::new(0, 0, LEAD_STAGE_WIDTH, 20));
-        assert_eq!(conversation, Rect::new(LEAD_STAGE_WIDTH, 0, 50, 20));
+    fn inline_mascot_region_is_bottom_right_and_conversation_stays_full_width() {
+        let full = Rect::new(0, 0, 80, 20);
+        let region = mascot_region(full).expect("fallback mascot fits");
+        assert_eq!(region.width, crate::mascot::FRAME_WIDTH as u16);
+        assert_eq!(region.height, crate::mascot::FRAME_HEIGHT as u16);
+        assert_eq!(region.right(), full.right().saturating_sub(1));
+        assert_eq!(region.bottom(), full.bottom().saturating_sub(1));
+        assert!(
+            region.x > 40,
+            "mascot must sit in the right half of the pane"
+        );
 
-        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 80, 19));
-        assert_eq!(stage, Some(Rect::new(0, 0, LEAD_STAGE_WIDTH, 19)));
-        assert_eq!(conversation, Rect::new(LEAD_STAGE_WIDTH, 0, 50, 19));
+        let native = inline_mascot_area(full, Rect::new(0, 0, 28, 17)).expect("native mascot fits");
+        assert_eq!(native, Rect::new(51, 2, 28, 17));
+        assert!(inline_mascot_area(Rect::new(0, 0, 29, 19), Rect::new(0, 0, 28, 17)).is_none());
+        assert_eq!(
+            inline_mascot_area(Rect::new(0, 0, 30, 19), Rect::new(0, 0, 28, 17)),
+            Some(Rect::new(1, 1, 28, 17))
+        );
+    }
 
-        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 40, 8));
-        assert!(stage.is_none());
-        assert_eq!(conversation, Rect::new(0, 0, 40, 8));
+    #[test]
+    fn inline_mascot_clearance_rejects_content_surfaces_placeholders_and_wide_glyphs() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(10, 2, 5, 3);
+                assert!(mascot_region_is_clear(frame, area, None));
 
-        for constrained in [Rect::new(0, 0, 77, 20), Rect::new(0, 0, 80, 18)] {
-            let (stage, conversation) = lead_stage_layout(constrained);
-            assert!(stage.is_none());
-            assert_eq!(conversation, constrained);
-        }
+                frame
+                    .buffer_mut()
+                    .cell_mut((10, 2))
+                    .expect("content cell")
+                    .set_symbol("x");
+                assert!(!mascot_region_is_clear(frame, area, None));
+                frame
+                    .buffer_mut()
+                    .cell_mut((10, 2))
+                    .expect("content cell")
+                    .reset();
+
+                frame
+                    .buffer_mut()
+                    .cell_mut((10, 2))
+                    .expect("surface cell")
+                    .set_bg(theme::DEFAULT.surface.expect("surface theme"));
+                assert!(!mascot_region_is_clear(frame, area, None));
+                frame
+                    .buffer_mut()
+                    .cell_mut((10, 2))
+                    .expect("surface cell")
+                    .reset();
+
+                frame
+                    .buffer_mut()
+                    .cell_mut((10, 2))
+                    .expect("placeholder cell")
+                    .skip = true;
+                assert!(!mascot_region_is_clear(frame, area, None));
+                frame
+                    .buffer_mut()
+                    .cell_mut((10, 2))
+                    .expect("placeholder cell")
+                    .reset();
+
+                frame
+                    .buffer_mut()
+                    .cell_mut((9, 2))
+                    .expect("left guard cell")
+                    .set_symbol("界");
+                assert!(!mascot_region_is_clear(frame, area, None));
+            })
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2197,10 +2368,20 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         app.scroll_from_bottom = 7;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let (stage, conversation) = lead_stage_layout(Rect::new(0, 0, 80, 20));
-        let stage = stage.expect("full mascot stage");
-        let before = buffer_region(&terminal, conversation);
-        let stage_before = buffer_region(&terminal, stage);
+        let conversation = Rect::new(0, 0, 80, 20);
+        let mascot_area = mascot_region(conversation).expect("mascot area");
+        let mut before = buffer_region(&terminal, conversation);
+        for (index, position) in conversation
+            .rows()
+            .flat_map(|row| row.columns())
+            .enumerate()
+        {
+            if mascot_area.contains(position.into()) {
+                before[index] = (String::new(), Color::Reset, Color::Reset, Modifier::empty());
+            }
+        }
+        let before_stable = before;
+        let mascot_before = buffer_region(&terminal, mascot_area);
         let cache_len = app.render_cache.len();
         let cache_starts = app.render_cache_starts.clone();
         let cache_total = app.render_cache_total_lines;
@@ -2211,17 +2392,27 @@ mod tests {
         app.advance_animation();
         app.advance_animation();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let after = buffer_region(&terminal, conversation);
-        let stage_after = buffer_region(&terminal, stage);
+        let mut after = buffer_region(&terminal, conversation);
+        for (x, position) in conversation
+            .rows()
+            .flat_map(|row| row.columns())
+            .enumerate()
+        {
+            if mascot_area.contains(position.into()) {
+                after[x] = (String::new(), Color::Reset, Color::Reset, Modifier::empty());
+            }
+        }
+        let after_stable = after;
+        let mascot_after = buffer_region(&terminal, mascot_area);
 
-        assert_eq!(before, after);
-        assert_ne!(stage_before, stage_after);
+        assert_eq!(before_stable, after_stable);
+        assert_ne!(mascot_before, mascot_after);
         assert_eq!(app.render_cache.len(), cache_len);
         assert_eq!(app.render_cache_starts, cache_starts);
         assert_eq!(app.render_cache_total_lines, cache_total);
         assert_eq!(app.render_cache_rev, cache_rev);
         assert_eq!(app.scroll_from_bottom, scroll);
-        assert!(has_full_mascot(&terminal));
+        assert!(has_inline_mascot(&terminal));
     }
 
     #[tokio::test]
@@ -2260,46 +2451,13 @@ mod tests {
             let mut app = test_app();
             app.theme = *selected;
             app.mode = Mode::Orchestrating;
+            app.transcript.clear();
+            app.transcript_rev += 1;
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
-            let luminance = |color| match color {
-                Color::White => Some(1.0),
-                Color::Black => Some(0.0),
-                _ => relative_luminance(color),
-            };
-            let assert_contrast = |label: &str, foreground: Color, background: Color| {
-                let foreground = luminance(foreground).expect("known foreground");
-                let background = luminance(background).expect("known background");
-                let contrast =
-                    (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
-                assert!(
-                    contrast >= 4.5,
-                    "{} {label} contrast is {contrast:.2}:1",
-                    selected.name
-                );
-            };
-            let stage_bg = selected.surface.or(selected.bg);
-
-            let brand_x = (0..80)
-                .find(|x| buffer[(*x, 0)].symbol() == "S")
-                .expect("SHALTAIBOLTAI title");
-            let brand = &buffer[(brand_x, 0)];
-            assert_eq!(
-                brand.fg,
-                semantic_foreground(selected.accent, stage_bg, selected.fg),
-                "{}",
-                selected.name
-            );
-
-            if let Some(background) = stage_bg {
-                assert_contrast("brand", brand.fg, background);
-            }
-
-            let stage = lead_stage_layout(Rect::new(0, 0, 80, 20))
-                .0
-                .expect("mascot stage");
-            let mascot_cells = stage
+            let mascot_cells = mascot_region(Rect::new(0, 0, 80, 20))
+                .expect("mascot area")
                 .rows()
                 .flat_map(|row| row.columns())
                 .filter(|position| is_mascot_cell(&buffer[*position]))

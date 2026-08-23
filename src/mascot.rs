@@ -49,8 +49,8 @@ const NATIVE_POSES: [&[u8]; 4] = [
 /// High-resolution pose cache for terminals that implement Kitty graphics.
 ///
 /// Every pose is decoded and encoded once during startup. Animation only
-/// changes which fixed protocol is placed in the rail, so no image work runs
-/// in the input/render loop.
+/// changes which fixed protocol is placed in the transcript, so no image work
+/// runs in the input/render loop.
 pub struct NativeMascot {
     poses: Vec<Protocol>,
     image_ids: [u32; 4],
