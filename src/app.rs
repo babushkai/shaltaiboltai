@@ -36,8 +36,10 @@ const PROJECT_CONTEXT_CAP: usize = 8_000;
 const ORCHESTRATION_SYSTEM_HEADROOM: usize = 8_000;
 const MIN_SYNTHESIS_EVIDENCE_CHARS: usize = 4_000;
 
-/// One-turn lookahead keeps memory bounded and makes failure recovery exact:
-/// there can never be a second draft to merge with a restored queued prompt.
+/// Keep queued follow-ups bounded even when a long-running turn produces a
+/// burst of type-ahead. The composer is left untouched when this cap is hit.
+pub const MAX_QUEUED_PROMPTS: usize = 16;
+
 #[derive(Clone)]
 struct QueuedPrompt {
     text: String,
@@ -46,11 +48,21 @@ struct QueuedPrompt {
     model: ModelEntry,
 }
 
+/// Immutable queue metadata exposed to the renderer without giving it access
+/// to attachment bytes or queue mutation.
+#[derive(Debug, Clone, Copy)]
+pub struct QueuedPromptPreview<'a> {
+    pub text: &'a str,
+    pub image_count: usize,
+    pub model: &'a ModelEntry,
+}
+
 struct ActiveRootPrompt {
     prompt: QueuedPrompt,
     history_len: usize,
     transcript_len: usize,
     observed_activity: bool,
+    promoted_from_queue: bool,
 }
 
 impl QueuedPrompt {
@@ -309,9 +321,12 @@ pub struct App {
     /// Images staged for the next message: (display name, encoded data).
     pub pending_images: Vec<(String, ImageData)>,
 
-    /// A single next message captured while the current agent turn runs. It is
-    /// deliberately kept out of transcript/history until it is dispatched.
-    queued_prompt: Option<QueuedPrompt>,
+    /// Bounded FIFO follow-ups captured while the current agent turn runs.
+    /// They stay out of transcript/history until individually dispatched.
+    queued_prompts: VecDeque<QueuedPrompt>,
+    /// A clean auto-promotion that became ready behind a visual modal. Modal
+    /// close is otherwise pure and must never infer readiness from queue state.
+    queue_resume_pending: bool,
     /// Frozen bytes for image paths from a queued prompt that was restored.
     /// Editing the text clears these; an unchanged resubmission reuses them.
     restored_references: Option<RestoredReferences>,
@@ -352,6 +367,9 @@ pub struct App {
     active_root_prompt: Option<ActiveRootPrompt>,
     /// One-shot worker count armed by `/team`; consumed by the next prompt.
     team_workers: Option<usize>,
+    /// Set only after the first Ctrl+C restored or preserved queued work. A
+    /// second consecutive Ctrl+C may then discard it and exit.
+    quit_armed: bool,
     /// The planning/fan-out/coordinator state for one orchestration run.
     orchestration_run: Option<OrchestrationRun>,
     /// Ephemeral, untrusted worker evidence injected into coordinator requests.
@@ -418,7 +436,8 @@ impl App {
             cwd_display: String::new(),
             git_branch: None,
             pending_images: Vec::new(),
-            queued_prompt: None,
+            queued_prompts: VecDeque::new(),
+            queue_resume_pending: false,
             restored_references: None,
             suppressed_reference_text: None,
             approval_preview: None,
@@ -439,6 +458,7 @@ impl App {
             active_turn_can_promote_queue: true,
             active_root_prompt: None,
             team_workers: None,
+            quit_armed: false,
             orchestration_run: None,
             orchestration_context: None,
             orchestration_confirm_focused: false,
@@ -578,6 +598,8 @@ impl App {
     /// Called when the input text changes: reopen a dismissed menu and reset
     /// the selection, mirroring how Claude Code's completion behaves.
     pub fn note_input_changed(&mut self) {
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         self.slash_dismissed = false;
         self.slash_index = 0;
         self.composer_notice = None;
@@ -604,12 +626,9 @@ impl App {
     }
 
     /// Whether keyboard and paste events should currently reach the composer.
-    /// A captured lookahead prompt locks the editor until it is sent or
-    /// restored, which keeps attachment ownership unambiguous.
+    /// Queued prompts own frozen attachment snapshots, so type-ahead can safely
+    /// continue while earlier follow-ups wait in the FIFO.
     pub fn composer_accepts_input(&self) -> bool {
-        if self.queued_prompt.is_some() {
-            return false;
-        }
         match self.mode {
             Mode::Input | Mode::Streaming | Mode::RunningTool => true,
             Mode::Orchestrating => self
@@ -672,7 +691,24 @@ impl App {
     }
 
     pub fn queued_prompt_count(&self) -> usize {
-        usize::from(self.queued_prompt.is_some())
+        self.queued_prompts.len()
+    }
+
+    /// Model that owns the currently visible turn. A newly selected model is
+    /// only the default for the next turn and must not rewrite the identity of
+    /// work that is already running.
+    pub fn status_model(&self) -> Option<&ModelEntry> {
+        self.active_turn_model.as_ref().or(self.model.as_ref())
+    }
+
+    pub fn queued_prompt_previews(&self) -> impl ExactSizeIterator<Item = QueuedPromptPreview<'_>> {
+        self.queued_prompts
+            .iter()
+            .map(|prompt| QueuedPromptPreview {
+                text: &prompt.text,
+                image_count: prompt.image_count(),
+                model: &prompt.model,
+            })
     }
 
     /// Token carried by events for the currently active provider/tool phase.
@@ -683,9 +719,10 @@ impl App {
     }
 
     pub fn queued_image_count(&self) -> usize {
-        self.queued_prompt
-            .as_ref()
-            .map_or(0, QueuedPrompt::image_count)
+        self.queued_prompts
+            .iter()
+            .map(QueuedPrompt::image_count)
+            .sum()
     }
 
     pub fn pending_image_count(&self) -> usize {
@@ -709,7 +746,7 @@ impl App {
         if self.mode != Mode::Approval {
             return;
         }
-        self.approval_focused = !(self.approval_focused && self.queued_prompt.is_none());
+        self.approval_focused = !self.approval_focused;
     }
 
     pub fn focus_approval(&mut self) {
@@ -879,7 +916,7 @@ impl App {
                 | Mode::OrchestrationConfirm
                 | Mode::Orchestrating
         ) || !self.pending_calls.is_empty()
-            || self.queued_prompt.is_some()
+            || !self.queued_prompts.is_empty()
             || self.orchestration_run.is_some()
     }
 
@@ -1085,12 +1122,15 @@ impl App {
                     && self.pending_images.is_empty()
                     && self.restored_references.is_none()
                     && self.suppressed_reference_text.is_none();
-                let restore_current = self.queued_prompt.is_none()
-                    && composer_untouched
-                    && active_root
-                        .as_ref()
-                        .is_some_and(|active| !active.observed_activity);
-                if restore_current {
+                let rollback_promoted = active_root
+                    .as_ref()
+                    .is_some_and(|active| active.promoted_from_queue && !active.observed_activity);
+                let restore_current = composer_untouched
+                    && active_root.as_ref().is_some_and(|active| {
+                        !active.observed_activity
+                            && (self.queued_prompts.is_empty() || active.promoted_from_queue)
+                    });
+                if restore_current || rollback_promoted {
                     let active = active_root.as_ref().expect("checked above");
                     self.history.truncate(active.history_len);
                     self.history_chars_cache.set(None);
@@ -1135,6 +1175,13 @@ impl App {
                         active_root.expect("checked above").prompt,
                         "message restored — the provider rejected it before producing output",
                     );
+                } else if rollback_promoted {
+                    self.queued_prompts
+                        .push_front(active_root.expect("checked above").prompt);
+                    self.composer_notice = Some(
+                        "failed queued message preserved at the front of the queue — current draft kept"
+                            .into(),
+                    );
                 } else {
                     self.restore_queued_prompt("the previous request failed");
                 }
@@ -1167,7 +1214,7 @@ impl App {
             self.apply_deferred_model_reconciliation();
             return;
         }
-        if self.queued_prompt.is_none() {
+        if self.queued_prompts.is_empty() {
             self.apply_deferred_model_reconciliation();
         }
         if self.context_over_threshold() && !self.compacting {
@@ -1199,7 +1246,7 @@ impl App {
                 self.approval_preview = tools::approval_preview(call);
                 // Always require an explicit Tab before decision shortcuts are
                 // armed. This also fences keys buffered just before the modal
-                // arrived, even when the one lookahead slot is already full.
+                // arrived, even when follow-ups are already queued.
                 self.approval_focused = false;
                 self.mode = Mode::Approval;
             }
@@ -1271,16 +1318,14 @@ impl App {
         if self.mode != Mode::Input {
             return;
         }
-        if self.queued_prompt.is_some() {
-            self.composer_notice = Some("next message is already queued".into());
-            return;
-        }
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         let text = self.textarea.lines().join("\n").trim().to_owned();
         if text.is_empty() {
             return;
         }
         // Slash commands stay available while compacting. A normal message is
-        // captured as the one-turn lookahead and sent after compaction.
+        // captured in the FIFO and sent after compaction.
         if self.compacting && !text.starts_with('/') && self.team_workers.is_some() {
             self.composer_notice =
                 Some("team mode will start after context compaction — your draft is safe".into());
@@ -1417,20 +1462,38 @@ impl App {
                 }
             }
         }
-        self.dispatch_prompt(QueuedPrompt {
-            text,
-            staged_images,
-            referenced_images,
-            model,
-        });
+        self.dispatch_prompt(
+            QueuedPrompt {
+                text,
+                staged_images,
+                referenced_images,
+                model,
+            },
+            false,
+        );
     }
 
-    /// Capture the next user turn without touching provider history. This is
-    /// intentionally one-slot: after capture the composer locks until the
-    /// prompt is dispatched or restored following an abnormal end.
+    /// Capture a follow-up without touching provider history. Every entry owns
+    /// exact attachment bytes and the model selected for the active turn.
     pub fn queue_input(&mut self) {
-        if self.queued_prompt.is_some() {
-            self.composer_notice = Some("next message is already queued".into());
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
+        // Reserve one recovery slot while a previously queued prompt is the
+        // active root. If that provider rejects before any output, the active
+        // prompt can return to the front without exceeding the hard bound.
+        let promoted_root_active = self
+            .active_root_prompt
+            .as_ref()
+            .is_some_and(|active| active.promoted_from_queue);
+        let queue_limit = MAX_QUEUED_PROMPTS - usize::from(promoted_root_active);
+        if self.queued_prompts.len() >= queue_limit {
+            self.composer_notice = Some(if promoted_root_active {
+                format!(
+                    "queue is full ({MAX_QUEUED_PROMPTS} follow-ups including the active queued message) — draft preserved"
+                )
+            } else {
+                format!("queue is full ({MAX_QUEUED_PROMPTS} messages) — draft preserved")
+            });
             return;
         }
         let text = self.textarea.lines().join("\n").trim().to_owned();
@@ -1454,14 +1517,32 @@ impl App {
         // bytes the user saw when pressing Enter. On failure, keep the draft
         // and originally staged attachments untouched.
         let staged_images = std::mem::take(&mut self.pending_images);
-        let mut referenced_images = Vec::new();
-        for path in images::extract_image_paths(&text) {
-            match images::load_image(&path) {
-                Ok(attachment) => referenced_images.push(attachment),
-                Err(e) => {
-                    self.pending_images = staged_images;
-                    self.composer_notice = Some(format!("could not queue message: {e:#}"));
-                    return;
+        let mut restored = self.restored_references.take();
+        let suppressed = self.suppressed_reference_text.take();
+        let reuse_restored = restored
+            .as_ref()
+            .is_some_and(|restored| restored.text == text);
+        let references_suppressed = suppressed
+            .as_ref()
+            .is_some_and(|suppressed| suppressed == &text);
+        let mut referenced_images = if reuse_restored {
+            restored
+                .take()
+                .map_or_else(Vec::new, |restored| restored.images)
+        } else {
+            Vec::new()
+        };
+        if !reuse_restored && !references_suppressed {
+            for path in images::extract_image_paths(&text) {
+                match images::load_image(&path) {
+                    Ok(attachment) => referenced_images.push(attachment),
+                    Err(e) => {
+                        self.pending_images = staged_images;
+                        self.restored_references = restored;
+                        self.suppressed_reference_text = suppressed;
+                        self.composer_notice = Some(format!("could not queue message: {e:#}"));
+                        return;
+                    }
                 }
             }
         }
@@ -1469,7 +1550,7 @@ impl App {
         self.textarea = make_textarea(&self.theme);
         self.remember_input(&text);
         self.composer_notice = None;
-        self.queued_prompt = Some(QueuedPrompt {
+        self.queued_prompts.push_back(QueuedPrompt {
             text,
             staged_images,
             referenced_images,
@@ -1566,7 +1647,7 @@ impl App {
         };
         let task_text = prompt.text.clone();
         let history = self.history.clone();
-        self.begin_root_prompt(prompt);
+        self.begin_root_prompt(prompt, false);
 
         run.entry_indices = run
             .tasks
@@ -1763,7 +1844,7 @@ impl App {
             || !self.pending_images.is_empty()
             || self.restored_references.is_some()
             || self.suppressed_reference_text.is_some();
-        let queued_successor = self.queued_prompt.is_some();
+        let queued_successor = !self.queued_prompts.is_empty();
 
         // Workers are advisory and have not produced canonical assistant/tool
         // output. Always remove the abandoned root from provider history,
@@ -1835,18 +1916,18 @@ impl App {
         }
     }
 
-    fn dispatch_prompt(&mut self, prompt: QueuedPrompt) {
+    fn dispatch_prompt(&mut self, prompt: QueuedPrompt, promoted_from_queue: bool) {
         debug_assert_eq!(self.mode, Mode::Input);
         debug_assert!(!self.compacting);
         debug_assert!(self.request_task.is_none());
         debug_assert!(self.tool_task.is_none());
         debug_assert!(self.pending_calls.is_empty());
 
-        self.begin_root_prompt(prompt);
+        self.begin_root_prompt(prompt, promoted_from_queue);
         self.start_request();
     }
 
-    fn begin_root_prompt(&mut self, prompt: QueuedPrompt) {
+    fn begin_root_prompt(&mut self, prompt: QueuedPrompt, promoted_from_queue: bool) {
         debug_assert!(self.request_task.is_none());
         debug_assert!(self.tool_task.is_none());
         debug_assert!(self.pending_calls.is_empty());
@@ -1856,6 +1937,7 @@ impl App {
             history_len: self.history.len(),
             transcript_len: self.transcript.len(),
             observed_activity: false,
+            promoted_from_queue,
         });
         let (text, model, images) = prompt.into_images();
         self.active_turn_model = Some(model);
@@ -1880,24 +1962,76 @@ impl App {
     }
 
     fn dispatch_queued_prompt(&mut self) {
-        if self.mode != Mode::Input
-            || self.compacting
-            || self.request_task.is_some()
-            || self.tool_task.is_some()
-            || !self.pending_calls.is_empty()
-        {
+        let ready_except_mode = !self.compacting
+            && self.request_task.is_none()
+            && self.tool_task.is_none()
+            && self.pending_calls.is_empty();
+        if self.mode != Mode::Input {
+            if ready_except_mode
+                && !self.queued_prompts.is_empty()
+                && matches!(
+                    self.mode,
+                    Mode::ModelPicker | Mode::SessionPicker | Mode::ThemePicker | Mode::Help
+                )
+            {
+                self.queue_resume_pending = true;
+            }
             return;
         }
-        if let Some(prompt) = self.queued_prompt.take() {
-            self.dispatch_prompt(prompt);
+        if !ready_except_mode {
+            return;
+        }
+        self.queue_resume_pending = false;
+        if let Some(prompt) = self.queued_prompts.pop_front() {
+            self.dispatch_prompt(prompt, true);
+        }
+    }
+
+    fn resume_ready_queue(&mut self) {
+        if !std::mem::take(&mut self.queue_resume_pending) {
+            return;
+        }
+        if !self.composer_has_draft() {
+            self.dispatch_queued_prompt();
+        } else if !self.queued_prompts.is_empty() {
+            self.composer_notice = Some(
+                "queued work is ready but the current draft was preserved — send explicitly".into(),
+            );
         }
     }
 
     fn restore_queued_prompt(&mut self, reason: &str) {
-        let Some(prompt) = self.queued_prompt.take() else {
+        self.queue_resume_pending = false;
+        if self.composer_has_draft() {
+            if !self.queued_prompts.is_empty() {
+                self.composer_notice = Some(format!(
+                    "queued messages preserved behind the current draft — {reason}"
+                ));
+            }
+            return;
+        }
+        let Some(prompt) = self.queued_prompts.pop_front() else {
             return;
         };
         self.restore_prompt(prompt, &format!("next message restored — {reason}"));
+    }
+
+    /// Restore the most recently queued follow-up for editing. The operation
+    /// is deliberately non-destructive when the composer already owns text or
+    /// attachments, and it never disturbs earlier FIFO entries.
+    pub fn restore_latest_queued_prompt(&mut self) -> bool {
+        self.quit_armed = false;
+        if self.composer_has_draft() {
+            self.composer_notice = Some(
+                "clear the current draft and attachments before editing a queued message".into(),
+            );
+            return false;
+        }
+        let Some(prompt) = self.queued_prompts.pop_back() else {
+            return false;
+        };
+        self.restore_prompt(prompt, "latest queued message restored for editing");
+        true
     }
 
     fn restore_prompt(&mut self, prompt: QueuedPrompt, notice: &str) {
@@ -1923,6 +2057,8 @@ impl App {
         if !self.composer_accepts_input() {
             return;
         }
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         // Files dragged onto the terminal arrive as a paste of their paths:
         // stage them as attachments instead of cluttering the input.
         let dropped = images::dropped_images(text);
@@ -1960,6 +2096,8 @@ impl App {
         if !self.composer_accepts_input() {
             return;
         }
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         match images::clipboard_image() {
             Ok(image) => {
                 let name = format!("clipboard-{}.png", self.pending_images.len() + 1);
@@ -1982,6 +2120,8 @@ impl App {
     }
 
     pub fn clear_attachments(&mut self) {
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         let text = self.textarea.lines().join("\n").trim().to_owned();
         let had_restored = self
             .restored_references
@@ -2015,9 +2155,18 @@ impl App {
         self.textarea.lines().iter().all(|l| l.is_empty())
     }
 
+    fn composer_has_draft(&self) -> bool {
+        !self.input_is_empty()
+            || !self.pending_images.is_empty()
+            || self.restored_references.is_some()
+            || self.suppressed_reference_text.is_some()
+    }
+
     /// Ctrl+U: wipe the whole input and leave history recall, so a subsequent
     /// Up starts from the most recent entry again.
     pub fn clear_input(&mut self) {
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         self.textarea = make_textarea(&self.theme);
         self.input_history_pos = None;
         self.input_draft.clear();
@@ -2062,6 +2211,8 @@ impl App {
     }
 
     fn set_input(&mut self, text: &str) {
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         self.textarea = make_textarea(&self.theme);
         self.textarea.insert_str(text);
         self.composer_notice = None;
@@ -2145,7 +2296,10 @@ impl App {
 
     pub fn close_help(&mut self) {
         self.mode = Mode::Input;
-        self.dispatch_queued_prompt();
+        // A compaction can finish behind Help, leaving a queue that is ready
+        // to resume. Never promote it over a draft restored after an abnormal
+        // turn, though: that would skip the FIFO head visible in the composer.
+        self.resume_ready_queue();
     }
 
     /// `/model <name>`: select directly on a unique match, open the picker
@@ -2294,6 +2448,8 @@ impl App {
     }
 
     pub fn cancel_request(&mut self) {
+        self.quit_armed = false;
+        self.queue_resume_pending = false;
         self.cancel_request_inner(true);
     }
 
@@ -2310,7 +2466,7 @@ impl App {
         if rollback_team_root {
             self.fail_orchestration_root("team synthesis cancelled before producing output");
             if !restore_queue {
-                self.queued_prompt = None;
+                self.queued_prompts.clear();
             }
             return;
         }
@@ -2344,7 +2500,7 @@ impl App {
         if restore_queue {
             self.restore_queued_prompt("the previous request was cancelled");
         } else {
-            self.queued_prompt = None;
+            self.queued_prompts.clear();
         }
         self.apply_deferred_model_reconciliation();
     }
@@ -2352,15 +2508,33 @@ impl App {
     /// Quit through the same cancellation path as Esc so partial text is
     /// preserved and dangling tool calls are repaired before session save.
     pub fn request_quit(&mut self) {
+        self.queue_resume_pending = false;
+        if self.quit_armed {
+            if matches!(
+                self.mode,
+                Mode::Streaming | Mode::RunningTool | Mode::Approval
+            ) {
+                self.cancel_request_inner(false);
+            } else if matches!(self.mode, Mode::OrchestrationConfirm | Mode::Orchestrating) {
+                self.cancel_orchestration();
+            }
+            self.cancel_compaction();
+            self.queued_prompts.clear();
+            self.pending_images.clear();
+            self.clear_input();
+            self.should_quit = true;
+            return;
+        }
         if matches!(self.mode, Mode::OrchestrationConfirm | Mode::Orchestrating) {
             self.cancel_orchestration();
+            self.quit_armed = true;
             self.composer_notice = Some(
                 "team work cancelled and draft preserved — press Ctrl+C again to discard it and quit"
                     .into(),
             );
             return;
         }
-        if self.queued_prompt.is_some() {
+        if !self.queued_prompts.is_empty() {
             if matches!(
                 self.mode,
                 Mode::Streaming | Mode::RunningTool | Mode::Approval
@@ -2371,8 +2545,9 @@ impl App {
                 self.mode = Mode::Input;
                 self.restore_queued_prompt("quit was paused for confirmation");
             }
+            self.quit_armed = true;
             self.composer_notice =
-                Some("next message restored — press Ctrl+C again to discard it and quit".into());
+                Some("queued work preserved — press Ctrl+C again to discard it and quit".into());
             return;
         }
         if matches!(
@@ -2382,7 +2557,7 @@ impl App {
             self.cancel_request_inner(false);
         }
         self.cancel_compaction();
-        self.queued_prompt = None;
+        self.queued_prompts.clear();
         self.should_quit = true;
     }
 
@@ -2491,7 +2666,12 @@ impl App {
             self.model = Some(model);
             self.model_selected_explicitly = true;
         }
+        self.close_model_picker();
+    }
+
+    pub fn close_model_picker(&mut self) {
         self.mode = Mode::Input;
+        self.resume_ready_queue();
     }
 
     // ---- theme picker (live preview) ----
@@ -2520,6 +2700,7 @@ impl App {
         self.transcript
             .push(Entry::Info(format!("theme: {}", self.theme.name)));
         self.mode = Mode::Input;
+        self.resume_ready_queue();
     }
 
     pub fn revert_theme(&mut self) {
@@ -2528,6 +2709,7 @@ impl App {
             self.apply_theme();
         }
         self.mode = Mode::Input;
+        self.resume_ready_queue();
     }
 
     /// Re-style live widgets and invalidate cached rendered lines after a
@@ -2616,7 +2798,7 @@ impl App {
         self.scroll_from_bottom = 0;
         self.last_usage = None;
         self.pending_calls.clear();
-        self.queued_prompt = None;
+        self.queued_prompts.clear();
         self.pending_images.clear();
         self.clear_input();
         self.approved_scopes.clear();
@@ -2648,7 +2830,7 @@ impl App {
 
     pub fn pick_session(&mut self) {
         let Some(meta) = self.sessions.get(self.session_index) else {
-            self.mode = Mode::Input;
+            self.close_session_picker();
             return;
         };
         match session::load(&meta.path) {
@@ -2657,7 +2839,7 @@ impl App {
                     self.transcript.push(Entry::Error(format!(
                         "could not resume another session because the current one was not saved: {e:#}"
                     )));
-                    self.mode = Mode::Input;
+                    self.close_session_picker();
                     return;
                 }
                 self.cancel_compaction();
@@ -2672,7 +2854,7 @@ impl App {
                 self.agent_turns = 0;
                 self.last_usage = None;
                 self.pending_calls.clear();
-                self.queued_prompt = None;
+                self.queued_prompts.clear();
                 self.pending_images.clear();
                 self.clear_input();
                 self.approved_scopes.clear();
@@ -2726,6 +2908,12 @@ impl App {
                 .push(Entry::Error(format!("failed to load session: {e:#}"))),
         }
         self.mode = Mode::Input;
+        self.resume_ready_queue();
+    }
+
+    pub fn close_session_picker(&mut self) {
+        self.mode = Mode::Input;
+        self.resume_ready_queue();
     }
 
     // ---- context compaction ----
@@ -2783,7 +2971,15 @@ impl App {
     /// Ollama models are bounded by the configured num_ctx, which is usually
     /// far smaller than the cloud-model threshold — compact well before it.
     fn effective_compact_threshold(&self) -> usize {
-        self.effective_compact_threshold_for(self.model.as_ref())
+        // Context must fit the model that will consume the next request, not
+        // a newly selected default that only applies after already-captured
+        // queue entries. During a turn, the active frozen model remains first.
+        let next_model = self
+            .active_turn_model
+            .as_ref()
+            .or_else(|| self.queued_prompts.front().map(|prompt| &prompt.model))
+            .or(self.model.as_ref());
+        self.effective_compact_threshold_for(next_model)
     }
 
     fn effective_compact_threshold_for(&self, model: Option<&ModelEntry>) -> usize {
@@ -2909,7 +3105,7 @@ impl App {
                     self.history_chars() / 1000
                 )));
                 if self.save_session_checked() {
-                    if self.queued_prompt.is_none() {
+                    if self.queued_prompts.is_empty() {
                         self.apply_deferred_model_reconciliation();
                     }
                     self.dispatch_queued_prompt();
@@ -3253,6 +3449,31 @@ mod tests {
         assert_eq!(m, vec!["new"]);
 
         assert!(match_commands("zzz").is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_threshold_follows_frozen_active_then_queued_models() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::OpenAi,
+            id: "selected-large-context".into(),
+        });
+        assert_eq!(app.effective_compact_threshold(), 80_000);
+
+        app.queued_prompts.push_back(QueuedPrompt {
+            text: "next frozen turn".into(),
+            staged_images: Vec::new(),
+            referenced_images: Vec::new(),
+            model: ModelEntry {
+                provider: ProviderKind::Ollama,
+                id: "queued-small-context".into(),
+            },
+        });
+        assert_eq!(app.effective_compact_threshold(), 16_384 * 3);
+
+        app.active_turn_model = app.model.clone();
+        assert_eq!(app.effective_compact_threshold(), 80_000);
     }
 
     #[tokio::test]
@@ -4156,8 +4377,15 @@ mod tests {
         assert_eq!(app.queued_prompt_count(), 1);
         assert_eq!(app.history.len(), 1);
 
+        app.open_themes();
+        assert_eq!(app.mode, Mode::ThemePicker);
         app.compacting = false;
         app.finish_compaction(Ok("compressed context".into()));
+        assert_eq!(app.mode, Mode::ThemePicker);
+        assert_eq!(app.queued_prompt_count(), 1);
+        assert_eq!(app.history.len(), 1);
+
+        app.revert_theme();
         assert_eq!(app.mode, Mode::Streaming);
         assert_eq!(app.queued_prompt_count(), 0);
         assert!(matches!(
@@ -4167,6 +4395,41 @@ mod tests {
                     && next.text() == "after compaction"
         ));
         app.cancel_request();
+
+        // A ready queue may be paused behind an overlay. If quit confirmation
+        // restores its head, that user action supersedes the deferred resume;
+        // opening and closing another overlay must not skip to the successor.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = App::new(offline_config(), tx);
+        paused.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "queue-test".into(),
+        });
+        paused.history.push(Message::User("old context".into()));
+        paused.compacting = true;
+        for text in ["restored head", "still queued"] {
+            paused.textarea.insert_str(text);
+            paused.submit_input();
+        }
+        paused.open_themes();
+        paused.compacting = false;
+        paused.finish_compaction(Ok("compressed context".into()));
+        assert_eq!(paused.mode, Mode::ThemePicker);
+        assert_eq!(paused.queued_prompt_count(), 2);
+
+        paused.request_quit();
+        assert_eq!(paused.mode, Mode::Input);
+        assert_eq!(paused.textarea.lines().join("\n"), "restored head");
+        assert_eq!(paused.queued_prompt_count(), 1);
+        paused.clear_input();
+        paused.open_help();
+        paused.close_help();
+        assert_eq!(paused.mode, Mode::Input);
+        assert_eq!(paused.queued_prompt_count(), 1);
+        assert!(matches!(
+            paused.history.as_slice(),
+            [Message::User(summary)] if summary.text().contains("compressed context")
+        ));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut failed = App::new(offline_config(), tx);
