@@ -1,0 +1,18 @@
+╭ ◆ shaltaiboltai ─────────────────────────────────────────────────────────────╮
+│ ◆ Ready to build                                                             │
+│   v0.1.2 · Describe a change, ask about the code, or type / for commands. F1 │
+│   opens the keyboard guide.                                                  │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ◆ queue-test · ollama  ⠋ thinking — Esc to cancel · 2 queued        feat/queue
+• Queued follow-up inputs (2)
+  ↳ run these checks next
+  ↳ then summarize the failures
+    ⌥↑ edit latest queued message
+╭ follow-up · 2 queued ────────────────────────────────────────────────────────╮
+│ Add another follow-up while this turn runs…                                  │
+╰───────────────────────────── Esc cancel · Tab / Enter queue · ⌥↑ edit latest ╯

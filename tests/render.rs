@@ -43,6 +43,15 @@ fn screen(terminal: &Terminal<TestBackend>) -> String {
         .collect()
 }
 
+fn normalized_screen(terminal: &Terminal<TestBackend>) -> String {
+    screen(terminal)
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 #[tokio::test]
 async fn renders_themed_frame() {
     isolate_data_dir();
@@ -200,7 +209,10 @@ async fn help_is_a_responsive_overlay_instead_of_transcript_noise() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let rendered = screen(&terminal);
     assert!(rendered.contains("keyboard guide"), "{rendered}");
-    assert!(rendered.contains("restore queued, then quit"), "{rendered}");
+    assert!(
+        rendered.contains("preserve queued, then confirm quit"),
+        "{rendered}"
+    );
     assert!(rendered.contains("F1 · Enter · Esc close"), "{rendered}");
 }
 
@@ -367,11 +379,13 @@ async fn narrow_terminal_preserves_conversation_status_and_composer() {
 }
 
 #[tokio::test]
-async fn active_composer_explains_and_confirms_one_turn_lookahead() {
+async fn active_composer_renders_fifo_follow_ups_and_restore_hint() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
     app.discovering = false;
+    app.cwd_display = "~/project".into();
+    app.git_branch = Some("feat/queue".into());
     app.model = Some(ModelEntry {
         provider: ProviderKind::Ollama,
         id: "queue-test".into(),
@@ -383,18 +397,37 @@ async fn active_composer_explains_and_confirms_one_turn_lookahead() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let composing = screen(&terminal);
     assert!(composing.contains("next message"), "{composing}");
-    assert!(composing.contains("Enter queue"), "{composing}");
+    assert!(composing.contains("Tab / Enter queue"), "{composing}");
 
+    app.queue_input();
+    app.textarea.insert_str("then summarize the failures");
     app.queue_input();
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let queued = screen(&terminal);
-    assert!(queued.contains("next message queued"), "{queued}");
-    assert!(queued.contains("waiting for current"), "{queued}");
+    assert_eq!(
+        normalized_screen(&terminal),
+        include_str!("snapshots/fifo_queue_80x18.txt")
+    );
+    assert!(queued.contains("Queued follow-up inputs (2)"), "{queued}");
+    assert!(queued.contains("run these checks next"), "{queued}");
+    assert!(queued.contains("then summarize the failures"), "{queued}");
+    assert!(queued.contains("follow-up · 2 queued"), "{queued}");
+    assert!(queued.contains("edit latest"), "{queued}");
+
+    for text in ["third visible follow-up", "fourth hidden follow-up"] {
+        app.textarea.insert_str(text);
+        app.queue_input();
+    }
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let capped = screen(&terminal);
+    assert!(capped.contains("third visible follow-up"), "{capped}");
+    assert!(!capped.contains("fourth hidden follow-up"), "{capped}");
+    assert!(capped.contains("… 1 more"), "{capped}");
 
     let mut narrow = Terminal::new(TestBackend::new(24, 8)).unwrap();
     narrow.draw(|f| ui::draw(f, &mut app)).unwrap();
     let narrow = screen(&narrow);
-    assert!(narrow.contains("queued"), "{narrow}");
+    assert!(narrow.contains("follow-up"), "{narrow}");
 
     let (tx, _rx) = unbounded_channel();
     let mut with_images = App::new(offline_config(), tx);
@@ -414,12 +447,67 @@ async fn active_composer_explains_and_confirms_one_turn_lookahead() {
     }
     with_images.textarea.insert_str("inspect these");
     with_images.queue_input();
-    let mut narrow = Terminal::new(TestBackend::new(24, 8)).unwrap();
-    narrow
+    let mut attachment_view = Terminal::new(TestBackend::new(48, 10)).unwrap();
+    attachment_view
         .draw(|frame| ui::draw(frame, &mut with_images))
         .unwrap();
-    let narrow = screen(&narrow);
-    assert!(narrow.contains("2 images"), "{narrow}");
+    let attachment_view = screen(&attachment_view);
+    assert!(attachment_view.contains("2 images"), "{attachment_view}");
+}
+
+#[tokio::test]
+async fn status_keeps_the_active_turn_model_when_the_next_default_changes() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "active-m1".into(),
+    });
+    app.textarea.insert_str("run on the frozen model");
+    app.submit_input();
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::OpenAi,
+        id: "next-m2".into(),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    assert!(rendered.contains("active-m1 · ollama"), "{rendered}");
+    assert!(!rendered.contains("next-m2"), "{rendered}");
+}
+
+#[tokio::test]
+async fn long_queued_prompt_keeps_its_frozen_model_visible() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.mode = Mode::Streaming;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "frozen-queue-m1".into(),
+    });
+    app.textarea.insert_str(
+        "inspect every package and dependency before writing a comprehensive migration report \
+         with all compatibility risks, benchmarks, and rollback instructions",
+    );
+    app.queue_input();
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::OpenAi,
+        id: "selected-next-m2".into(),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    assert!(
+        rendered.contains("frozen-queue-m1 · ollama ›"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("selected-next-m2"), "{rendered}");
 }
 
 #[tokio::test]

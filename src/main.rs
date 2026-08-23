@@ -8,6 +8,39 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use futures_util::StreamExt;
+use tokio::time::Instant;
+
+/// Coalesce provider, input, and animation updates without allowing a dense
+/// event stream to drive the terminal faster than 120 frames per second.
+const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(8_333_334);
+
+#[derive(Debug)]
+struct FrameLimiter {
+    next_draw_at: Instant,
+    redraw_pending: bool,
+}
+
+impl FrameLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_draw_at: now,
+            redraw_pending: true,
+        }
+    }
+
+    fn request_redraw(&mut self) {
+        self.redraw_pending = true;
+    }
+
+    fn is_ready(&self, now: Instant) -> bool {
+        self.redraw_pending && now >= self.next_draw_at
+    }
+
+    fn mark_drawn(&mut self, started_at: Instant) {
+        self.redraw_pending = false;
+        self.next_draw_at = started_at + MIN_FRAME_INTERVAL;
+    }
+}
 
 const HELP: &str = "\
 shaltaiboltai — a multi-provider agentic coding TUI
@@ -100,17 +133,27 @@ async fn run(
     // new working state starts at the first authored mascot pose.
     animation.tick().await;
     environment.tick().await;
+    let mut frames = FrameLimiter::new(Instant::now());
 
     while !app.should_quit {
-        terminal.draw(|frame| {
-            if let Some(native_mascot) = native_mascot {
-                ui::draw_with_native_mascot(frame, &mut app, native_mascot);
-            } else {
-                ui::draw(frame, &mut app);
-            }
-        })?;
+        let now = Instant::now();
+        if frames.is_ready(now) {
+            terminal.draw(|frame| {
+                if let Some(native_mascot) = native_mascot {
+                    ui::draw_with_native_mascot(frame, &mut app, native_mascot);
+                } else {
+                    ui::draw(frame, &mut app);
+                }
+            })?;
+            frames.mark_drawn(now);
+        }
+
+        let redraw_deadline = frames.next_draw_at;
 
         tokio::select! {
+            // A pending draw that was coalesced during the frame interval gets
+            // one precise wake-up even when no further terminal event arrives.
+            _ = tokio::time::sleep_until(redraw_deadline), if frames.redraw_pending => {}
             Some(event) = rx.recv() => {
                 app.on_event(event);
                 // Coalesce a bounded burst into one redraw, then yield back to
@@ -138,6 +181,7 @@ async fn run(
                 app.refresh_environment();
             }
         }
+        frames.request_redraw();
     }
     app.save_session_for_exit()?;
     Ok(())
@@ -221,9 +265,9 @@ fn handle_orchestrating_key(app: &mut App, key: KeyEvent) {
         handle_scroll_key(app, key);
         return;
     }
-    // Only the concurrent worker phase exposes the existing one-slot
-    // lookahead composer. Planning and coordination keep it locked so a failed
-    // root prompt can still be restored without merging two drafts.
+    // Only the concurrent worker phase exposes the FIFO follow-up composer.
+    // Planning and coordination keep it locked so a failed root prompt can be
+    // restored without competing with a live draft.
     if app.composer_accepts_input() {
         handle_lookahead_composer_key(app, key);
     }
@@ -301,7 +345,12 @@ fn handle_lookahead_composer_key(app: &mut App, key: KeyEvent) {
             app.textarea.insert_newline();
             app.note_input_changed();
         }
-        KeyCode::Enter => app.queue_input(),
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.restore_latest_queued_prompt();
+        }
+        // Tab is the Codex-compatible follow-up shortcut. Keep Enter as a
+        // compatibility alias until providers can steer an in-flight turn.
+        KeyCode::Tab | KeyCode::Enter => app.queue_input(),
         _ => {
             app.textarea.input(key);
             if matches!(
@@ -359,6 +408,10 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc if menu => app.dismiss_slash_menu(),
         KeyCode::Esc => app.clear_attachments(),
         KeyCode::Enter => app.submit_input(),
+        KeyCode::Tab => app.submit_input(),
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.restore_latest_queued_prompt();
+        }
         // Shell-style prompt recall when the input is empty (or while already
         // navigating history); otherwise Up/Down move the cursor in the editor.
         KeyCode::Up if app.input_is_empty() || app.history_recall_active() => {
@@ -417,7 +470,7 @@ fn handle_scroll_key(app: &mut App, key: KeyEvent) {
 fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
     let count = app.filtered_models().len();
     match key.code {
-        KeyCode::Esc => app.mode = Mode::Input,
+        KeyCode::Esc => app.close_model_picker(),
         KeyCode::Enter => app.pick_model(),
         KeyCode::Up => app.picker_index = app.picker_index.saturating_sub(1),
         KeyCode::Down => {
@@ -440,7 +493,7 @@ fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
 fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
     let count = app.sessions.len();
     match key.code {
-        KeyCode::Esc => app.mode = Mode::Input,
+        KeyCode::Esc => app.close_session_picker(),
         KeyCode::Enter => app.pick_session(),
         KeyCode::Up => app.session_index = app.session_index.saturating_sub(1),
         KeyCode::Down if count > 0 => {
@@ -456,6 +509,21 @@ mod tests {
     use shaltaiboltai::orchestration::PlannedTask;
     use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn frame_limiter_coalesces_requests_at_120_fps() {
+        let started_at = Instant::now();
+        let mut frames = FrameLimiter::new(started_at);
+
+        assert!(frames.is_ready(started_at));
+        frames.mark_drawn(started_at);
+        assert!(!frames.is_ready(started_at + MIN_FRAME_INTERVAL));
+
+        frames.request_redraw();
+        frames.request_redraw();
+        assert!(!frames.is_ready(started_at + std::time::Duration::from_millis(8)));
+        assert!(frames.is_ready(started_at + MIN_FRAME_INTERVAL));
+    }
 
     fn test_app() -> App {
         let data_dir = std::env::temp_dir().join(format!("shaltai-main-{}", std::process::id()));
@@ -577,10 +645,34 @@ mod tests {
         }
         assert_eq!(app.textarea.lines().join("\n"), "next request");
 
-        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.queued_prompt_count(), 1);
         assert!(app.input_is_empty());
         assert_eq!(app.mode, Mode::Streaming);
+
+        app.textarea.insert_str("latest queued draft");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.queued_prompt_count(), 2);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(app.queued_prompt_count(), 1);
+        assert_eq!(app.textarea.lines().join("\n"), "latest queued draft");
+    }
+
+    #[tokio::test]
+    async fn tab_submits_the_idle_composer() {
+        let mut app = test_app();
+        app.textarea.insert_str("send this now");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Streaming);
+        assert!(matches!(
+            app.history.last(),
+            Some(shaltaiboltai::providers::Message::User(content))
+                if content.text() == "send this now"
+        ));
+        app.cancel_request();
     }
 
     #[tokio::test]
@@ -640,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn occupied_compaction_lookahead_locks_a_second_draft() {
+    async fn compaction_lookahead_accepts_multiple_fifo_drafts() {
         let mut app = test_app();
         app.compacting = true;
         for ch in "after compaction".chars() {
@@ -657,6 +749,10 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
         );
+        assert_eq!(app.textarea.lines().join("\n"), "x");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.queued_prompt_count(), 2);
         assert!(app.input_is_empty());
 
         handle_key(&mut app, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));

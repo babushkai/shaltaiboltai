@@ -160,8 +160,7 @@ pub fn planner_request(
     let task = truncate_chars(task.trim(), MAX_ROOT_TASK_CHARS);
     let mut messages = text_only_history(history.as_ref());
     messages.push(Message::User(UserContent::Text(format!(
-        "Plan advisory work for this root task:\n\n{}",
-        task
+        "Plan advisory work for this root task:\n\n{task}"
     ))));
 
     Ok(ChatRequest {

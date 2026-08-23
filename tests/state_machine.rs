@@ -1,4 +1,4 @@
-use shaltaiboltai::app::{App, AppEvent, Mode};
+use shaltaiboltai::app::{App, AppEvent, Mode, MAX_QUEUED_PROMPTS};
 use shaltaiboltai::config::Config;
 use shaltaiboltai::providers::{
     ChatEvent, ImageData, Message, ModelEntry, ProviderKind, ToolCall, UserContent,
@@ -64,7 +64,7 @@ fn enable_test_model(app: &mut App) {
 }
 
 #[tokio::test]
-async fn next_prompt_waits_outside_history_then_dispatches_exactly_once() {
+async fn queued_prompts_dispatch_fifo_exactly_one_per_clean_turn() {
     let (mut app, _rx) = test_app();
     enable_test_model(&mut app);
     app.textarea.insert_str("first request");
@@ -74,8 +74,17 @@ async fn next_prompt_waits_outside_history_then_dispatches_exactly_once() {
 
     app.textarea.insert_str("second request");
     app.queue_input();
-    assert_eq!(app.queued_prompt_count(), 1);
+    app.textarea.insert_str("third request");
+    app.queue_input();
+    assert_eq!(app.queued_prompt_count(), 2);
+    assert!(app.composer_accepts_input());
     assert!(app.input_is_empty());
+    assert_eq!(
+        app.queued_prompt_previews()
+            .map(|preview| preview.text)
+            .collect::<Vec<_>>(),
+        ["second request", "third request"]
+    );
     assert_eq!(
         app.history
             .iter()
@@ -93,7 +102,7 @@ async fn next_prompt_waits_outside_history_then_dispatches_exactly_once() {
         event: completed(Vec::new()),
     });
 
-    assert_eq!(app.queued_prompt_count(), 0);
+    assert_eq!(app.queued_prompt_count(), 1);
     assert_eq!(app.mode, Mode::Streaming);
     assert!(matches!(
         app.history.as_slice(),
@@ -102,6 +111,21 @@ async fn next_prompt_waits_outside_history_then_dispatches_exactly_once() {
             Message::Assistant { .. },
             Message::User(second)
         ] if first.text() == "first request" && second.text() == "second request"
+    ));
+    assert!(!app.history.iter().any(
+        |message| matches!(message, Message::User(content) if content.text() == "third request")
+    ));
+
+    let second_gen = app.event_generation();
+    app.on_event(AppEvent::Chat {
+        gen: second_gen,
+        event: completed(Vec::new()),
+    });
+    assert_eq!(app.queued_prompt_count(), 0);
+    assert_eq!(app.mode, Mode::Streaming);
+    assert!(matches!(
+        app.history.last(),
+        Some(Message::User(content)) if content.text() == "third request"
     ));
 
     // The queued root turn owns a fresh generation. Buffered events from the
@@ -115,6 +139,302 @@ async fn next_prompt_waits_outside_history_then_dispatches_exactly_once() {
         |entry| matches!(entry, shaltaiboltai::app::Entry::Error(text) if text == "late old error")
     ));
     app.cancel_request();
+}
+
+#[tokio::test]
+async fn queue_cap_preserves_the_overflow_draft_and_attachments() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+
+    for index in 0..MAX_QUEUED_PROMPTS {
+        app.textarea.insert_str(format!("queued {index}"));
+        app.queue_input();
+    }
+    assert_eq!(app.queued_prompt_count(), MAX_QUEUED_PROMPTS);
+    assert!(app.composer_accepts_input());
+    assert_eq!(
+        app.queued_prompt_previews()
+            .map(|preview| preview.text)
+            .collect::<Vec<_>>(),
+        (0..MAX_QUEUED_PROMPTS)
+            .map(|index| format!("queued {index}"))
+            .collect::<Vec<_>>()
+    );
+
+    app.pending_images.push((
+        "overflow.png".into(),
+        ImageData {
+            media_type: "image/png".into(),
+            data: "b3ZlcmZsb3c=".into(),
+        },
+    ));
+    app.textarea.insert_str("overflow draft");
+    app.queue_input();
+
+    assert_eq!(app.queued_prompt_count(), MAX_QUEUED_PROMPTS);
+    assert_eq!(app.textarea.lines().join("\n"), "overflow draft");
+    assert_eq!(app.pending_images.len(), 1);
+    assert!(app
+        .composer_notice()
+        .is_some_and(|notice| notice.contains("queue is full (16 messages)")));
+    app.cancel_request();
+    assert_eq!(app.queued_prompt_count(), MAX_QUEUED_PROMPTS);
+    assert_eq!(app.textarea.lines().join("\n"), "overflow draft");
+}
+
+#[tokio::test]
+async fn queue_freezes_attachment_bytes_models_and_total_counts() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+    let first_gen = app.event_generation();
+
+    let image_path =
+        std::env::temp_dir().join(format!("shaltai-fifo-ref-{}.png", std::process::id()));
+    std::fs::write(&image_path, b"frozen referenced bytes").unwrap();
+    app.pending_images.push((
+        "staged-one.png".into(),
+        ImageData {
+            media_type: "image/png".into(),
+            data: "c3RhZ2VkLW9uZQ==".into(),
+        },
+    ));
+    app.textarea
+        .insert_str(format!("inspect {}", image_path.display()));
+    app.queue_input();
+    std::fs::remove_file(&image_path).unwrap();
+
+    app.pending_images.push((
+        "staged-two.png".into(),
+        ImageData {
+            media_type: "image/png".into(),
+            data: "c3RhZ2VkLXR3bw==".into(),
+        },
+    ));
+    app.textarea.insert_str("then compare");
+    app.queue_input();
+
+    let previews = app.queued_prompt_previews().collect::<Vec<_>>();
+    assert_eq!(previews.len(), 2);
+    assert_eq!(previews[0].image_count, 2);
+    assert_eq!(previews[1].image_count, 1);
+    assert_eq!(previews[0].model.id, "queue-test");
+    assert_eq!(previews[1].model.id, "queue-test");
+    assert_eq!(app.queued_image_count(), 3);
+
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::OpenAi,
+        id: "changed-after-capture".into(),
+    });
+    assert!(app
+        .queued_prompt_previews()
+        .all(|preview| preview.model.id == "queue-test"));
+
+    app.on_event(AppEvent::Chat {
+        gen: first_gen,
+        event: completed(Vec::new()),
+    });
+    assert_eq!(app.queued_prompt_count(), 1);
+    assert_eq!(app.queued_image_count(), 1);
+    assert!(matches!(
+        app.history.last(),
+        Some(Message::User(UserContent::Rich { text, images }))
+            if text.contains("inspect") && images.len() == 2
+    ));
+
+    let queued_gen = app.event_generation();
+    app.on_event(AppEvent::Chat {
+        gen: queued_gen,
+        event: completed(Vec::new()),
+    });
+    assert_eq!(app.queued_prompt_count(), 0);
+    assert!(matches!(
+        app.history.last(),
+        Some(Message::User(UserContent::Rich { text, images }))
+            if text == "then compare"
+                && images.len() == 1
+                && images[0].data == "c3RhZ2VkLXR3bw=="
+    ));
+    app.cancel_request();
+}
+
+#[tokio::test]
+async fn restore_latest_only_edits_the_fifo_back_when_composer_is_empty() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+
+    for text in ["oldest", "middle", "latest"] {
+        if text == "latest" {
+            app.pending_images.push((
+                "latest.png".into(),
+                ImageData {
+                    media_type: "image/png".into(),
+                    data: "bGF0ZXN0".into(),
+                },
+            ));
+        }
+        app.textarea.insert_str(text);
+        app.queue_input();
+    }
+
+    assert!(app.restore_latest_queued_prompt());
+    assert_eq!(app.textarea.lines().join("\n"), "latest");
+    assert_eq!(app.pending_images[0].0, "latest.png");
+    assert_eq!(app.queued_prompt_count(), 2);
+    assert_eq!(
+        app.queued_prompt_previews()
+            .map(|preview| preview.text)
+            .collect::<Vec<_>>(),
+        ["oldest", "middle"]
+    );
+
+    assert!(!app.restore_latest_queued_prompt());
+    assert_eq!(app.queued_prompt_count(), 2);
+    assert_eq!(app.textarea.lines().join("\n"), "latest");
+    assert!(app
+        .composer_notice()
+        .is_some_and(|notice| notice.contains("clear the current draft")));
+
+    app.clear_attachments();
+    app.clear_input();
+    assert!(app.restore_latest_queued_prompt());
+    assert_eq!(app.textarea.lines().join("\n"), "middle");
+    assert_eq!(app.queued_prompt_count(), 1);
+    assert_eq!(
+        app.queued_prompt_previews()
+            .next()
+            .map(|preview| preview.text),
+        Some("oldest")
+    );
+    app.cancel_request();
+}
+
+#[tokio::test]
+async fn abnormal_end_restores_one_fifo_prompt_and_preserves_the_rest() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+    for text in ["first queued", "second queued", "third queued"] {
+        app.textarea.insert_str(text);
+        app.queue_input();
+    }
+
+    app.cancel_request();
+
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.textarea.lines().join("\n"), "first queued");
+    assert_eq!(app.queued_prompt_count(), 2);
+    assert_eq!(
+        app.queued_prompt_previews()
+            .map(|preview| preview.text)
+            .collect::<Vec<_>>(),
+        ["second queued", "third queued"]
+    );
+}
+
+#[tokio::test]
+async fn closing_help_never_skips_a_restored_fifo_head() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+    for text in ["first queued", "second queued"] {
+        app.textarea.insert_str(text);
+        app.queue_input();
+    }
+
+    app.cancel_request();
+    assert_eq!(app.textarea.lines().join("\n"), "first queued");
+    assert_eq!(app.queued_prompt_count(), 1);
+    let user_turns = app
+        .history
+        .iter()
+        .filter(|message| matches!(message, Message::User(_)))
+        .count();
+
+    app.open_help();
+    app.close_help();
+
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.textarea.lines().join("\n"), "first queued");
+    assert_eq!(app.queued_prompt_count(), 1);
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|message| matches!(message, Message::User(_)))
+            .count(),
+        user_turns,
+        "closing a visual overlay must not start a provider turn"
+    );
+
+    app.clear_input();
+    app.open_help();
+    app.close_help();
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.queued_prompt_count(), 1);
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|message| matches!(message, Message::User(_)))
+            .count(),
+        user_turns,
+        "clearing a restored draft must not make modal close an implicit send"
+    );
+}
+
+#[tokio::test]
+async fn closing_a_picker_without_pending_promotion_keeps_the_queue_idle() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.models.push(app.model.clone().expect("test model"));
+    app.compacting = true;
+    for text in ["first queued", "second queued"] {
+        app.textarea.insert_str(text);
+        app.queue_input();
+    }
+    app.open_picker();
+    assert_eq!(app.mode, Mode::ModelPicker);
+
+    // Merely becoming otherwise ready is not enough: modal close must stay
+    // pure unless a clean turn/compaction explicitly requested auto-promotion.
+    app.compacting = false;
+    app.close_model_picker();
+
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.queued_prompt_count(), 2);
+    assert!(app.history.is_empty());
+}
+
+#[tokio::test]
+async fn quit_requires_confirmation_before_discarding_a_fifo() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+    for text in ["first queued", "second queued"] {
+        app.textarea.insert_str(text);
+        app.queue_input();
+    }
+
+    app.request_quit();
+    assert!(!app.should_quit);
+    assert_eq!(app.textarea.lines().join("\n"), "first queued");
+    assert_eq!(app.queued_prompt_count(), 1);
+    assert!(app
+        .composer_notice()
+        .is_some_and(|notice| notice.contains("press Ctrl+C again")));
+
+    app.request_quit();
+    assert!(app.should_quit);
+    assert!(app.input_is_empty());
+    assert_eq!(app.pending_image_count(), 0);
+    assert_eq!(app.queued_prompt_count(), 0);
 }
 
 #[tokio::test]
@@ -193,6 +513,154 @@ async fn provider_rejection_before_activity_restores_the_current_prompt() {
     assert!(app
         .composer_notice()
         .is_some_and(|notice| notice.contains("message restored")));
+}
+
+#[tokio::test]
+async fn early_rejection_restores_the_promoted_fifo_head_before_its_successors() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+    let active_gen = app.event_generation();
+
+    app.pending_images.push((
+        "first.png".into(),
+        ImageData {
+            media_type: "image/png".into(),
+            data: "Zmlyc3Q=".into(),
+        },
+    ));
+    app.textarea.insert_str("first queued");
+    app.queue_input();
+    app.textarea.insert_str("second queued");
+    app.queue_input();
+
+    app.on_event(AppEvent::Chat {
+        gen: active_gen,
+        event: completed(Vec::new()),
+    });
+    assert_eq!(app.mode, Mode::Streaming);
+    assert_eq!(app.queued_prompt_count(), 1);
+    let promoted_gen = app.event_generation();
+
+    app.on_event(AppEvent::Chat {
+        gen: promoted_gen,
+        event: ChatEvent::Error("provider rejected promoted head".into()),
+    });
+
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.textarea.lines().join("\n"), "first queued");
+    assert_eq!(app.pending_image_count(), 1);
+    assert_eq!(app.pending_images[0].0, "first.png");
+    assert_eq!(app.queued_prompt_count(), 1);
+    assert_eq!(
+        app.queued_prompt_previews()
+            .next()
+            .map(|preview| preview.text),
+        Some("second queued")
+    );
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|message| matches!(message, Message::User(_)))
+            .count(),
+        1,
+        "the rejected promoted head must roll back out of provider history"
+    );
+    assert!(!app.transcript.iter().any(
+        |entry| matches!(entry, shaltaiboltai::app::Entry::User(text) if text == "first queued")
+    ));
+}
+
+#[tokio::test]
+async fn early_rejection_requeues_a_promoted_head_ahead_of_a_live_draft() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+    let active_gen = app.event_generation();
+
+    app.pending_images.push((
+        "first.png".into(),
+        ImageData {
+            media_type: "image/png".into(),
+            data: "Zmlyc3Q=".into(),
+        },
+    ));
+    app.textarea.insert_str("first queued");
+    app.queue_input();
+    app.textarea.insert_str("second queued");
+    app.queue_input();
+    app.on_event(AppEvent::Chat {
+        gen: active_gen,
+        event: completed(Vec::new()),
+    });
+    let promoted_gen = app.event_generation();
+    app.textarea.insert_str("newer live draft");
+
+    app.on_event(AppEvent::Chat {
+        gen: promoted_gen,
+        event: ChatEvent::Error("provider rejected promoted head".into()),
+    });
+
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.textarea.lines().join("\n"), "newer live draft");
+    assert_eq!(app.queued_prompt_count(), 2);
+    let previews = app.queued_prompt_previews().collect::<Vec<_>>();
+    assert_eq!(previews[0].text, "first queued");
+    assert_eq!(previews[0].image_count, 1);
+    assert_eq!(previews[1].text, "second queued");
+    assert!(app
+        .composer_notice()
+        .is_some_and(|notice| notice.contains("front of the queue")));
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|message| matches!(message, Message::User(_)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn promoted_head_reserves_capacity_for_lossless_recovery() {
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    app.textarea.insert_str("active request");
+    app.submit_input();
+    let active_gen = app.event_generation();
+    for index in 0..MAX_QUEUED_PROMPTS {
+        app.textarea.insert_str(format!("queued {index}"));
+        app.queue_input();
+    }
+
+    app.on_event(AppEvent::Chat {
+        gen: active_gen,
+        event: completed(Vec::new()),
+    });
+    assert_eq!(app.queued_prompt_count(), MAX_QUEUED_PROMPTS - 1);
+    let promoted_gen = app.event_generation();
+
+    app.textarea.insert_str("newer live draft");
+    app.queue_input();
+    assert_eq!(app.queued_prompt_count(), MAX_QUEUED_PROMPTS - 1);
+    assert_eq!(app.textarea.lines().join("\n"), "newer live draft");
+    assert!(app
+        .composer_notice()
+        .is_some_and(|notice| notice.contains("including the active queued message")));
+
+    app.on_event(AppEvent::Chat {
+        gen: promoted_gen,
+        event: ChatEvent::Error("provider rejected promoted head".into()),
+    });
+    assert_eq!(app.queued_prompt_count(), MAX_QUEUED_PROMPTS);
+    assert_eq!(app.textarea.lines().join("\n"), "newer live draft");
+    assert_eq!(
+        app.queued_prompt_previews()
+            .next()
+            .map(|preview| preview.text),
+        Some("queued 0")
+    );
 }
 
 #[tokio::test]
@@ -524,7 +992,7 @@ async fn late_provider_events_cannot_interrupt_the_tool_phase() {
 }
 
 #[tokio::test]
-async fn one_lookahead_slot_locks_further_input_and_busy_commands() {
+async fn fifo_keeps_composer_editable_but_busy_commands_remain_drafts() {
     let (mut app, _rx) = test_app();
     enable_test_model(&mut app);
     app.textarea.insert_str("first request");
@@ -532,13 +1000,11 @@ async fn one_lookahead_slot_locks_further_input_and_busy_commands() {
     app.textarea.insert_str("one queued request");
     app.queue_input();
 
-    assert!(!app.composer_accepts_input());
-    app.paste("must be ignored");
+    assert!(app.composer_accepts_input());
+    app.paste("second queued request");
     app.queue_input();
+    assert_eq!(app.queued_prompt_count(), 2);
     assert!(app.input_is_empty());
-    assert!(app
-        .composer_notice()
-        .is_some_and(|notice| notice.contains("already queued")));
     app.cancel_request();
 
     // Slash commands typed during a new active turn remain drafts; they can
@@ -548,7 +1014,7 @@ async fn one_lookahead_slot_locks_further_input_and_busy_commands() {
     app.submit_input();
     app.textarea.insert_str("/new");
     app.queue_input();
-    assert_eq!(app.queued_prompt_count(), 0);
+    assert_eq!(app.queued_prompt_count(), 1);
     assert_eq!(app.textarea.lines().join("\n"), "/new");
     assert!(app
         .composer_notice()
