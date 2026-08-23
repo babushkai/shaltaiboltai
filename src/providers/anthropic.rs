@@ -137,10 +137,11 @@ pub async fn stream_chat(
         Ok(())
     })
     .await?;
+    let stop_reason = stop_reason.context("Anthropic stream ended before a stop reason")?;
 
     let _ = tx.send(ChatEvent::Completed {
         tool_calls,
-        stop_reason,
+        stop_reason: Some(stop_reason),
         usage: Some(usage),
     });
     Ok(())
