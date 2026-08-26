@@ -35,6 +35,15 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.8"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 

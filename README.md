@@ -3,7 +3,7 @@
 > [!NOTE]
 > This project is built along with Claude Fable, which is now regulated by US government. 
 
-A Claude Code-style agentic coding TUI in Rust. Chat with a model, let it read/write files and run shell commands (with approval), and switch between providers — Anthropic, OpenAI (or any OpenAI-compatible endpoint), and local Ollama — mid-conversation.
+A multi-provider agentic coding TUI in Rust with a Codex-style authority shell: typed startup policy, OS-enforced command sandboxing, scoped approvals, `/permissions`, `/status`, `/init`, and a polished Ink/Paper interface. Chat with Anthropic, OpenAI-compatible APIs, Ollama, Claude Code, or Codex and switch providers without changing the active safety contract.
 
 ## Install
 
@@ -15,13 +15,15 @@ curl -fsSL https://github.com/babushkai/shaltaiboltai/releases/latest/download/i
 
 It installs to `~/.local/bin`; override with `SHALTAI_INSTALL_DIR`, or pin a tag with `SHALTAI_VERSION=v0.1.0`. Then run `shaltaiboltai`.
 
-From source (any platform with Rust 1.88+):
+From source (Rust 1.88+; constrained shell execution is supported on macOS and Linux):
 
 ```sh
 cargo install --git https://github.com/babushkai/shaltaiboltai --locked
 ```
 
 Or clone and `cargo run --release`.
+
+On Linux, constrained `run_command` calls require Bubblewrap at `/usr/bin/bwrap` or `/bin/bwrap`. The app fails closed if the backend is unavailable; install the `bubblewrap` package with your distribution's package manager. macOS uses the system Seatbelt backend.
 
 Providers are auto-discovered at startup:
 
@@ -30,33 +32,60 @@ Providers are auto-discovered at startup:
 | Anthropic | `ANTHROPIC_API_KEY` | Claude (Fable, Opus, Sonnet, Haiku) |
 | OpenAI | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | fetched from `/v1/models` |
 | Ollama | running locally (`OLLAMA_HOST`, default `http://localhost:11434`) | fetched from `/api/tags` |
-| Claude Code | the `claude` CLI installed and signed in | CLI default plus the documented Fable, Opus, and Sonnet aliases |
-| Codex | the `codex` CLI installed and signed in | CLI default plus exact models advertised by the local Codex catalog |
+| Claude Code | the `claude` CLI installed and signed in (Unix) | CLI default plus the documented Fable, Opus, and Sonnet aliases |
+| Codex | the `codex` CLI installed and signed in (Unix) | CLI default; exact model IDs can be entered explicitly |
 
 No keys needed for Ollama — if it's running, its models just show up. Models without tool support automatically fall back to plain chat.
 
 ### Subscription providers (no API key)
 
-If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://github.com/openai/codex) is installed and signed in, subscription-backed choices appear in the picker (Claude Pro/Max, ChatGPT Plus/Pro) instead of using a metered API key. `claude-code` and `codex` mean **use that CLI's configured default**. Explicit selectors pass a model override to the CLI: for example, `/model claude-code:sonnet` uses Claude's latest Sonnet alias and `/model codex:gpt-5.6-sol` requests that exact Codex model. The Codex rows come from its local machine-readable model catalog; Claude aliases come from the installed CLI's documented interface. You can also enter a provider-qualified full model ID directly with `/model`, even when it is not listed—the CLI remains authoritative about access.
+If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://github.com/openai/codex) is installed and signed in, subscription-backed choices appear in the picker (Claude Pro/Max, ChatGPT Plus/Pro) instead of using a metered API key. `claude-code` and `codex` mean **use that CLI's configured default**. Explicit selectors pass a model override to the CLI: for example, `/model claude-code:sonnet` uses Claude's latest Sonnet alias and `/model codex:gpt-5.6-sol` requests that exact Codex model. Claude aliases come from the installed CLI's documented interface; Codex advertises only its default row because the app never executes a CLI merely to discover models. You can enter any provider-qualified full model ID directly with `/model`, even when it is not listed—the CLI remains authoritative about access.
 
-We never see or store a token — the CLI owns its own auth. shaltaiboltai spawns it headless (`claude --print --output-format stream-json`, `codex exec --json`) and renders its event stream, so it runs as a **sub-agent**: the CLI drives its own tool loop (read/edit/run) and you watch its activity in the transcript. shaltaiboltai's own tools and approval flow don't apply to these providers — the CLI's own permission/sandbox model does. An unavailable model is reported as an error; shaltaiboltai never silently falls back to another model.
+CLI discovery is metadata-only and currently Unix-only. At startup the app snapshots the first absolute `claude` and `codex` candidate on `PATH`, rejects candidates inside the workspace or a temporary writable root, and never executes them during discovery. A rejected first hit fails closed instead of falling through to another executable. Restart after installing a CLI or changing `PATH`; `/refresh` does not replace this executable snapshot. The executable identity is revalidated immediately before every launch. Non-Unix CLI bridging stays unavailable until the app can bind a stable executable identity there; API providers remain available.
 
-Safe defaults, each opt-out via config.toml:
+We never see or store a subscription token — each CLI owns its authentication. shaltaiboltai launches a fresh headless child (`claude --print --output-format stream-json`, `codex exec --json`) and renders its event stream. The child drives its own tool loop, while shaltaiboltai maps the active permission snapshot onto every launch instead of inheriting ambient authority:
 
-- **Claude Code** runs with `--permission-mode acceptEdits` (reads/edits files autonomously; shell commands auto-denied since there's no interactive prompt). `claude_code_bypass_permissions = true` lets it run shell commands unsupervised.
-- **Codex** runs with `--sandbox workspace-write` (OS-sandboxed: edits and commands confined to the working directory, no network). `codex_full_access = true` removes the sandbox (`danger-full-access`).
+| Permission | Codex CLI | Claude Code CLI |
+|---|---|---|
+| Read Only | `read-only`, user config/rules ignored | `plan` + safe mode, read/search tools only |
+| Ask for approval | `workspace-write`, no network, canonical roots only | `plan` + safe mode, read/search tools only |
+| Full Access | `danger-full-access` | `bypassPermissions` |
+
+Headless children cannot route an inner approval prompt back into this TUI, so their inner approval policy is fail-closed. Claude Code cannot express the protected-path carve-outs required by the normal workspace policy, so constrained Claude turns are advisory-only; use the Anthropic API provider for app-owned, policy-mediated edits. Claude Code editing requires the explicit Full Access preset. Full Access is available only through the startup policy or the two-step `/permissions` confirmation; there are no provider-specific bypass switches. An unavailable model is reported as an error and is never silently replaced. Unsupported older CLI interfaces fail closed.
 
 Each CLI request starts an ephemeral fresh process with an explicit handoff of this app's conversation history. That avoids attaching to an unrelated “last” CLI session in the same directory or duplicating the handoff in CLI session storage. Images are represented in the handoff but their binary contents aren't forwarded to these providers yet (they work with the API providers).
 
+## Startup policy
+
+The default is workspace-write with on-request approvals. Startup options expose a supported Codex-style subset:
+
+```text
+shaltaiboltai [OPTIONS] [PROMPT]
+
+-C, --cd <DIR>                    Set the working directory
+    --add-dir <DIR>               Add a writable workspace root (repeatable)
+-s, --sandbox <MODE>              read-only | workspace-write | danger-full-access
+-a, --ask-for-approval <POLICY>   on-request | never
+-m, --model <MODEL>               Select the initial provider/model
+-i, --image <PATH,...>            Attach startup images (repeatable)
+    --full-auto                   workspace-write with on-request approval
+    --dangerously-bypass-approvals-and-sandbox
+    --no-alt-screen               Keep terminal scrollback visible
+```
+
+`--dangerously-bypass-approvals-and-sandbox` is intentionally explicit: it enables full disk and network access without approval. Relative `--add-dir` paths are resolved from the selected `--cd` directory; Read Only ignores them with a warning because it has no writable roots. A positional prompt is submitted once after its selected model becomes available. Typed, queued, and dropped relative image paths all resolve from `--cd`.
+
+In workspace mode, protected `.git`, `.agents`, and `.codex` paths are carved back to read-only by pathname; macOS and Windows classification also reserves ASCII case variants. Direct constrained `write_file` and `edit_file` calls reject multiply-linked files before truncation on Unix and Windows.
+
 ## Keys & commands
 
-Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). Commands take arguments directly: `/theme nord` switches and persists the theme, `/model qwen` jumps to the unique match or opens the picker pre-filtered, `/model claude-code:opus` and `/model codex:gpt-5.6-sol` select subscription CLI models, `/team 3` arms a coordinated run, and `/refresh` rediscovers providers. The statusline prioritizes the active state on narrow terminals, then adds the model, project, linked-worktree branch, and live context usage as space allows.
+Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). `/permissions` changes the next-turn authority, `/status` shows the immutable snapshot governing an active turn, and `/init` asks the selected model to create repository-scoped `AGENTS.md` guidance through the normal tool and approval path. Commands also take arguments directly: `/theme paper`, `/model qwen`, `/model codex:gpt-5.6-sol`, `/team 3`, and `/refresh`. The statusline prioritizes active state on narrow terminals, then adds model, project, linked-worktree branch, policy, and live context usage as space allows.
 
 The composer stays live while a response streams or a tool runs. Press `Enter` to queue one next message; it is sent automatically only after the current turn finishes cleanly (and after any context compaction). Cancellation, provider errors, truncation, or persistence/compaction failures restore that message to the composer instead. The one-message queue locks after capture, and slash commands wait until the active turn ends.
 
 ### Team orchestration
 
-`/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent: the classic Humpty Dumpty egg gentleman lives inside the main transcript and moves when there is clear room, yielding to conversation text, menus, and review overlays. Ghostty and other Kitty-graphics terminals render the high-resolution artwork directly; other terminals use a source-derived cell fallback. Both preserve his face on the shell, cravat, waistcoat, breeches, and boots instead of substituting a robot or ASCII icon. Smaller or busy transcripts prioritize the conversation and show only his name. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan.
+`/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent. The mascot appears only on genuinely large, quiet canvases; common 120×36 and narrower layouts preserve transcript hierarchy instead of sacrificing half the viewport to decoration. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan.
 
 After confirmation, workers run concurrently under a read-only policy and cannot use Shaltaiboltai's mutating tools. API workers whose models support tools get a bounded, app-owned read-only repository tool loop. Claude Code uses safe mode with `Read`, `Glob`, and `Grep`; a local model without tool support instead reasons from the supplied conversation. Codex CLI is deliberately excluded from planning and worker assignments: its `read-only` sandbox blocks writes but allows reads outside the workspace. An explicitly selected Codex model can still be the post-confirmation lead that synthesizes and edits under its normal sandbox. Every selected advisory provider receives the text conversation, so review the provider/model rows before sharing it. Images are omitted from team fan-out; use `/team off` for a vision prompt. Shaltaiboltai waits for every worker request to finish, synthesizes their reports, and becomes the only agent allowed to edit through the normal approval or CLI sandbox rules. This prevents concurrent team edits; it cannot prevent an unrelated process or person from changing the workspace at the same time.
 
@@ -72,6 +101,9 @@ The selected lead provider/model is pinned for synthesis and is also the planner
 | `Ctrl+U` | clear the input |
 | `Ctrl+P` or `/model` | model picker (type to filter, `Enter` to select) |
 | `/team [2-4\|off]` | arm one lead-and-workers run, or turn it off |
+| `/permissions` | choose Read Only, Ask for approval, or Full Access; Full Access requires a second confirmation |
+| `/status` | show model, provider, enforcement, workspace, policy, network, instructions, session, and usage |
+| `/init` | run a hidden synthetic turn that creates `AGENTS.md` through normal tools and policy |
 | `F1` or `/help` | focused keyboard guide |
 | `Esc` | cancel an in-flight response or running tool (including CLI sub-agents); in a tool approval, first focus its review controls and then deny the tool |
 | `Tab`, then `y` / `a` / `n` | focus a newly arrived tool approval, then approve once / allow only this path, search, or exact command for the current session / deny |
@@ -93,7 +125,7 @@ The transcript uses a quiet activity rail with explicit `YOU`, `ASSISTANT`, and 
 
 ## Themes
 
-`/theme` opens a live-preview picker (Up/Down to try, Enter to keep, Esc to revert) — the choice persists across runs. Built-in palettes: `mocha` (default), `tokyo-night`, `rose-pine`, `nord`, `gruvbox`, `latte` (light), and `terminal` (plain ANSI, keeps your terminal's own colors — use this if your emulator lacks truecolor). Each theme defines a base background, an elevated surface tone (input field, status bar, code cards, overlays), and tiered borders, so the UI has depth rather than flat accents. Set an initial theme with `theme = "nord"` in config.toml.
+`/theme` opens a live-preview picker (`Up`/`Down` to try, `Enter` to keep, `Esc` to revert), and the choice persists across runs. `ink` is the default; `paper` is its warm light companion. Their base, surface, elevated, hover, typography, border, accent, success, warning, error, code, and indigo tokens are transferred exactly from the original TypeScript Ink & Paper projects. Legacy palettes remain available: `mocha`, `tokyo-night`, `rose-pine`, `nord`, `gruvbox`, `latte`, and `terminal`. Set an initial theme with `theme = "paper"` in config.toml.
 
 ## Sessions & compaction
 
@@ -103,10 +135,22 @@ Conversations auto-save after every completed turn to `~/Library/Application Sup
 
 The agent has seven tools:
 
-- **Read-only** — `read_file`, `list_directory`, `grep` (regex content search, gitignore-aware), `glob` (find files by pattern). Auto-approved **only inside the working directory** after resolving symlinks; reads outside it (dotfiles, other projects, `/etc`…) always prompt before contents are sent to a provider.
-- **Mutating** — `write_file`, `edit_file` (exact find/replace, must match uniquely), `run_command`. Always prompt; the approval dialog shows a unified diff of what a file change will do. `a` remembers only the displayed path/search or exact command for the current conversation; grants are cleared by `/new`, `/resume`, and exit.
+- **Read/search** — `read_file`, `list_directory`, `grep` (regex, gitignore-aware), and `glob`. Constrained modes allow reads while every target is canonicalized and rechecked immediately before I/O.
+- **Edit/run** — `write_file`, `edit_file` (unique exact replacement), and `run_command`. Workspace-path writes run without interruption in the default preset; protected-path and outside writes require explicit authority. File approvals show the exact canonical target and a bounded unified diff.
 
-Commands time out after 60s and tool output is capped at 32 KB. If `AGENTS.md` or `CLAUDE.md` exists in the working directory it is loaded into the system prompt automatically.
+The presets are deliberately distinct:
+
+- **Read Only** — reads and sandboxed read-only commands are allowed; edits, network, and commands requesting execution outside the sandbox ask first.
+- **Ask for approval** — reads, workspace-path edits, and constrained commands are allowed; network, outside writes, and protected `.git`/`.agents`/`.codex` path writes ask first.
+- **Full Access** — disk and network access are enabled without prompts. The TUI opens this mode with “Go back” selected and requires a deliberate second action.
+
+An approval is bound to the exact policy generation and canonical target, search, or command displayed. Retargeting a symlink invalidates the review instead of rebinding the click. Session grants are cleared when authority changes, on `/new`, on `/resume`, and at exit.
+
+The broker is a boundary for model-initiated work, not for another hostile process already running as the same OS user. Such a process can race pathname-based file operations or workspace mount setup. OS pathname sandboxes also cannot distinguish a pre-existing workspace hard-link alias from its outside or protected inode, although the app-owned direct writers reject multiply-linked files. A deliberately daemonized Unix child can leave its original process group and outlive group cleanup. Sanitize untrusted local workspaces before allowing shell commands, and use a separate OS account, VM, or container when hard links, detached daemons, or same-user adversaries are in scope.
+
+Constrained shell commands never degrade to a raw shell: macOS uses Seatbelt; Linux uses a read-only Bubblewrap filesystem view, isolated namespaces, and a seccomp network filter. Workspace roots and temporary roots are the only write mounts, with protected paths carved back to read-only by pathname. Command stdin is closed, each child owns a process group whose remaining members are terminated on completion or cancellation, commands time out after 60 seconds, stdout/stderr are drained with bounded memory, and returned tool output is capped at 32 KB.
+
+Repository instructions are loaded from the Git root down to the selected working directory. At each level, `AGENTS.override.md` replaces `AGENTS.md`; the combined context is capped and the exact loaded paths appear in `/status`.
 
 ## Config (optional)
 
@@ -122,9 +166,8 @@ default_model = "qwen3.5:latest"
 # openai_api_key = "sk-..."
 # openai_base_url = "https://api.openai.com/v1"   # any OpenAI-compatible server
 # ollama_host = "http://localhost:11434"
+# theme = "paper"                                  # default is ink
 # reduced_motion = false                           # freeze the mascot pose while retaining status text
-# claude_code_bypass_permissions = false          # let the claude-code sub-agent run shell commands unsupervised
-# codex_full_access = false                        # remove the codex sub-agent's OS sandbox (danger-full-access)
 ```
 
 Set `SHALTAIBOLTAI_REDUCED_MOTION=1` for the same motion-free behavior without changing the file.
@@ -133,6 +176,8 @@ Set `SHALTAIBOLTAI_REDUCED_MOTION=1` for the same motion-free behavior without c
 
 `cargo run --example smoke [model_id]` exercises the provider layer end-to-end (discovery → streaming → tool call → result → final answer) without the TUI.
 
-Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic/OpenAI, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model. Static models appear immediately and dynamic providers publish independently as their probes finish. `src/app.rs` owns the agent loop, approval state machine, and cancellable request/compaction tasks; `src/ui.rs` uses dirty-entry caching plus cumulative line offsets, so each redraw parses only changed content and jumps directly to the visible viewport as conversations grow.
+Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic/OpenAI, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model. `src/policy.rs` owns typed authority and canonical path classification; `src/sandbox.rs` turns that authority into fail-closed OS process boundaries; `src/tools.rs` reassesses and binds every execution. `src/app.rs` owns immutable turn snapshots, approvals, orchestration, and cancellation. `src/ui.rs` uses dirty-entry caching plus cumulative line offsets, so redraw cost follows changed and visible content rather than transcript length.
+
+The render suite exercises idle, help, status, permissions, Full Access confirmation, and tool approvals down to 40×12, including Ink/Paper semantic styles. CI runs formatting, installer ShellCheck, strict Clippy, all targets, the production Linux sandbox integration test, macOS/Linux release builds, and a Windows compile plus hard-link boundary test before release artifacts are cut.
 
 Provider details: transient failures (429/5xx) are retried with backoff honoring `Retry-After`; Anthropic requests use prompt caching (system, tools, and conversation tail breakpoints); truncated responses (`max_tokens`/`length`) are surfaced in the transcript; the status bar shows real token usage reported by the provider.

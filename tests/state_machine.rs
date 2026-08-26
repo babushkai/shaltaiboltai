@@ -1,5 +1,6 @@
 use shaltaiboltai::app::{App, AppEvent, Mode};
 use shaltaiboltai::config::Config;
+use shaltaiboltai::policy::{ExecutionPolicy, PermissionPreset, Workspace};
 use shaltaiboltai::providers::{
     ChatEvent, ImageData, Message, ModelEntry, ProviderKind, ToolCall, UserContent,
 };
@@ -17,8 +18,6 @@ fn offline_config() -> Config {
         compact_threshold_chars: 80_000,
         ollama_num_ctx: 16_384,
         theme: None,
-        claude_code_bypass_permissions: false,
-        codex_full_access: false,
         reduced_motion: false,
     }
 }
@@ -61,6 +60,10 @@ fn enable_test_model(app: &mut App) {
         provider: ProviderKind::Ollama,
         id: "queue-test".into(),
     });
+}
+
+fn require_write_approval(app: &mut App) {
+    app.policy.apply_preset(PermissionPreset::ReadOnly);
 }
 
 #[tokio::test]
@@ -457,6 +460,7 @@ async fn inconsistent_stop_with_tool_calls_never_executes_or_promotes() {
 #[tokio::test]
 async fn queued_prompt_stays_behind_the_complete_tool_loop() {
     let (mut app, _rx) = test_app();
+    require_write_approval(&mut app);
     enable_test_model(&mut app);
     app.textarea.insert_str("first request");
     app.submit_input();
@@ -499,6 +503,7 @@ async fn queued_prompt_stays_behind_the_complete_tool_loop() {
 #[tokio::test]
 async fn late_provider_events_cannot_interrupt_the_tool_phase() {
     let (mut app, _rx) = test_app();
+    require_write_approval(&mut app);
     enable_test_model(&mut app);
     app.textarea.insert_str("request with a tool");
     app.submit_input();
@@ -559,6 +564,7 @@ async fn one_lookahead_slot_locks_further_input_and_busy_commands() {
 #[tokio::test]
 async fn stale_tool_events_after_cancel_do_not_resume_the_loop() {
     let (mut app, _rx) = test_app();
+    require_write_approval(&mut app);
 
     // Model requests a mutating tool → approval gate.
     app.on_event(AppEvent::Chat {
@@ -592,6 +598,7 @@ async fn stale_tool_events_after_cancel_do_not_resume_the_loop() {
 #[tokio::test]
 async fn denied_tool_calls_record_an_error_result() {
     let (mut app, _rx) = test_app();
+    require_write_approval(&mut app);
 
     app.on_event(AppEvent::Chat {
         gen: 0,
@@ -610,6 +617,55 @@ async fn denied_tool_calls_record_an_error_result() {
     // No model configured → the follow-up request cannot start; we must land
     // back in input mode rather than a stuck state.
     assert_eq!(app.mode, Mode::Input);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_cannot_rebind_to_a_retargeted_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "shaltai-approval-retarget-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    let workspace = root.join("workspace");
+    let first_target = root.join("first-target");
+    let second_target = root.join("second-target");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&first_target).expect("create first target");
+    std::fs::create_dir_all(&second_target).expect("create second target");
+    let link = workspace.join("escape");
+    symlink(&first_target, &link).expect("create first symlink");
+
+    let policy = ExecutionPolicy::new(Workspace::new(&workspace).expect("valid workspace"));
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::with_policy(offline_config(), policy, tx);
+    let call = ToolCall {
+        id: "retargeted-approval".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "escape/file.txt", "content": "secret"}),
+    };
+    app.on_event(AppEvent::Chat {
+        gen: 0,
+        event: completed(vec![call]),
+    });
+    assert_eq!(app.mode, Mode::Approval);
+
+    std::fs::remove_file(&link).expect("remove first symlink");
+    symlink(&second_target, &link).expect("retarget symlink");
+    app.approve_pending(true);
+
+    assert_eq!(app.mode, Mode::Approval);
+    assert!(app.pending_approval().is_some());
+    assert!(!first_target.join("file.txt").exists());
+    assert!(!second_target.join("file.txt").exists());
+
+    app.deny_pending();
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
@@ -1318,6 +1374,7 @@ async fn discovery_never_switches_provider_mid_agent_turn() {
     config.anthropic_api_key = Some("test-key".into());
     config.default_model = Some("codex".into());
     let (mut app, _rx) = test_app_with_config(config);
+    require_write_approval(&mut app);
     let anthropic = app.models.first().cloned().unwrap();
     app.model = Some(anthropic.clone());
     app.mode = Mode::Streaming;
@@ -1360,6 +1417,7 @@ async fn discovery_never_switches_provider_mid_agent_turn() {
 #[tokio::test]
 async fn quitting_during_approval_repairs_the_tool_turn() {
     let (mut app, _rx) = test_app();
+    require_write_approval(&mut app);
     app.on_event(AppEvent::Chat {
         gen: 0,
         event: completed(vec![write_call("quit-call")]),

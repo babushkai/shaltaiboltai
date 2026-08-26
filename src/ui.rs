@@ -1,4 +1,4 @@
-use crate::app::{App, Entry, Mode};
+use crate::app::{App, Entry, Mode, PermissionOverlay, PERMISSION_PRESETS};
 use crate::markdown;
 use crate::mascot;
 use crate::session;
@@ -42,17 +42,24 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
         );
     }
 
+    let header_height = if frame.area().height >= 6 { 2 } else { 1 };
     let input_height = input_height(app, frame.area().height);
-    let [transcript_area, status_area, input_area] = Layout::vertical([
+    let [header_area, transcript_area, input_area] = Layout::vertical([
+        Constraint::Length(header_height),
         Constraint::Min(1),
-        Constraint::Length(1),
         Constraint::Length(input_height),
     ])
     .areas(frame.area());
 
+    draw_header(frame, app, header_area);
     draw_transcript(frame, app, transcript_area);
     let slash_menu_active = app.mode == Mode::Input && app.slash_menu_active();
-    if !slash_menu_active
+    if frame.area().width >= 200
+        && frame.area().height >= 70
+        && app.transcript.len() == 1
+        && !app.is_busy()
+        && app.permission_overlay.is_none()
+        && !slash_menu_active
         && !matches!(
             app.mode,
             Mode::ModelPicker
@@ -65,7 +72,6 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
     {
         draw_inline_mascot(frame, app, transcript_area, native_mascot);
     }
-    draw_status(frame, app, status_area);
     draw_input(frame, app, input_area);
     if slash_menu_active {
         draw_slash_menu(frame, app, input_area);
@@ -79,6 +85,11 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
         Mode::OrchestrationConfirm => draw_orchestration_confirm(frame, app),
         Mode::Help => draw_help(frame, app),
         _ => {}
+    }
+    match app.permission_overlay {
+        Some(PermissionOverlay::Picker) => draw_permissions(frame, app),
+        Some(PermissionOverlay::FullAccessConfirm) => draw_full_access_confirmation(frame, app),
+        None => {}
     }
 }
 
@@ -230,8 +241,8 @@ fn input_height(app: &App, total_height: u16) -> u16 {
     }
 }
 
-/// The input renders as an elevated card; its border doubles as the focus
-/// indicator — accent while typing is possible, structural otherwise.
+/// The composer is an elevated band with one structural rule. It deliberately
+/// avoids another closed rounded box beneath the conversation surface.
 fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let focused = app.composer_accepts_input();
@@ -249,23 +260,23 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         theme.border
     };
-    let title = if queued && area.width < 32 {
-        " queued "
+    let compact = area.width < 48;
+    let title = if queued && !compact {
+        " › next message queued "
     } else if queued {
-        " next message queued "
-    } else if team_workers.is_some() && area.width < 40 {
-        " team prompt "
+        " › queued "
     } else if team_workers.is_some() {
-        " team · next prompt "
+        " › team prompt "
     } else if lookahead {
-        " next message "
+        " › next message "
     } else {
-        " compose "
+        " › "
     };
     let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .borders(Borders::TOP)
+        .border_type(BorderType::Plain)
         .border_style(Style::new().fg(border))
+        .padding(Padding::horizontal(1))
         .title(Line::styled(
             title,
             Style::new().fg(border).add_modifier(Modifier::BOLD),
@@ -291,46 +302,65 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
                 .alignment(Alignment::Right),
         );
     }
+    let draft_empty = app
+        .textarea
+        .lines()
+        .iter()
+        .all(|line| line.trim().is_empty());
     let footer = if let Some(notice) = app.composer_notice() {
         Some((notice.to_owned(), theme.warning))
     } else if app.mode == Mode::Approval && !app.approval_focused && queued {
         Some(("Tab review tool · next message queued".into(), theme.dim))
     } else if app.mode == Mode::Approval && !app.approval_focused {
         Some((
-            "Tab review tool · Enter queue · Alt+Enter newline".into(),
+            if compact {
+                "Tab review · Enter queue".into()
+            } else {
+                "Tab review tool · Enter queue · Alt+Enter newline".into()
+            },
             theme.dim,
         ))
     } else if focused && lookahead {
         Some((
-            "Esc cancel · Enter queue · Alt+Enter newline".into(),
+            if compact {
+                "Esc cancel · Enter queue".into()
+            } else {
+                "Esc cancel · Enter queue · Alt+Enter newline".into()
+            },
             theme.dim,
         ))
     } else if let Some(workers) = team_workers {
         Some((
-            format!("Enter starts 1 planning call · {workers} workers after review"),
+            if compact {
+                format!("Enter plan · {workers} workers")
+            } else {
+                format!("Enter starts 1 planning call · {workers} workers after review")
+            },
             theme.accent2,
         ))
     } else if queued && app.mode == Mode::Approval {
         Some(("waiting for tool decision · n / Esc deny".into(), theme.dim))
     } else if queued {
-        Some(("Esc cancel · waiting for current turn".into(), theme.dim))
-    } else if focused {
         Some((
-            "Enter send · Alt+Enter newline · / commands".into(),
+            if compact {
+                "Esc cancel · waiting".into()
+            } else {
+                "Esc cancel · waiting for current turn".into()
+            },
+            theme.dim,
+        ))
+    } else if focused && draft_empty {
+        Some((
+            if compact {
+                "Enter send · / commands".into()
+            } else {
+                "Enter send · Alt+Enter newline · / commands".into()
+            },
             theme.dim,
         ))
     } else {
         None
     };
-    if area.width >= 16 {
-        if let Some((footer, color)) = footer {
-            let footer = truncate_width(&footer, area.width.saturating_sub(4) as usize);
-            block = block.title_bottom(
-                Line::styled(format!(" {footer} "), Style::new().fg(color))
-                    .alignment(Alignment::Right),
-            );
-        }
-    }
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
     }
@@ -350,7 +380,32 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default()
     });
     app.textarea.set_block(block);
-    frame.render_widget(&app.textarea, area);
+    let show_footer = area.height >= 3;
+    let [editor_area, footer_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(u16::from(show_footer)),
+    ])
+    .areas(area);
+    frame.render_widget(&app.textarea, editor_area);
+    if show_footer {
+        if let Some(surface) = theme.surface {
+            frame.render_widget(
+                Block::default().style(Style::new().bg(surface).fg(theme.fg)),
+                footer_area,
+            );
+        }
+        if let Some((footer, color)) = footer {
+            let footer = truncate_width(&footer, footer_area.width.saturating_sub(3) as usize);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  ", Style::new().fg(border)),
+                    Span::styled(footer, Style::new().fg(color)),
+                ]))
+                .alignment(Alignment::Right),
+                footer_area,
+            );
+        }
+    }
 }
 
 /// Renders the transcript through a per-entry line cache with cumulative line
@@ -358,7 +413,8 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
 /// binary search rather than a walk from the beginning of the conversation.
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
-    // Borders (2) + horizontal padding (2).
+    // Two cells of editorial breathing room on each side. There is no outer
+    // transcript frame: the HUD and composer rules provide the shell.
     let width = area.width.saturating_sub(4).max(10) as usize;
     let previous_total = app.render_cache_total_lines;
     let preserve_viewport = app.scroll_from_bottom > 0
@@ -421,7 +477,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
                 .saturating_sub(previous_total - total);
         }
     }
-    let visible = area.height.saturating_sub(2) as usize;
+    let visible = area.height as usize;
     app.scroll_from_bottom = app.scroll_from_bottom.min(total.saturating_sub(visible));
     let start = total.saturating_sub(visible + app.scroll_from_bottom);
     let end = (start + visible).min(total);
@@ -451,38 +507,11 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let brand = if area.width >= 28 {
-        " ◆ shaltaiboltai ".to_owned()
-    } else {
-        " ◆ chat ".to_owned()
-    };
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.border))
-        .padding(Padding::horizontal(1))
-        .title(Line::styled(
-            brand,
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ));
-    if app.scroll_from_bottom > 0 {
-        let label = if area.width >= 48 {
-            format!(
-                " ↑ {} lines from latest · Ctrl+End jump ",
-                app.scroll_from_bottom
-            )
-        } else {
-            format!(" ↑ {} · Ctrl+End ", app.scroll_from_bottom)
-        };
-        block = block.title_bottom(
-            Line::styled(
-                label,
-                Style::new().fg(semantic_foreground(theme.warning, theme.bg, theme.fg)),
-            )
-            .alignment(Alignment::Right),
-        );
-    }
-    frame.render_widget(Paragraph::new(window).block(block), area);
+    let inner = area.inner(Margin {
+        vertical: 0,
+        horizontal: 2,
+    });
+    frame.render_widget(Paragraph::new(window), inner);
 
     if total > visible {
         let mut state = ScrollbarState::new(total)
@@ -495,10 +524,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
                 .track_symbol(None)
                 .thumb_symbol("▐")
                 .style(Style::new().fg(theme.border)),
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
+            area,
             &mut state,
         );
     }
@@ -510,7 +536,7 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
         Entry::Banner { title, subtitle } => {
             lines.push(Line::from(vec![
                 Span::styled(
-                    "◆ ",
+                    "━━╾ ",
                     Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -530,44 +556,43 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
         Entry::User(text) => {
             lines.push(Line::from(vec![
                 Span::styled(
-                    " YOU ",
-                    Style::new()
-                        .fg(on_color(theme.accent))
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
+                    "YOU",
+                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  prompt", Style::new().fg(theme.dim)),
+                Span::styled("  ·  prompt", Style::new().fg(theme.dim)),
             ]));
             push_wrapped(
                 &mut lines,
-                "│ ",
-                Style::new().fg(theme.border),
+                "▎ ",
+                Style::new().fg(theme.accent),
                 text,
                 width,
-                Style::new().fg(theme.fg),
+                Style::new().fg(theme.secondary),
             );
         }
         Entry::Assistant(text) => {
             if !text.is_empty() || streaming {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "◆ ",
+                        "◆  ",
                         Style::new().fg(theme.accent2).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        "ASSISTANT",
-                        Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+                        "SHALTAIBOLTAI",
+                        Style::new()
+                            .fg(theme.secondary)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 if text.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::new().fg(theme.border)),
+                        Span::raw("   "),
                         Span::styled("thinking…", Style::new().fg(theme.dim)),
                     ]));
                 } else {
-                    for line in markdown::render(text, width.saturating_sub(2), theme) {
+                    for line in markdown::render(text, width.saturating_sub(3), theme) {
                         let mut spans = Vec::with_capacity(line.spans.len() + 1);
-                        spans.push(Span::styled("│ ", Style::new().fg(theme.border)));
+                        spans.push(Span::raw("   "));
                         spans.extend(line.spans);
                         lines.push(Line::from(spans));
                     }
@@ -580,26 +605,25 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
             is_error,
         } => {
             let (state, glyph, color) = if *is_error {
-                ("FAILED", "✗ ", theme.error)
+                ("failed", "✗", theme.error)
             } else {
-                ("DONE", "✓ ", theme.success)
+                ("done", "✓", theme.success)
             };
             let result_lines = result.lines().count();
             lines.push(Line::from(vec![
                 Span::styled(
-                    glyph,
+                    format!("{glyph}  "),
                     Style::new()
                         .fg(semantic_foreground(color, theme.bg, theme.fg))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(" {state} "),
+                    "tool",
                     Style::new()
-                        .fg(on_color(color))
-                        .bg(color)
+                        .fg(theme.secondary)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  TOOL", Style::new().fg(theme.dim)),
+                Span::styled(format!(" · {state}"), Style::new().fg(color)),
                 Span::styled(
                     if result_lines > 0 {
                         format!(
@@ -614,25 +638,25 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
             ]));
             push_wrapped(
                 &mut lines,
-                "│ ",
-                Style::new().fg(theme.border),
+                "▎ ",
+                Style::new().fg(color),
                 summary,
                 width,
-                Style::new().fg(theme.fg),
+                Style::new().fg(theme.secondary),
             );
             let shown = result_lines.min(TOOL_RESULT_PREVIEW_LINES);
             for (i, line) in result.lines().take(shown).enumerate() {
                 push_wrapped(
                     &mut lines,
-                    "│   ",
-                    Style::new().fg(theme.border),
+                    "   ",
+                    Style::new().fg(theme.dim),
                     line,
                     width,
                     Style::new().fg(theme.dim),
                 );
                 if i + 1 == shown && result_lines > shown {
                     lines.push(Line::from(vec![
-                        Span::styled("│   ", Style::new().fg(theme.border)),
+                        Span::raw("   "),
                         Span::styled(
                             format!("… {} more lines", result_lines - shown),
                             Style::new().fg(theme.dim).add_modifier(Modifier::ITALIC),
@@ -650,42 +674,46 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
         } => {
             let running = status == "RUNNING";
             let (glyph, color) = if *is_error {
-                ("✗ ", theme.error)
+                ("✗", theme.error)
             } else if running {
-                ("◆ ", theme.accent2)
+                ("◆", theme.accent2)
             } else {
-                ("✓ ", theme.success)
+                ("✓", theme.success)
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    glyph,
+                    format!("{glyph}  "),
                     Style::new()
                         .fg(semantic_foreground(color, theme.bg, theme.fg))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(" {status} "),
+                    "agent",
                     Style::new()
-                        .fg(on_color(color))
-                        .bg(color)
+                        .fg(theme.secondary)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  AGENT · ", Style::new().fg(theme.dim)),
+                Span::styled(
+                    format!(" · {} · ", status.to_ascii_lowercase()),
+                    Style::new().fg(color),
+                ),
                 Span::styled(model.clone(), Style::new().fg(theme.accent2)),
             ]));
             push_wrapped(
                 &mut lines,
-                "│ ",
-                Style::new().fg(theme.border),
+                "▎ ",
+                Style::new().fg(color),
                 name,
                 width,
-                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(theme.secondary)
+                    .add_modifier(Modifier::BOLD),
             );
             if !summary.is_empty() {
                 push_wrapped(
                     &mut lines,
-                    "│   ",
-                    Style::new().fg(theme.border),
+                    "   ",
+                    Style::new().fg(theme.dim),
                     summary,
                     width,
                     Style::new().fg(if *is_error { theme.error } else { theme.dim }),
@@ -701,6 +729,136 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
                 width,
                 Style::new().fg(theme.dim).add_modifier(Modifier::ITALIC),
             );
+        }
+        Entry::Status { title, fields } => {
+            let value = |label: &str| {
+                fields
+                    .iter()
+                    .find_map(|(field, value)| (field == label).then_some(value.as_str()))
+                    .unwrap_or("—")
+            };
+            if width < 44 {
+                let permissions = value("Permissions");
+                let compact_permissions = if permissions.starts_with("Workspace") {
+                    "Ask for approval"
+                } else if permissions.starts_with("Read Only") {
+                    "Read Only"
+                } else if permissions.starts_with("Full Access") {
+                    "Full Access"
+                } else {
+                    permissions
+                };
+                let compact = [
+                    ("RUNTIME", value("Model")),
+                    ("Provider", value("Model provider")),
+                    ("WORKSPACE", value("Directory")),
+                    ("Permissions", compact_permissions),
+                    ("USAGE", value("Context window")),
+                ];
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "STATUS",
+                        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" · ", Style::new().fg(theme.border)),
+                    Span::styled(
+                        truncate_width(title, width.saturating_sub(9)),
+                        Style::new().fg(theme.secondary),
+                    ),
+                ]));
+                for (label, field_value) in compact {
+                    let prefix = format!("{label}  ");
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            prefix.clone(),
+                            Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            truncate_width(field_value, width.saturating_sub(prefix.width())),
+                            Style::new().fg(theme.secondary),
+                        ),
+                    ]));
+                }
+                return lines;
+            }
+            if width < 68 {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "STATUS",
+                        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" · ", Style::new().fg(theme.border)),
+                    Span::styled(title.clone(), Style::new().fg(theme.secondary)),
+                ]));
+                for (section, labels) in [
+                    (
+                        "RUNTIME",
+                        ["Model", "Model provider", "Enforcement"].as_slice(),
+                    ),
+                    (
+                        "WORKSPACE",
+                        ["Directory", "Permissions", "Network"].as_slice(),
+                    ),
+                    ("USAGE", ["Token usage", "Context window"].as_slice()),
+                ] {
+                    lines.push(Line::styled(
+                        section,
+                        Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+                    ));
+                    for label in labels {
+                        let prefix = format!("{label:<14}  ");
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.clone(), Style::new().fg(theme.dim)),
+                            Span::styled(
+                                truncate_width(value(label), width.saturating_sub(prefix.width())),
+                                Style::new().fg(theme.secondary),
+                            ),
+                        ]));
+                    }
+                }
+                return lines;
+            }
+            let label_width = fields
+                .iter()
+                .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
+                .max()
+                .unwrap_or(0)
+                .min(18);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "STATUS",
+                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · ", Style::new().fg(theme.border)),
+                Span::styled(title.clone(), Style::new().fg(theme.secondary)),
+            ]));
+            for (label, value) in fields {
+                let section = match label.as_str() {
+                    "Model" => Some("RUNTIME"),
+                    "Directory" => Some("WORKSPACE"),
+                    "Token usage" => Some("USAGE"),
+                    _ => None,
+                };
+                if let Some(section) = section {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            section,
+                            Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("  ━━━╾", Style::new().fg(theme.accent)),
+                    ]));
+                }
+                let prefix = format!("{label:<label_width$}  ");
+                push_wrapped(
+                    &mut lines,
+                    &prefix,
+                    Style::new().fg(theme.dim),
+                    value,
+                    width,
+                    Style::new().fg(theme.secondary),
+                );
+            }
         }
         Entry::Error(text) => {
             let error = semantic_foreground(theme.error, theme.bg, theme.fg);
@@ -756,17 +914,74 @@ fn spinner_frame(tick: u64) -> char {
     SPINNER[tick as usize % SPINNER.len()]
 }
 
-/// One-line status bar on the surface elevation: accent model chip, state
-/// (with spinner while busy) on the left, context usage on the right.
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+/// Product HUD derived from the original TypeScript shell: one compact seal,
+/// one authored identity, quiet runtime metadata, and a single separator.
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
-    if let Some(surface) = theme.surface {
-        frame.render_widget(
-            Block::default().style(Style::new().bg(surface).fg(theme.fg)),
-            area,
-        );
+    let surface_style = theme.surface.map_or_else(
+        || Style::new().fg(theme.fg),
+        |surface| Style::new().bg(surface).fg(theme.fg),
+    );
+    let mut shell = Block::default().style(surface_style);
+    if area.height >= 2 {
+        shell = shell
+            .borders(Borders::BOTTOM)
+            .border_type(BorderType::Plain)
+            .border_style(Style::new().fg(theme.border));
+
+        let mut workspace = app.cwd_display.clone();
+        if let Some(branch) = &app.git_branch {
+            if !workspace.is_empty() {
+                workspace.push_str(" · ");
+            }
+            workspace.push_str(branch);
+        }
+        if !workspace.is_empty() && area.width >= 44 {
+            shell = shell.title_bottom(Line::styled(
+                format!(
+                    " {} ",
+                    truncate_width(&workspace, (area.width / 2) as usize)
+                ),
+                Style::new().fg(theme.dim),
+            ));
+        }
+
+        let usage = if app.scroll_from_bottom > 0 {
+            if area.width >= 48 {
+                format!(
+                    " ↑ {} lines from latest · Ctrl+End jump ",
+                    app.scroll_from_bottom
+                )
+            } else {
+                format!(" ↑ {} · Ctrl+End ", app.scroll_from_bottom)
+            }
+        } else {
+            match app.last_usage {
+                Some(usage) => format!(
+                    " ctx {} · out {} ",
+                    fmt_count(usage.input_tokens as usize),
+                    fmt_count(usage.output_tokens as usize)
+                ),
+                None if app.approx_tokens() > 0 => {
+                    format!(" ctx ~{} ", fmt_count(app.approx_tokens()))
+                }
+                None => String::new(),
+            }
+        };
+        if !usage.is_empty() {
+            let color = if app.scroll_from_bottom > 0 {
+                semantic_foreground(theme.warning, theme.surface, theme.fg)
+            } else {
+                theme.dim
+            };
+            shell = shell.title_bottom(
+                Line::styled(usage, Style::new().fg(color)).alignment(Alignment::Right),
+            );
+        }
     }
-    let wide = area.width >= 52;
+    frame.render_widget(shell, area);
+
+    let wide = area.width >= 58;
     let (state, state_color) = if let Some(status) = app.orchestration_status() {
         (status, theme.accent2)
     } else if app.compacting {
@@ -778,25 +993,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.mode {
             Mode::Input => ("ready".into(), theme.success),
-            Mode::Streaming => (
-                if wide {
-                    "thinking — Esc to cancel".into()
-                } else {
-                    "thinking".into()
-                },
-                theme.accent,
-            ),
-            Mode::RunningTool => (
-                if wide {
-                    "running tool — Esc to cancel".into()
-                } else {
-                    "running tool".into()
-                },
-                theme.accent2,
-            ),
+            Mode::Streaming => ("thinking".into(), theme.accent),
+            Mode::RunningTool => ("running tool".into(), theme.accent2),
             Mode::Approval => ("approval needed".into(), theme.warning),
-            Mode::OrchestrationConfirm => ("TEAM · plan ready".into(), theme.warning),
-            Mode::Orchestrating => ("TEAM · working — Esc cancel".into(), theme.accent2),
+            Mode::OrchestrationConfirm => ("team plan ready".into(), theme.warning),
+            Mode::Orchestrating => ("team working".into(), theme.accent2),
             Mode::ModelPicker => ("selecting model".into(), theme.accent2),
             Mode::SessionPicker => ("selecting session".into(), theme.accent2),
             Mode::ThemePicker => (
@@ -821,115 +1022,80 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         state
     };
-    let spinner_width = if app.is_busy() { 3 } else { 1 };
-    let state_width = UnicodeWidthStr::width(state.as_str());
-    let chip_budget = (area.width as usize)
-        .saturating_sub(state_width + spinner_width + 2)
-        .min(36);
+
+    let mut left = vec![Span::styled(
+        " SB ",
+        Style::new()
+            .fg(theme.bg.unwrap_or_else(|| on_color(theme.accent)))
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if area.width >= 18 {
+        left.push(Span::styled(
+            if area.width >= 34 {
+                "  SHALTAIBOLTAI"
+            } else {
+                "  SHALTAI"
+            },
+            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let left_width = left.iter().map(Span::width).sum::<usize>();
+    frame.render_widget(
+        Paragraph::new(Line::from(left)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
     let model = app
         .model
         .as_ref()
-        .map(|m| format!("{} · {}", m.display_id(), m.provider.label()))
-        .unwrap_or_else(|| {
-            if app.discovering {
-                "finding models".into()
-            } else {
-                "no model".into()
-            }
-        });
-    let mut spans = Vec::new();
-    if chip_budget >= 8 {
-        let model = truncate_width(&model, chip_budget.saturating_sub(4));
-        spans.push(Span::styled(
-            format!(" ◆ {model} "),
-            Style::new().fg(on_color(theme.accent)).bg(theme.accent),
-        ));
+        .map(|m| format!("{} · {}", m.display_id(), m.provider.label()));
+    let permission = app
+        .effective_execution_policy()
+        .matching_preset()
+        .map_or_else(
+            || app.effective_execution_policy().sandbox_mode().label(),
+            |preset| preset.label(),
+        );
+    let available = area.width as usize;
+    let state_width = UnicodeWidthStr::width(state.as_str()) + if app.is_busy() { 2 } else { 1 };
+    let mut right = Vec::new();
+    let room = available.saturating_sub(left_width + 2);
+    let model_width = model
+        .as_deref()
+        .map(UnicodeWidthStr::width)
+        .unwrap_or_default();
+    let permission_width = UnicodeWidthStr::width(permission);
+    if wide && room > state_width + permission_width + model_width + 6 {
+        if let Some(model) = model {
+            right.push(Span::styled(model, Style::new().fg(theme.accent2)));
+            right.push(Span::styled(" · ", Style::new().fg(theme.border)));
+        }
     }
-    if app.is_busy() {
-        spans.push(Span::styled(
-            format!(" {} ", spinner_frame(app.animation_tick())),
+    if room > state_width + permission_width + 3 {
+        right.push(Span::styled(permission, Style::new().fg(theme.secondary)));
+        right.push(Span::styled(" · ", Style::new().fg(theme.border)));
+    }
+    right.push(if app.is_busy() {
+        Span::styled(
+            format!("{} ", spinner_frame(app.animation_tick())),
             Style::new().fg(theme.accent),
-        ));
+        )
     } else {
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled(
+        Span::styled("● ", Style::new().fg(state_color))
+    });
+    right.push(Span::styled(
         state,
         Style::new().fg(semantic_foreground(state_color, theme.surface, theme.fg)),
     ));
-    let left_width: usize = spans.iter().map(|s| s.width()).sum();
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-
-    // Right side: cwd · branch · context usage, Claude Code style. On narrow
-    // terminals, pieces are dropped (cwd first, then branch) instead of
-    // colliding with the left side.
-    let approx = (app.last_usage.is_none()).then(|| app.approx_tokens());
-    let context = match app.last_usage {
-        Some(u) => Some(format!(
-            "ctx {} · out {}",
-            fmt_count(u.input_tokens as usize),
-            fmt_count(u.output_tokens as usize)
-        )),
-        None => approx
-            .filter(|tokens| *tokens > 0)
-            .map(|tokens| format!("ctx ~{}", fmt_count(tokens))),
-    };
-    let context_percent = context.as_ref().and_then(|_| app.context_percent());
-    let assemble = |with_cwd: bool, with_branch: bool| -> Vec<Span<'static>> {
-        let mut right: Vec<Span> = Vec::new();
-        let sep = || Span::styled(" · ", Style::new().fg(theme.border));
-        if with_cwd && !app.cwd_display.is_empty() {
-            right.push(Span::styled(
-                app.cwd_display.clone(),
-                Style::new().fg(theme.dim),
-            ));
-        }
-        if with_branch {
-            if let Some(branch) = &app.git_branch {
-                if !right.is_empty() {
-                    right.push(sep());
-                }
-                right.push(Span::styled(branch.clone(), Style::new().fg(theme.accent2)));
-            }
-        }
-        if let Some(ctx) = &context {
-            if !right.is_empty() {
-                right.push(sep());
-            }
-            right.push(Span::styled(ctx.clone(), Style::new().fg(theme.dim)));
-            if let Some(pct) = context_percent {
-                let color = match pct {
-                    0..=69 => theme.dim,
-                    70..=89 => theme.warning,
-                    _ => theme.error,
-                };
-                right.push(Span::styled(
-                    format!(" {pct}%"),
-                    Style::new().fg(semantic_foreground(color, theme.surface, theme.fg)),
-                ));
-            }
-        }
-        if !right.is_empty() {
-            right.push(Span::raw(" "));
-        }
-        right
-    };
-    let fits = |candidate: &[Span]| -> bool {
-        let w: usize = candidate.iter().map(|s| s.width()).sum();
-        !candidate.is_empty() && left_width + w < area.width as usize
-    };
-    let right = [(true, true), (false, true), (false, false)]
-        .into_iter()
-        .find_map(|(cwd, branch)| {
-            let candidate = assemble(cwd, branch);
-            fits(&candidate).then_some(candidate)
-        });
-    if let Some(right) = right {
-        frame.render_widget(
-            Paragraph::new(Line::from(right)).alignment(Alignment::Right),
-            area,
-        );
-    }
+    let right_x = area
+        .x
+        .saturating_add((left_width + 1).min(area.width as usize) as u16);
+    let right_area = Rect::new(right_x, area.y, area.right().saturating_sub(right_x), 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
+        right_area,
+    );
 }
 
 fn truncate_width(text: &str, max: usize) -> String {
@@ -967,6 +1133,14 @@ fn on_color(color: Color) -> Color {
             _ => Color::Black,
         },
     }
+}
+
+fn selection_style(theme: &Theme) -> Style {
+    let mut style = Style::new().fg(theme.fg).add_modifier(Modifier::BOLD);
+    if let Some(selection) = theme.hover.or(theme.elevated).or(theme.surface) {
+        style = style.bg(selection);
+    }
+    style
 }
 
 /// Preserve a semantic hue only when it remains readable as text on the
@@ -1066,15 +1240,15 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
 
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::new().fg(theme.border));
     if let Some(surface) = theme.surface {
         block = block.style(Style::new().bg(surface).fg(theme.fg));
     }
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::new().bg(theme.accent).fg(on_color(theme.accent)))
-        .highlight_symbol("❯ ");
+        .highlight_style(selection_style(&theme))
+        .highlight_symbol("▎ ");
 
     let mut state = ListState::default();
     state.select(Some(selected));
@@ -1124,6 +1298,161 @@ fn draw_model_picker(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_permissions(frame: &mut Frame, app: &App) {
+    let theme = app.theme;
+    let root = frame.area();
+    draw_modal_scrim(frame, &theme, root);
+    let items = PERMISSION_PRESETS
+        .iter()
+        .map(|preset| {
+            let current = app.policy.matching_preset() == Some(*preset);
+            let marker = if current { "  ✓ current" } else { "" };
+            ListItem::new(Line::from(vec![
+                Span::styled(preset.label(), Style::new().fg(theme.secondary)),
+                Span::styled(marker, Style::new().fg(theme.dim)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let area = modal_area(frame.area(), 76, 13);
+    frame.render_widget(Clear, area);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(theme.border))
+        .padding(Padding::horizontal(1))
+        .title(Line::styled(
+            " Permissions ",
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    if area.width >= 38 {
+        block = block.title_bottom(
+            Line::styled(
+                " ↑↓ move · Enter select · Esc close ",
+                Style::new().fg(theme.dim),
+            )
+            .alignment(Alignment::Right),
+        );
+    }
+    if let Some(surface) = theme.surface {
+        block = block.style(Style::new().bg(surface).fg(theme.fg));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let list_height = (PERMISSION_PRESETS.len() as u16).min(inner.height);
+    let [list_area, detail_area] =
+        Layout::vertical([Constraint::Length(list_height), Constraint::Min(0)]).areas(inner);
+    let list = List::new(items)
+        .highlight_style(selection_style(&theme))
+        .highlight_symbol("▎ ");
+    let mut state = ListState::default();
+    state.select(Some(
+        app.permission_index
+            .min(PERMISSION_PRESETS.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    if detail_area.height > 0 {
+        let selected = PERMISSION_PRESETS[app
+            .permission_index
+            .min(PERMISSION_PRESETS.len().saturating_sub(1))];
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::styled(
+                    "DETAIL",
+                    Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(selected.description(), Style::new().fg(theme.secondary)),
+            ])
+            .wrap(Wrap { trim: true }),
+            detail_area,
+        );
+    }
+}
+
+fn draw_full_access_confirmation(frame: &mut Frame, app: &App) {
+    let theme = app.theme;
+    let root = frame.area();
+    draw_modal_scrim(frame, &theme, root);
+    let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
+    let area = modal_area(frame.area(), 76, 10);
+    frame.render_widget(Clear, area);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(theme.border))
+        .padding(Padding::horizontal(1))
+        .title(Line::styled(
+            " Full Access ",
+            Style::new().fg(theme.error).add_modifier(Modifier::BOLD),
+        ));
+    if let Some(surface) = theme.surface {
+        block = block.style(Style::new().bg(surface).fg(theme.fg));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let action_height = inner.height.min(2);
+    let [body_area, action_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(action_height)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(
+            "The agent can edit any file and use the network without asking. This can expose or delete data.",
+        )
+        .style(Style::new().fg(warning))
+        .wrap(Wrap { trim: true }),
+        body_area,
+    );
+    let safe = if app.full_access_enable_selected {
+        "  "
+    } else {
+        "▎ "
+    };
+    let danger = if app.full_access_enable_selected {
+        "▎ "
+    } else {
+        "  "
+    };
+    let safe_hint = if app.full_access_enable_selected {
+        "  Esc"
+    } else {
+        "  Enter · Esc"
+    };
+    let danger_hint = if app.full_access_enable_selected {
+        "  Enter"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(safe, Style::new().fg(theme.accent)),
+                Span::styled(
+                    "Go back",
+                    Style::new()
+                        .fg(theme.secondary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(safe_hint, Style::new().fg(theme.dim)),
+            ]),
+            Line::from(vec![
+                Span::styled(danger, Style::new().fg(theme.error)),
+                Span::styled(
+                    "Enable full access",
+                    Style::new().fg(theme.error).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(danger_hint, Style::new().fg(theme.dim)),
+            ]),
+        ]),
+        action_area,
+    );
+}
+
 fn draw_session_picker(frame: &mut Frame, app: &App) {
     let theme = app.theme;
     let items: Vec<ListItem> = app
@@ -1139,7 +1468,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App) {
             ];
             // Sessions from other working directories are listed after the
             // current project's, badged with where they came from.
-            if crate::app::session_is_foreign(s) {
+            if crate::app::session_is_foreign_at(s, app.policy.workspace().cwd()) {
                 if let Some(cwd) = &s.cwd {
                     spans.push(Span::styled(
                         format!("  ·  {}", short_dir(cwd)),
@@ -1197,6 +1526,8 @@ fn draw_overlay_list(
     items: Vec<ListItem>,
     selected: usize,
 ) {
+    let root = frame.area();
+    draw_modal_scrim(frame, theme, root);
     let preferred_height = (items.len() as u16 + 2).clamp(5, 22);
     let area = modal_area(frame.area(), 76, preferred_height);
     frame.render_widget(Clear, area);
@@ -1204,8 +1535,8 @@ fn draw_overlay_list(
     let empty = items.is_empty();
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.accent))
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(theme.border))
         .padding(Padding::horizontal(1))
         .title(Line::styled(
             title,
@@ -1225,8 +1556,8 @@ fn draw_overlay_list(
     }
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::new().bg(theme.accent).fg(on_color(theme.accent)))
-        .highlight_symbol("❯ ");
+        .highlight_style(selection_style(theme))
+        .highlight_symbol("▎ ");
 
     let mut state = ListState::default();
     state.select((!empty).then_some(selected));
@@ -1235,6 +1566,8 @@ fn draw_overlay_list(
 
 fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
     let theme = app.theme;
+    let root = frame.area();
+    draw_modal_scrim(frame, &theme, root);
     let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
     let tasks = app.orchestration_plan();
     let workers = tasks.len();
@@ -1252,8 +1585,8 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
 
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(warning))
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(theme.border))
         .padding(Padding::horizontal(1))
         .title(Line::styled(
             if focused {
@@ -1496,21 +1829,29 @@ fn draw_approval(frame: &mut Frame, app: &mut App) {
             ..frame.area()
         }
     };
+    draw_modal_scrim(frame, &theme, modal_root);
     let area = modal_area(modal_root, 96, 24);
     frame.render_widget(Clear, area);
+    let approval_title = if area.width < 56 {
+        if approval_focused {
+            " tool approval "
+        } else {
+            " approval · Tab to review "
+        }
+    } else if approval_focused {
+        " review tool request · approval focus "
+    } else if queue_occupied {
+        " review tool request · press Tab "
+    } else {
+        " review tool request · composer focus "
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(warning))
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(theme.border))
         .padding(Padding::horizontal(1))
         .title(Line::styled(
-            if approval_focused {
-                " review tool request · approval focus "
-            } else if queue_occupied {
-                " review tool request · press Tab "
-            } else {
-                " review tool request · composer focus "
-            },
+            approval_title,
             Style::new().fg(warning).add_modifier(Modifier::BOLD),
         ));
     if let Some(surface) = theme.surface {
@@ -1825,20 +2166,14 @@ fn key_span(label: &'static str, color: Color) -> Span<'static> {
 
 fn draw_help(frame: &mut Frame, app: &App) {
     let theme = app.theme;
-    // The guide is intentionally a focused full-screen layer; clearing the
-    // underlying composer/status avoids a noisy double frame on 80×24 shells.
-    frame.render_widget(Clear, frame.area());
-    if let Some(bg) = theme.bg {
-        frame.render_widget(
-            Block::default().style(Style::new().bg(bg).fg(theme.fg)),
-            frame.area(),
-        );
-    }
-    let area = modal_area(frame.area(), 78, 20);
+    draw_modal_scrim(frame, &theme, frame.area());
+    let preferred_height = if frame.area().width < 68 { 12 } else { 20 };
+    let area = modal_area(frame.area(), 78, preferred_height);
+    frame.render_widget(Clear, area);
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.accent2))
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(theme.border))
         .padding(Padding::horizontal(1))
         .title(Line::styled(
             " keyboard guide ",
@@ -1864,7 +2199,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
     let key = |label: &'static str, action: &'static str| {
         Line::from(vec![
             Span::styled(
-                format!(" {label:<key_column$}"),
+                format!(" {label:<key_column$} "),
                 Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(action, Style::new().fg(theme.fg)),
@@ -1898,14 +2233,24 @@ fn draw_help(frame: &mut Frame, app: &App) {
             key("Ctrl+C", "restore queued, then quit"),
         ]
     } else if inner.height >= 8 {
+        let team = if inner.width >= 40 {
+            key("/team [2-4]", "lead + read-only workers")
+        } else {
+            key("/team", "lead + workers")
+        };
+        let approval = if inner.width >= 40 {
+            key("Tab · y/a/n", "approval choices")
+        } else {
+            key("Tab · y/a/n", "approve / deny")
+        };
         vec![
             key("Enter", "send / queue next"),
             key("Alt+Enter", "newline"),
-            key("/team [2-4]", "lead + read-only workers"),
+            team,
             key("/", "commands"),
             key("PgUp/PgDn", "scroll"),
             key("Esc", "cancel / deny"),
-            key("Tab · y/a/n", "approval choices"),
+            approval,
             key("Ctrl+C", "queue-safe quit"),
         ]
     } else {
@@ -1945,6 +2290,23 @@ fn modal_area(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
     }
 }
 
+fn draw_modal_scrim(frame: &mut Frame, _theme: &Theme, area: Rect) {
+    let buffer = frame.buffer_mut();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let cell = &mut buffer[(x, y)];
+            if !cell.symbol().is_empty()
+                && cell.symbol().chars().all(|symbol| {
+                    matches!(symbol, '─' | '│' | '┌' | '┐' | '└' | '┘' | '━' | '╾' | '▎')
+                })
+            {
+                cell.set_symbol(" ");
+            }
+        }
+    }
+    buffer.set_style(area, Style::new().add_modifier(Modifier::DIM));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1971,8 +2333,6 @@ mod tests {
             compact_threshold_chars: 80_000,
             ollama_num_ctx: 16_384,
             theme: None,
-            claude_code_bypass_permissions: false,
-            codex_full_access: false,
             reduced_motion: false,
         };
         let (tx, _rx) = unbounded_channel();
@@ -2006,9 +2366,9 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let transcript = Rect::new(
             0,
-            0,
+            2,
             buffer.area.width,
-            buffer.area.height.saturating_sub(4),
+            buffer.area.height.saturating_sub(5),
         );
         let Some(region) = mascot_region(transcript) else {
             return false;
@@ -2088,7 +2448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inline_mascot_and_worker_card_render_at_standard_size() {
+    async fn standard_working_view_uses_the_seal_instead_of_floating_art() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Orchestrating;
@@ -2104,13 +2464,13 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
+        assert!(rendered.contains("SB"), "{rendered}");
+        assert!(rendered.contains("SHALTAIBOLTAI"), "{rendered}");
         assert!(!rendered.contains("REAL AGENT"), "{rendered}");
         assert!(!rendered.contains("DANCING"), "{rendered}");
-        assert!(has_inline_mascot(&terminal), "{rendered}");
-        assert!(rendered.contains("RUNNING"), "{rendered}");
+        assert!(!has_inline_mascot(&terminal), "{rendered}");
         assert!(
-            rendered.contains("AGENT · team-test · ollama"),
+            rendered.contains("agent · running · team-test · ollama"),
             "{rendered}"
         );
         assert!(rendered.contains("read-only sandbox"), "{rendered}");
@@ -2125,10 +2485,10 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
+        assert!(rendered.contains("SB"), "{rendered}");
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
         assert!(!has_inline_mascot(&terminal), "{rendered}");
-        assert!(rendered.contains("TEAM"), "{rendered}");
+        assert!(rendered.contains("team working"), "{rendered}");
     }
 
     #[tokio::test]
@@ -2141,6 +2501,18 @@ mod tests {
         let native = native_mascot();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(!has_native_graphics(&terminal));
+
+        app.mode = Mode::Input;
+        app.transcript = vec![Entry::Banner {
+            title: "Ready to build".into(),
+            subtitle: "Describe a change.".into(),
+        }];
+        app.transcript_rev += 1;
+        terminal.backend_mut().resize(200, 70);
         terminal
             .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
             .unwrap();
@@ -2158,13 +2530,13 @@ mod tests {
             .unwrap();
         assert!(!has_native_graphics(&terminal));
 
-        app.mode = Mode::Streaming;
+        app.mode = Mode::Input;
         terminal.backend_mut().resize(60, 20);
         terminal
             .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
             .unwrap();
         assert!(!has_native_graphics(&terminal));
-        assert!(screen(&terminal).contains("◆ shaltaiboltai"));
+        assert!(screen(&terminal).contains("SB"));
     }
 
     #[tokio::test]
@@ -2224,20 +2596,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_and_reduced_motion_keep_a_static_inline_mascot() {
+    async fn only_the_large_idle_hero_keeps_static_mascot_art() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
-        app.transcript.clear();
-        app.transcript_rev += 1;
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(200, 70)).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(has_inline_mascot(&terminal));
 
-        app.mode = Mode::Streaming;
         app.config.reduced_motion = true;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let area = mascot_region(Rect::new(0, 0, 80, 20)).expect("mascot area");
+        let area = mascot_region(Rect::new(0, 2, 200, 65)).expect("mascot area");
         let before = buffer_region(&terminal, area);
         app.advance_animation();
         app.advance_animation();
@@ -2259,6 +2628,12 @@ mod tests {
             .unwrap();
         assert!(has_native_graphics(&terminal));
         assert_eq!(app.animation_tick(), 0);
+
+        app.mode = Mode::Streaming;
+        terminal
+            .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
+            .unwrap();
+        assert!(!has_native_graphics(&terminal));
     }
 
     #[tokio::test]
@@ -2270,11 +2645,11 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("◆ shaltaiboltai"), "{rendered}");
+        assert!(rendered.contains("SB"), "{rendered}");
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
         assert!(!has_inline_mascot(&terminal), "{rendered}");
         assert!(rendered.contains("Ready to build"), "{rendered}");
-        assert!(rendered.contains("TEAM"), "{rendered}");
+        assert!(rendered.contains("team working"), "{rendered}");
         assert!(rendered.contains("next message"), "{rendered}");
     }
 
@@ -2355,7 +2730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn working_pose_advances_without_touching_transcript_cache_or_scroll() {
+    async fn working_animation_keeps_large_art_hidden_and_cache_stable() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Orchestrating;
@@ -2366,22 +2741,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!has_inline_mascot(&terminal));
         app.scroll_from_bottom = 7;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let conversation = Rect::new(0, 0, 80, 20);
-        let mascot_area = mascot_region(conversation).expect("mascot area");
-        let mut before = buffer_region(&terminal, conversation);
-        for (index, position) in conversation
-            .rows()
-            .flat_map(|row| row.columns())
-            .enumerate()
-        {
-            if mascot_area.contains(position.into()) {
-                before[index] = (String::new(), Color::Reset, Color::Reset, Modifier::empty());
-            }
-        }
-        let before_stable = before;
-        let mascot_before = buffer_region(&terminal, mascot_area);
         let cache_len = app.render_cache.len();
         let cache_starts = app.render_cache_starts.clone();
         let cache_total = app.render_cache_total_lines;
@@ -2392,27 +2754,12 @@ mod tests {
         app.advance_animation();
         app.advance_animation();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let mut after = buffer_region(&terminal, conversation);
-        for (x, position) in conversation
-            .rows()
-            .flat_map(|row| row.columns())
-            .enumerate()
-        {
-            if mascot_area.contains(position.into()) {
-                after[x] = (String::new(), Color::Reset, Color::Reset, Modifier::empty());
-            }
-        }
-        let after_stable = after;
-        let mascot_after = buffer_region(&terminal, mascot_area);
-
-        assert_eq!(before_stable, after_stable);
-        assert_ne!(mascot_before, mascot_after);
+        assert!(!has_inline_mascot(&terminal));
         assert_eq!(app.render_cache.len(), cache_len);
         assert_eq!(app.render_cache_starts, cache_starts);
         assert_eq!(app.render_cache_total_lines, cache_total);
         assert_eq!(app.render_cache_rev, cache_rev);
         assert_eq!(app.scroll_from_bottom, scroll);
-        assert!(has_inline_mascot(&terminal));
     }
 
     #[tokio::test]
@@ -2450,13 +2797,10 @@ mod tests {
         for selected in theme::all() {
             let mut app = test_app();
             app.theme = *selected;
-            app.mode = Mode::Orchestrating;
-            app.transcript.clear();
-            app.transcript_rev += 1;
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(200, 70)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
-            let mascot_cells = mascot_region(Rect::new(0, 0, 80, 20))
+            let mascot_cells = mascot_region(Rect::new(0, 2, 200, 65))
                 .expect("mascot area")
                 .rows()
                 .flat_map(|row| row.columns())
@@ -2489,7 +2833,7 @@ mod tests {
                         "terminal mascot missing {expected:?}"
                     );
                 }
-                assert_eq!(buffer[(1, 1)].bg, Color::Reset);
+                assert_eq!(buffer[(1, 3)].bg, Color::Reset);
                 continue;
             }
             for (label, present) in [

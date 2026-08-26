@@ -1,6 +1,8 @@
-use shaltaiboltai::{app, config, mascot, ui};
+#[cfg(target_os = "linux")]
+use shaltaiboltai::sandbox;
+use shaltaiboltai::{app, cli, config, images, mascot, policy, ui};
 
-use app::{App, AppEvent, Mode};
+use app::{App, AppEvent, Mode, PermissionOverlay};
 use config::Config;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -8,20 +10,32 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use futures_util::StreamExt;
+use policy::{ApprovalPolicy, ExecutionPolicy, SandboxMode, Workspace};
+use std::path::{Path, PathBuf};
 
 const HELP: &str = "\
 shaltaiboltai — a multi-provider agentic coding TUI
 
 USAGE:
-    shaltaiboltai [OPTIONS]
+    shaltaiboltai [OPTIONS] [PROMPT]
 
 OPTIONS:
-    -h, --help       Print this help and exit
-    -V, --version    Print version and exit
+    -m, --model <MODEL>               Override the configured model
+    -C, --cd <DIR>                    Set the working directory
+        --add-dir <DIR>               Add a writable workspace root (repeatable)
+    -s, --sandbox <MODE>              read-only | workspace-write | danger-full-access
+    -a, --ask-for-approval <POLICY>   on-request | never
+    -i, --image <PATH,...>            Attach startup images (repeatable)
+        --full-auto                   workspace-write with on-request approval
+        --dangerously-bypass-approvals-and-sandbox
+                                      Full disk/network access without approvals
+        --no-alt-screen               Keep terminal scrollback visible
+    -h, --help                        Print this help and exit
+    -V, --version                     Print version and exit
 
 With no options it launches the interactive TUI. Configure providers via
 ANTHROPIC_API_KEY / OPENAI_API_KEY / a running Ollama, or a logged-in
-`claude` / `codex` CLI for subscription use. See the README for details.";
+`claude` / `codex` CLI for subscription use on Unix. See the README for details.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalDecision {
@@ -49,48 +63,178 @@ fn approval_decision(key: &KeyEvent) -> Option<ApprovalDecision> {
 async fn main() -> anyhow::Result<()> {
     // Handle non-interactive flags before touching the terminal, so the binary
     // behaves like a normal CLI in pipes and scripts.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    let options = match cli::parse_args(std::env::args_os().skip(1)) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}\n\n{HELP}");
+            std::process::exit(2);
+        }
+    };
+    if options.sandbox_seccomp_command.is_some() {
+        #[cfg(target_os = "linux")]
+        {
+            let command = options
+                .sandbox_seccomp_command
+                .as_deref()
+                .expect("checked above");
+            sandbox::exec_linux_seccomp_shell(command)?;
+            unreachable!("successful sandbox helper execution replaces the process");
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("the internal seccomp child stage is only available on Linux");
+    }
+    if options.help {
         println!("{HELP}");
         return Ok(());
     }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
+    if options.version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if let Some(unknown) = args.first() {
-        eprintln!("error: unrecognized argument `{unknown}`\n\n{HELP}");
-        std::process::exit(2);
-    }
 
-    let mut terminal = ratatui::init();
+    let launch_cwd = std::env::current_dir()?;
+    let (execution_policy, warning) = resolve_launch_policy(&options, &launch_cwd)?;
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+    let startup_images = load_startup_images(&options.images, execution_policy.workspace().cwd())?;
+    let mut launch_config = Config::load();
+    if let Some(model) = &options.model {
+        launch_config.default_model = Some(model.clone());
+    }
+    let no_alt_screen = options.no_alt_screen;
+    let mut terminal = if no_alt_screen {
+        let height = crossterm::terminal::size()?.1.max(1);
+        ratatui::init_with_options(ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Inline(height),
+        })
+    } else {
+        ratatui::init()
+    };
     // Detect direct Ghostty/Kitty sessions after alternate-screen setup and
     // before EventStream starts. Unsupported/error paths keep the deterministic
     // half-block mascot without a blocking terminal capability query.
     let native_mascot = mascot::NativeMascot::detect().ok().flatten();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
-    let result = run(&mut terminal, native_mascot.as_ref()).await;
+    let result = run(
+        &mut terminal,
+        native_mascot.as_ref(),
+        launch_config,
+        execution_policy,
+        startup_images,
+        options.prompt,
+    )
+    .await;
     // Remove Kitty placeholder cells before leaving the alternate screen.
     // The terminal then releases every virtual placement owned by this UI.
     if let Some(native_mascot) = &native_mascot {
         let _ = native_mascot.clear();
     }
-    let _ = terminal.clear();
+    if !no_alt_screen {
+        let _ = terminal.clear();
+    }
     let _ = execute!(
         std::io::stdout(),
         DisableMouseCapture,
         DisableBracketedPaste
     );
-    ratatui::restore();
+    if no_alt_screen {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = terminal.show_cursor();
+    } else {
+        ratatui::restore();
+    }
     result
+}
+
+fn resolve_launch_policy(
+    options: &cli::LaunchOptions,
+    launch_cwd: &Path,
+) -> anyhow::Result<(ExecutionPolicy, Option<String>)> {
+    let selected_cwd = options.cwd.as_ref().map_or_else(
+        || launch_cwd.to_path_buf(),
+        |cwd| {
+            if cwd.is_absolute() {
+                cwd.clone()
+            } else {
+                launch_cwd.join(cwd)
+            }
+        },
+    );
+    let (sandbox, approval) = if options.dangerously_bypass_approvals_and_sandbox {
+        (SandboxMode::DangerFullAccess, ApprovalPolicy::Never)
+    } else if options.full_auto {
+        (SandboxMode::WorkspaceWrite, ApprovalPolicy::OnRequest)
+    } else {
+        let sandbox = match options.sandbox_mode {
+            Some(cli::SandboxMode::ReadOnly) => SandboxMode::ReadOnly,
+            Some(cli::SandboxMode::WorkspaceWrite) => SandboxMode::WorkspaceWrite,
+            Some(cli::SandboxMode::DangerFullAccess) => SandboxMode::DangerFullAccess,
+            None => SandboxMode::WorkspaceWrite,
+        };
+        let approval = match options.approval_policy {
+            Some(cli::ApprovalPolicy::OnRequest) | None => ApprovalPolicy::OnRequest,
+            Some(cli::ApprovalPolicy::Never) => ApprovalPolicy::Never,
+        };
+        (sandbox, approval)
+    };
+    let ignore_additional_dirs =
+        !options.additional_writable_dirs.is_empty() && sandbox == SandboxMode::ReadOnly;
+    let additional_dirs = if ignore_additional_dirs {
+        &[][..]
+    } else {
+        options.additional_writable_dirs.as_slice()
+    };
+    let workspace = Workspace::from_roots(&selected_cwd, additional_dirs)?;
+    let warning = ignore_additional_dirs
+        .then(|| "--add-dir is ignored because the selected sandbox is read-only".to_owned());
+    Ok((
+        ExecutionPolicy::from_parts(workspace, sandbox, approval),
+        warning,
+    ))
+}
+
+fn load_startup_images(
+    paths: &[PathBuf],
+    cwd: &Path,
+) -> anyhow::Result<Vec<(String, shaltaiboltai::providers::ImageData)>> {
+    paths
+        .iter()
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            };
+            images::load_image(&path).map_err(|error| anyhow::anyhow!("{error:#}"))
+        })
+        .collect()
 }
 
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     native_mascot: Option<&mascot::NativeMascot>,
+    config: Config,
+    execution_policy: ExecutionPolicy,
+    startup_images: Vec<(String, shaltaiboltai::providers::ImageData)>,
+    initial_prompt: Option<String>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-    let mut app = App::new(Config::load(), tx);
+    let mut app = App::with_policy(config, execution_policy, tx);
+    if !startup_images.is_empty() {
+        let names = startup_images
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        app.pending_images.extend(startup_images);
+        app.transcript
+            .push(app::Entry::Info(format!("attached: {names}")));
+    }
+    let mut pending_initial_prompt = initial_prompt;
+    if let Some(prompt) = &pending_initial_prompt {
+        app.textarea.insert_str(prompt);
+    }
     let mut term_events = EventStream::new();
     let mut animation = tokio::time::interval(std::time::Duration::from_millis(120));
     animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -102,6 +246,7 @@ async fn run(
     environment.tick().await;
 
     while !app.should_quit {
+        submit_initial_prompt_when_ready(&mut app, &mut pending_initial_prompt);
         terminal.draw(|frame| {
             if let Some(native_mascot) = native_mascot {
                 ui::draw_with_native_mascot(frame, &mut app, native_mascot);
@@ -143,6 +288,25 @@ async fn run(
     Ok(())
 }
 
+fn submit_initial_prompt_when_ready(app: &mut App, pending: &mut Option<String>) {
+    let Some(expected) = pending.as_deref() else {
+        return;
+    };
+    let current = app.textarea.lines().join("\n");
+    if current != expected {
+        *pending = None;
+        return;
+    }
+    if expected.trim().is_empty() {
+        *pending = None;
+        return;
+    }
+    if expected.trim_start().starts_with('/') || app.model.is_some() {
+        app.submit_input();
+        *pending = None;
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     // Global bindings, regardless of mode.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -171,6 +335,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         && app.composer_accepts_input()
     {
         app.open_help();
+        return;
+    }
+    if app.permission_overlay.is_some() {
+        handle_permission_key(app, key);
         return;
     }
     match app.mode {
@@ -238,7 +406,30 @@ fn handle_active_key(app: &mut App, key: KeyEvent) {
         handle_scroll_key(app, key);
         return;
     }
+    if key.code == KeyCode::Enter && app.submit_active_local_command() {
+        return;
+    }
     handle_lookahead_composer_key(app, key);
+}
+
+fn handle_permission_key(app: &mut App, key: KeyEvent) {
+    match app.permission_overlay {
+        Some(PermissionOverlay::Picker) => match key.code {
+            KeyCode::Esc => app.close_permissions(),
+            KeyCode::Enter => app.select_permission(),
+            KeyCode::Up => app.permission_move(-1),
+            KeyCode::Down => app.permission_move(1),
+            _ => {}
+        },
+        Some(PermissionOverlay::FullAccessConfirm) => match key.code {
+            KeyCode::Esc => app.cancel_full_access_confirmation(),
+            KeyCode::Up | KeyCode::Left => app.move_full_access_confirmation(-1),
+            KeyCode::Down | KeyCode::Right => app.move_full_access_confirmation(1),
+            KeyCode::Enter => app.activate_full_access_confirmation(),
+            _ => {}
+        },
+        None => {}
+    }
 }
 
 fn handle_approval_key(app: &mut App, key: KeyEvent) {
@@ -387,6 +578,14 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
 /// One line per event: trackpads emit a dense, velocity-scaled event stream,
 /// so larger steps multiply the speed and feel chunky rather than faster.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.permission_overlay == Some(PermissionOverlay::Picker) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.permission_move(-1),
+            MouseEventKind::ScrollDown => app.permission_move(1),
+            _ => {}
+        }
+        return;
+    }
     if app.mode == Mode::Approval {
         match mouse.kind {
             MouseEventKind::ScrollUp => app.approval_scroll = app.approval_scroll.saturating_sub(1),
@@ -469,8 +668,6 @@ mod tests {
             compact_threshold_chars: 80_000,
             ollama_num_ctx: 16_384,
             theme: None,
-            claude_code_bypass_permissions: false,
-            codex_full_access: false,
             reduced_motion: false,
         };
         let (tx, _rx) = unbounded_channel();
@@ -529,6 +726,53 @@ mod tests {
             approval_decision(&KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL)),
             Some(ApprovalDecision::Deny)
         );
+    }
+
+    #[test]
+    fn read_only_additional_directories_are_ignored_with_a_warning() {
+        let workspace = std::env::temp_dir().join(format!(
+            "shaltai-read-only-cli-{}",
+            shaltaiboltai::session::new_id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("test workspace");
+        let options = cli::parse_args(["--sandbox", "read-only", "--add-dir", "missing-directory"])
+            .expect("valid CLI options");
+
+        let (policy, warning) =
+            resolve_launch_policy(&options, &workspace).expect("read-only launch policy");
+
+        assert_eq!(policy.sandbox_mode(), SandboxMode::ReadOnly);
+        assert_eq!(policy.workspace().effective_user_visible_roots().len(), 1);
+        assert!(warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("--add-dir") && warning.contains("ignored")));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn positional_prompt_waits_for_a_model_then_submits_once() {
+        let mut app = test_app();
+        app.model = None;
+        app.textarea.insert_str("inspect this workspace");
+        let mut pending = Some("inspect this workspace".to_owned());
+
+        submit_initial_prompt_when_ready(&mut app, &mut pending);
+        assert!(pending.is_some());
+        assert_eq!(app.textarea.lines().join("\n"), "inspect this workspace");
+
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "startup-prompt-test".into(),
+        });
+        submit_initial_prompt_when_ready(&mut app, &mut pending);
+        assert!(pending.is_none());
+        assert!(app.input_is_empty());
+        assert!(app.history.iter().any(|message| matches!(
+            message,
+            shaltaiboltai::providers::Message::User(content)
+                if content.text() == "inspect this workspace"
+        )));
+        app.cancel_request();
     }
 
     #[tokio::test]
@@ -701,6 +945,7 @@ mod tests {
     #[tokio::test]
     async fn newly_arrived_approval_cannot_consume_typed_decision_letters() {
         let mut app = test_app();
+        app.policy.apply_preset(policy::PermissionPreset::ReadOnly);
         app.mode = Mode::Streaming;
         handle_key(
             &mut app,
@@ -740,6 +985,7 @@ mod tests {
     #[tokio::test]
     async fn escape_denies_an_approval_without_releasing_the_queued_prompt() {
         let mut app = test_app();
+        app.policy.apply_preset(policy::PermissionPreset::ReadOnly);
         app.mode = Mode::Streaming;
         app.textarea.insert_str("next request");
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -765,5 +1011,38 @@ mod tests {
         assert_eq!(app.queued_prompt_count(), 1);
         assert_eq!(app.mode, Mode::Streaming);
         app.cancel_request();
+    }
+
+    #[tokio::test]
+    async fn full_access_requires_an_explicit_destructive_selection() {
+        let mut app = test_app();
+        app.open_permissions();
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.permission_overlay,
+            Some(PermissionOverlay::FullAccessConfirm)
+        );
+        assert!(!app.full_access_enable_selected);
+
+        // Enter activates the preselected safe action and cannot silently
+        // broaden authority.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.permission_overlay, Some(PermissionOverlay::Picker));
+        assert_ne!(
+            app.policy.matching_preset(),
+            Some(policy::PermissionPreset::FullAccess)
+        );
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.full_access_enable_selected);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.policy.matching_preset(),
+            Some(policy::PermissionPreset::FullAccess)
+        );
+        assert!(app.permission_overlay.is_none());
     }
 }
