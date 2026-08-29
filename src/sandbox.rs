@@ -182,7 +182,7 @@ impl ShellCleanupGuard {
         {
             let mut guard = self;
             let targets = std::mem::take(&mut guard.targets);
-            return cleanup_synthetic_mount_targets(&targets);
+            cleanup_synthetic_mount_targets(&targets)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -1046,10 +1046,12 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     struct OutsideFile {
         path: PathBuf,
     }
 
+    #[cfg(target_os = "macos")]
     impl OutsideFile {
         fn new(label: &str) -> Option<Self> {
             let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
@@ -1069,6 +1071,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for OutsideFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);

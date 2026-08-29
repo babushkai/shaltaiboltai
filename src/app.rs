@@ -1981,8 +1981,7 @@ impl App {
             )
         } else {
             format!(
-                "{successful}/{} agents reported — Shaltaiboltai is continuing with partial evidence",
-                task_count
+                "{successful}/{task_count} agents reported — Shaltaiboltai is continuing with partial evidence"
             )
         }));
         self.mode = Mode::Input;
