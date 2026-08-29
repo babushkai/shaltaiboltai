@@ -23,7 +23,7 @@ cargo install --git https://github.com/babushkai/shaltaiboltai --locked
 
 Or clone and `cargo run --release`.
 
-On Linux, constrained `run_command` calls require Bubblewrap at `/usr/bin/bwrap` or `/bin/bwrap`. The app fails closed if the backend is unavailable; install the `bubblewrap` package with your distribution's package manager. macOS uses the system Seatbelt backend.
+On Linux, constrained `run_command` calls require Bubblewrap at `/usr/bin/bwrap` or `/bin/bwrap`. The app fails closed if the backend is unavailable; install the `bubblewrap` package with your distribution's package manager. Ubuntu 24.04 hosts that restrict unprivileged user namespaces must also load the distribution's capability-dropping `bwrap-userns-restrict` AppArmor profile from `apparmor-profiles`; do not disable AppArmor globally. Shaltaiboltai never retries a constrained command outside the boundary. macOS uses the system Seatbelt backend.
 
 Providers are auto-discovered at startup:
 

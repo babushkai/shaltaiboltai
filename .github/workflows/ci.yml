@@ -22,19 +22,40 @@ jobs:
         os: [ubuntu-latest, macos-14]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
 
-      - name: Install Linux sandbox backend
+      - name: Install and verify Linux sandbox backend
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap apparmor-profiles apparmor-utils
+          # Ubuntu 24.04 otherwise withholds Bubblewrap's network-namespace
+          # setup capability. This packaged profile drops it again for children.
+          sudo install -m 0644 \
+            /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          /usr/bin/bwrap \
+            --die-with-parent \
+            --new-session \
+            --unshare-user \
+            --unshare-ipc \
+            --unshare-pid \
+            --unshare-net \
+            --unshare-uts \
+            --unshare-cgroup-try \
+            --ro-bind / / \
+            --proc /proc \
+            --dev /dev \
+            -- /bin/true
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -63,13 +84,13 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

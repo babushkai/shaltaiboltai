@@ -173,9 +173,36 @@ async fn production_linux_boundary_enforces_read_write_metadata_network_and_clea
     drop(listener);
     std::fs::remove_file(&socket_path).expect("remove host Unix socket");
 
+    let unix_sendmsg = "/usr/bin/python3 -c 'import errno,socket\n\
+a,b=socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM)\n\
+try:\n\
+ a.sendmsg([b\"denied\"])\n\
+except OSError as error:\n\
+ raise SystemExit(0 if error.errno == errno.EPERM else 2)\n\
+raise SystemExit(3)'";
+    let blocked_sendmsg = run(prepare(&workspace, &unix_sendmsg, application_binary)).await;
+    assert!(
+        blocked_sendmsg.status.success(),
+        "seccomp must reject message-oriented Unix socket I/O with EPERM: {blocked_sendmsg:?}"
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let x32 = run(prepare(
+            &workspace,
+            "/usr/bin/python3 -c 'import ctypes,errno; libc=ctypes.CDLL(None,use_errno=True); result=libc.syscall(0x40000000 | 39); raise SystemExit(0 if result == -1 and ctypes.get_errno() == errno.EPERM else 1)'",
+            application_binary,
+        ))
+        .await;
+        assert!(
+            x32.status.success(),
+            "seccomp must reject x32 syscall numbers before ABI dispatch: {x32:?}"
+        );
+    }
+
     let local_socketpair = run(prepare(
         &workspace,
-        "/usr/bin/python3 -c 'import socket; a,b=socket.socketpair(); a.send(b\"ok\"); assert b.recv(2)==b\"ok\"; print(\"socketpair-ok\")'",
+        "/usr/bin/python3 -c 'import os,socket; a,b=socket.socketpair(); os.write(a.fileno(),b\"ok\"); assert os.read(b.fileno(),2)==b\"ok\"; print(\"socketpair-ok\")'",
         application_binary,
     ))
     .await;

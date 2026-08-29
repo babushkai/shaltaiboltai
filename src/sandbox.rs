@@ -724,6 +724,39 @@ fn cleanup_synthetic_mount_targets(targets: &[SyntheticMountTarget]) -> Result<(
 /// system Bubblewrap installations rely on setuid setup. This process then
 /// replaces itself with the requested shell so every descendant inherits the
 /// network syscall filter.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x32_abi_guard() -> [seccompiler::sock_filter; 4] {
+    use seccompiler::sock_filter;
+
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+
+    let statement = |code: u32, k: u32| sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+
+    [
+        statement(
+            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+            SECCOMP_DATA_NR_OFFSET,
+        ),
+        sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: X32_SYSCALL_BIT,
+        },
+        statement(
+            libc::BPF_RET | libc::BPF_K,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+    ]
+}
+
 #[cfg(target_os = "linux")]
 pub fn exec_linux_seccomp_shell(command: &OsStr) -> Result<(), SandboxError> {
     use seccompiler::{
@@ -755,6 +788,7 @@ pub fn exec_linux_seccomp_shell(command: &OsStr) -> Result<(), SandboxError> {
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
+        libc::SYS_socket,
         libc::SYS_connect,
         libc::SYS_accept,
         libc::SYS_accept4,
@@ -764,7 +798,10 @@ pub fn exec_linux_seccomp_shell(command: &OsStr) -> Result<(), SandboxError> {
         libc::SYS_getsockname,
         libc::SYS_shutdown,
         libc::SYS_sendto,
+        libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
+        libc::SYS_recvfrom,
+        libc::SYS_recvmsg,
         libc::SYS_recvmmsg,
         libc::SYS_getsockopt,
         libc::SYS_setsockopt,
@@ -772,10 +809,10 @@ pub fn exec_linux_seccomp_shell(command: &OsStr) -> Result<(), SandboxError> {
         deny(&mut rules, syscall);
     }
 
-    // Process-local Unix socket pairs remain available for ordinary build
-    // tools. Creating Internet sockets is denied, and `connect` is denied for
-    // every family so host filesystem-backed Unix sockets cannot bypass the
-    // isolated network namespace.
+    // Standalone sockets and every operation that can address a host-visible
+    // socket are denied. Process-local Unix socket pairs remain available
+    // through read/write for ordinary build tools; message-oriented APIs stay
+    // blocked so descriptor passing cannot widen the boundary.
     let deny_non_unix = SeccompRule::new(vec![SeccompCondition::new(
         0,
         SeccompCmpArgLen::Dword,
@@ -784,7 +821,6 @@ pub fn exec_linux_seccomp_shell(command: &OsStr) -> Result<(), SandboxError> {
     )
     .map_err(sandbox_error)?])
     .map_err(sandbox_error)?;
-    rules.insert(libc::SYS_socket, vec![deny_non_unix.clone()]);
     rules.insert(libc::SYS_socketpair, vec![deny_non_unix]);
 
     let architecture = if cfg!(target_arch = "x86_64") {
@@ -805,6 +841,13 @@ pub fn exec_linux_seccomp_shell(command: &OsStr) -> Result<(), SandboxError> {
     )
     .map_err(sandbox_error)?;
     let program: BpfProgram = filter.try_into().map_err(sandbox_error)?;
+
+    // x32 shares AUDIT_ARCH_X86_64 but sets a high syscall-number bit. The
+    // seccompiler architecture check alone therefore cannot distinguish it
+    // from the native ABI. Reject the entire alternate ABI before installing
+    // the syscall-specific filter so raw x32 calls cannot bypass the denylist.
+    #[cfg(target_arch = "x86_64")]
+    apply_filter(&x32_abi_guard()).map_err(sandbox_error)?;
     apply_filter(&program).map_err(sandbox_error)?;
 
     let error = std::process::Command::new(SHELL)
