@@ -180,7 +180,7 @@ try:\n\
 except OSError as error:\n\
  raise SystemExit(0 if error.errno == errno.EPERM else 2)\n\
 raise SystemExit(3)'";
-    let blocked_sendmsg = run(prepare(&workspace, &unix_sendmsg, application_binary)).await;
+    let blocked_sendmsg = run(prepare(&workspace, unix_sendmsg, application_binary)).await;
     assert!(
         blocked_sendmsg.status.success(),
         "seccomp must reject message-oriented Unix socket I/O with EPERM: {blocked_sendmsg:?}"
