@@ -1,14 +1,22 @@
+use crate::policy::{
+    ApprovalPolicy, BoundaryAction, ExecutionPolicy, GrantBinding, PathClassification, SandboxMode,
+};
 use crate::providers::{ToolCall, ToolDef};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
@@ -18,7 +26,11 @@ const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SEARCH_VISITED_FILES: usize = 20_000;
 const MAX_SEARCH_DURATION: Duration = Duration::from_secs(10);
+const SEARCH_OUTPUT_LIMIT_MARKER: &str = "… search stopped at 32 KiB output limit";
 const MAX_DIFF_PREVIEW_LINES: usize = 40;
+const MAX_EDITABLE_FILE_BYTES: usize = 256 * 1024;
+const MAX_DIFF_INPUT_LINES: usize = 10_000;
+const MAX_DIFF_DURATION: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Copy)]
 struct SearchLimits {
@@ -62,6 +74,47 @@ struct CancelSearchOnDrop(Arc<AtomicBool>);
 impl Drop for CancelSearchOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pgid: libc::pid_t,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn new(child_id: u32) -> Result<Self> {
+        let pgid = libc::pid_t::try_from(child_id).context("child process id exceeds pid_t")?;
+        Ok(Self { pgid, armed: true })
+    }
+
+    fn terminate(&mut self) -> std::io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        // SAFETY: `pgid` came from the child we just spawned after configuring
+        // it as its own process-group leader. A negative pid targets only that
+        // group. ESRCH means the group has already exited.
+        if unsafe { libc::kill(-self.pgid, libc::SIGKILL) } == 0 {
+            self.armed = false;
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            self.armed = false;
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        let _ = self.terminate();
     }
 }
 
@@ -144,7 +197,16 @@ pub fn definitions() -> Vec<ToolDef> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The shell command to run."}
+                    "command": {"type": "string", "description": "The shell command to run."},
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"],
+                        "description": "Use the configured sandbox, or explicitly request execution outside it. Defaults to use_default."
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Optional concise reason shown when elevated execution is requested."
+                    }
                 },
                 "required": ["command"]
             }),
@@ -152,121 +214,350 @@ pub fn definitions() -> Vec<ToolDef> {
     ]
 }
 
-/// Mutating tools always require approval. Read-only tools are auto-approved
-/// only inside the working directory — reads outside it (dotfiles, keys,
-/// other projects) must be confirmed by the user before their contents are
-/// sent to a model provider.
-pub fn requires_approval(call: &ToolCall) -> bool {
-    match call.name.as_str() {
-        "write_file" | "edit_file" | "run_command" => true,
-        "read_file" | "list_directory" | "grep" | "glob" => {
-            let path = call.arguments["path"].as_str().unwrap_or(".");
-            !path_within_cwd(path)
-        }
-        _ => true,
+/// Whether a model-initiated tool can execute immediately, must be presented
+/// for a narrowly scoped user decision, or is forbidden by active policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// A fully resolved, policy-bound assessment. Callers may use `scope` to bind
+/// a [`GrantBinding`], but execution always recomputes this assessment so a
+/// retargeted symlink or changed policy invalidates the earlier decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolAssessment {
+    decision: ToolDecision,
+    scope: Vec<u8>,
+    canonical_target: Option<PathBuf>,
+    reason: Option<String>,
+    requires_escalation: bool,
+}
+
+impl ToolAssessment {
+    pub const fn decision(&self) -> ToolDecision {
+        self.decision
+    }
+
+    pub fn scope(&self) -> &[u8] {
+        &self.scope
+    }
+
+    pub fn canonical_target(&self) -> Option<&Path> {
+        self.canonical_target.as_deref()
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    /// True only for `run_command` calls that explicitly requested execution
+    /// outside the configured sandbox. An approval for an untrusted default
+    /// command deliberately leaves this false and keeps the command sandboxed.
+    pub const fn requires_escalation(&self) -> bool {
+        self.requires_escalation
     }
 }
 
-fn path_within_cwd(path: &str) -> bool {
-    let Ok(cwd) = std::env::current_dir() else {
-        return false;
-    };
-    path_within_root(&cwd, path)
+/// Explicit authority supplied to the execution boundary. Session approvals
+/// remain tied to the exact scope, authority instance, policy fingerprint, and
+/// policy generation recorded by [`ExecutionPolicy::bind_grant`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ToolAuthorization {
+    #[default]
+    Default,
+    Approved(GrantBinding),
 }
 
-/// Resolve an existing target (or its nearest existing parent) before deciding
-/// whether it belongs to the project. This closes the common `repo/link ->
-/// ~/.ssh` escape that a lexical `starts_with` check cannot see.
-fn path_within_root(root: &Path, path: &str) -> bool {
-    let Ok(root) = std::fs::canonicalize(root) else {
-        return false;
-    };
-    resolve_path(root.as_path(), path).is_some_and(|target| target.starts_with(root))
-}
-
-/// Produce a stable, narrowly scoped key for an "allow for this session"
-/// decision. File operations are limited to one resolved path, searches to
-/// their exact arguments, and shell access to one exact command.
-pub fn approval_scope(call: &ToolCall) -> String {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    approval_scope_in(&root, call)
-}
-
-fn approval_scope_in(root: &Path, call: &ToolCall) -> String {
-    let serialized_arguments =
-        || serde_json::to_string(&call.arguments).unwrap_or_else(|_| call.arguments.to_string());
-    let resolved_path = |raw: &str| {
-        std::fs::canonicalize(root)
-            .ok()
-            .and_then(|root| resolve_path(&root, raw))
-            .unwrap_or_else(|| PathBuf::from(raw))
-    };
-    match call.name.as_str() {
-        "read_file" | "write_file" | "edit_file" | "list_directory" => {
-            let raw = call.arguments["path"].as_str().unwrap_or(".");
-            let resolved = resolved_path(raw);
-            format!("{}\0{}", call.name, resolved.display())
-        }
-        "run_command" => format!(
-            "run_command\0{}",
-            call.arguments["command"].as_str().unwrap_or("")
-        ),
-        "grep" | "glob" => {
-            let raw = call.arguments["path"].as_str().unwrap_or(".");
-            format!(
-                "{}\0{}\0{}",
-                call.name,
-                resolved_path(raw).display(),
-                serialized_arguments()
-            )
-        }
-        _ => format!("{}\0{}", call.name, serialized_arguments()),
+impl ToolAuthorization {
+    pub fn approved(policy: &ExecutionPolicy, assessment: &ToolAssessment) -> Self {
+        Self::Approved(policy.bind_grant(assessment.scope.clone()))
     }
 }
 
-/// Human wording paired with [`approval_scope`] in the approval footer.
+/// Requested process authority for `run_command`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SandboxPermission {
+    #[default]
+    UseDefault,
+    RequireEscalated,
+}
+
+impl SandboxPermission {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UseDefault => "use_default",
+            Self::RequireEscalated => "require_escalated",
+        }
+    }
+}
+
+impl FromStr for SandboxPermission {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "use_default" => Ok(Self::UseDefault),
+            "require_escalated" => Ok(Self::RequireEscalated),
+            _ => Err(format!("invalid sandbox_permissions `{value}`")),
+        }
+    }
+}
+
+/// Assess a call solely against explicit runtime authority. No decision in
+/// this module consults the process working directory.
+pub fn assess(policy: &ExecutionPolicy, call: &ToolCall) -> ToolAssessment {
+    let args = &call.arguments;
+    match call.name.as_str() {
+        "read_file" => {
+            let Some(path) = required_string(args, "path") else {
+                return denied(policy, call, "missing required argument: path");
+            };
+            assess_path(policy, call, path, false, None)
+        }
+        "write_file" => {
+            let Some(path) = required_string(args, "path") else {
+                return denied(policy, call, "missing required argument: path");
+            };
+            if required_string(args, "content").is_none() {
+                return denied(policy, call, "missing required argument: content");
+            }
+            assess_path(policy, call, path, true, None)
+        }
+        "edit_file" => {
+            let Some(path) = required_string(args, "path") else {
+                return denied(policy, call, "missing required argument: path");
+            };
+            if required_string(args, "old_string").is_none() {
+                return denied(policy, call, "missing required argument: old_string");
+            }
+            if required_string(args, "new_string").is_none() {
+                return denied(policy, call, "missing required argument: new_string");
+            }
+            if args
+                .get("replace_all")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return denied(policy, call, "replace_all must be a boolean");
+            }
+            assess_path(policy, call, path, true, None)
+        }
+        "list_directory" => {
+            let Some(path) = optional_path(args) else {
+                return denied(policy, call, "path must be a string");
+            };
+            assess_path(policy, call, path, false, None)
+        }
+        "grep" => {
+            let Some(pattern) = required_string(args, "pattern") else {
+                return denied(policy, call, "missing required argument: pattern");
+            };
+            if let Err(error) = regex::Regex::new(pattern) {
+                return denied(policy, call, format!("invalid regex: {error}"));
+            }
+            let Some(path) = optional_path(args) else {
+                return denied(policy, call, "path must be a string");
+            };
+            assess_path(policy, call, path, false, Some(pattern))
+        }
+        "glob" => {
+            let Some(pattern) = required_string(args, "pattern") else {
+                return denied(policy, call, "missing required argument: pattern");
+            };
+            if let Err(error) = globset::GlobBuilder::new(pattern)
+                .literal_separator(false)
+                .build()
+            {
+                return denied(policy, call, format!("invalid glob pattern: {error}"));
+            }
+            let Some(path) = optional_path(args) else {
+                return denied(policy, call, "path must be a string");
+            };
+            assess_path(policy, call, path, false, Some(pattern))
+        }
+        "run_command" => assess_command(policy, call),
+        _ => denied(policy, call, format!("unknown tool: {}", call.name)),
+    }
+}
+
+fn assess_path(
+    policy: &ExecutionPolicy,
+    call: &ToolCall,
+    raw_path: &str,
+    write: bool,
+    search_pattern: Option<&str>,
+) -> ToolAssessment {
+    let classification = if write {
+        policy.classify_write(raw_path)
+    } else {
+        policy.classify_read(raw_path)
+    };
+    let classification = match classification {
+        Ok(classification) => classification,
+        Err(error) => return denied(policy, call, error.to_string()),
+    };
+    let scope = path_scope(policy, call, &classification, search_pattern);
+    ToolAssessment {
+        decision: decision_for(classification.action()),
+        scope,
+        canonical_target: Some(classification.target().to_path_buf()),
+        reason: decision_reason(classification.action(), write),
+        requires_escalation: false,
+    }
+}
+
+fn assess_command(policy: &ExecutionPolicy, call: &ToolCall) -> ToolAssessment {
+    let Some(command) = required_string(&call.arguments, "command") else {
+        return denied(policy, call, "missing required argument: command");
+    };
+    if call
+        .arguments
+        .get("justification")
+        .is_some_and(|value| !value.is_string())
+    {
+        return denied(policy, call, "justification must be a string");
+    }
+    let permission = match call.arguments.get("sandbox_permissions") {
+        None => SandboxPermission::UseDefault,
+        Some(Value::String(value)) => match value.parse() {
+            Ok(permission) => permission,
+            Err(error) => return denied(policy, call, error),
+        },
+        Some(_) => return denied(policy, call, "sandbox_permissions must be a string"),
+    };
+
+    let decision = match permission {
+        SandboxPermission::UseDefault if policy.approval_policy() == ApprovalPolicy::Untrusted => {
+            ToolDecision::Ask
+        }
+        SandboxPermission::UseDefault => ToolDecision::Allow,
+        SandboxPermission::RequireEscalated
+            if policy.sandbox_mode() == SandboxMode::DangerFullAccess =>
+        {
+            ToolDecision::Allow
+        }
+        SandboxPermission::RequireEscalated
+            if policy.approval_policy() == ApprovalPolicy::Never =>
+        {
+            ToolDecision::Deny
+        }
+        SandboxPermission::RequireEscalated => ToolDecision::Ask,
+    };
+    let reason = match decision {
+        ToolDecision::Allow => None,
+        ToolDecision::Ask if permission == SandboxPermission::RequireEscalated => {
+            Some("command requests execution outside the configured sandbox".into())
+        }
+        ToolDecision::Ask => Some("untrusted policy requires approval for shell commands".into()),
+        ToolDecision::Deny => {
+            Some("approval policy `never` forbids execution outside the configured sandbox".into())
+        }
+    };
+    let fingerprint = policy.fingerprint().to_string();
+    ToolAssessment {
+        decision,
+        scope: encoded_scope([
+            b"policy".as_slice(),
+            fingerprint.as_bytes(),
+            b"run_command".as_slice(),
+            permission.as_str().as_bytes(),
+            command.as_bytes(),
+        ]),
+        canonical_target: None,
+        reason,
+        requires_escalation: permission == SandboxPermission::RequireEscalated,
+    }
+}
+
+fn path_scope(
+    policy: &ExecutionPolicy,
+    call: &ToolCall,
+    classification: &PathClassification,
+    search_pattern: Option<&str>,
+) -> Vec<u8> {
+    let fingerprint = policy.fingerprint().to_string();
+    let mut fields = vec![
+        b"policy".as_slice(),
+        fingerprint.as_bytes(),
+        call.name.as_bytes(),
+        classification.target().as_os_str().as_encoded_bytes(),
+    ];
+    if let Some(pattern) = search_pattern {
+        fields.push(pattern.as_bytes());
+    }
+    encoded_scope(fields)
+}
+
+/// Length-prefix every field so scopes are unambiguous and preserve exact
+/// OS-native path bytes. In particular, never use `Path::display()` here:
+/// distinct non-UTF-8 paths can have the same lossy rendering.
+fn encoded_scope<'a>(fields: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut scope = Vec::new();
+    for field in fields {
+        scope.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        scope.extend_from_slice(field);
+    }
+    scope
+}
+
+fn decision_for(action: BoundaryAction) -> ToolDecision {
+    match action {
+        BoundaryAction::Allow => ToolDecision::Allow,
+        BoundaryAction::RequiresApproval => ToolDecision::Ask,
+        BoundaryAction::Deny => ToolDecision::Deny,
+    }
+}
+
+fn decision_reason(action: BoundaryAction, write: bool) -> Option<String> {
+    match action {
+        BoundaryAction::Allow => None,
+        BoundaryAction::RequiresApproval if write => {
+            Some("write crosses the active sandbox boundary".into())
+        }
+        BoundaryAction::RequiresApproval => Some("read crosses the active sandbox boundary".into()),
+        BoundaryAction::Deny => Some("active policy forbids this filesystem access".into()),
+    }
+}
+
+fn denied(policy: &ExecutionPolicy, call: &ToolCall, reason: impl Into<String>) -> ToolAssessment {
+    let serialized =
+        serde_json::to_string(&call.arguments).unwrap_or_else(|_| call.arguments.to_string());
+    let fingerprint = policy.fingerprint().to_string();
+    ToolAssessment {
+        decision: ToolDecision::Deny,
+        scope: encoded_scope([
+            b"policy".as_slice(),
+            fingerprint.as_bytes(),
+            call.name.as_bytes(),
+            b"invalid".as_slice(),
+            serialized.as_bytes(),
+        ]),
+        canonical_target: None,
+        reason: Some(reason.into()),
+        requires_escalation: false,
+    }
+}
+
+fn required_string<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
+}
+
+fn optional_path(args: &Value) -> Option<&str> {
+    match args.get("path") {
+        None => Some("."),
+        Some(Value::String(path)) => Some(path),
+        Some(_) => None,
+    }
+}
+
+/// Human wording paired with [`ToolAssessment::scope`] in the approval footer.
 pub fn approval_scope_label(call: &ToolCall) -> &'static str {
     match call.name.as_str() {
         "read_file" | "write_file" | "edit_file" | "list_directory" => "this path",
         "grep" | "glob" => "this search",
         "run_command" => "this exact command",
         _ => "these exact arguments",
-    }
-}
-
-/// Resolve symlinks in every existing portion of `path`, retaining any
-/// missing suffix. The latter matters for prospective write targets whose
-/// parent already exists (and may itself be a symlink).
-fn resolve_path(root: &Path, path: &str) -> Option<PathBuf> {
-    let p = Path::new(path);
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        root.join(p)
-    };
-    // Do not collapse `..` lexically before canonicalization: `link/..`
-    // follows the symlink first on the filesystem and can land somewhere very
-    // different from the lexical parent.
-    let mut cursor = abs.as_path();
-    let mut missing = Vec::<OsString>::new();
-
-    loop {
-        if let Ok(mut resolved) = std::fs::canonicalize(cursor) {
-            for component in missing.iter().rev() {
-                resolved.push(component);
-            }
-            return Some(resolved);
-        }
-        match std::fs::symlink_metadata(cursor) {
-            // An entry is present but cannot be canonicalized (most commonly
-            // a dangling symlink). Treat it as unsafe rather than pretending
-            // it is a missing in-project suffix.
-            Ok(_) => return None,
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return None,
-            Err(_) => {}
-        }
-        missing.push(cursor.file_name()?.to_owned());
-        cursor = cursor.parent()?;
     }
 }
 
@@ -304,26 +595,54 @@ pub fn describe(call: &ToolCall) -> String {
 
 /// Diff preview for the approval dialog: what the file change would do.
 /// Tags: '+' insert, '-' delete, ' ' context, '@' hunk header, '!' problem.
-pub fn approval_preview(call: &ToolCall) -> Option<Vec<(char, String)>> {
-    let path = call.arguments["path"].as_str()?;
+pub fn approval_preview(
+    assessment: &ToolAssessment,
+    call: &ToolCall,
+) -> Option<Vec<(char, String)>> {
+    let path = assessment.canonical_target()?;
     match call.name.as_str() {
         "write_file" => {
-            let old = std::fs::read_to_string(path).unwrap_or_default();
+            let old = match read_change_file_bounded(path, true) {
+                Ok(old) => old,
+                Err(error) => {
+                    return Some(vec![(
+                        '!',
+                        format!(
+                            "preview unavailable for {}: {error:#}; approval may overwrite the existing target without a diff",
+                            path.display()
+                        ),
+                    )]);
+                }
+            };
             let new = call.arguments["content"].as_str()?;
-            Some(diff_lines(&old, new))
+            Some(match diff_lines_bounded(&old, new) {
+                Ok(lines) => lines,
+                Err(error) => vec![(
+                    '!',
+                    format!(
+                        "preview unavailable for {}: {error:#}; approval may overwrite the target without a diff",
+                        path.display()
+                    ),
+                )],
+            })
         }
         "edit_file" => {
-            let old = match std::fs::read_to_string(path) {
+            let old = match read_change_file_bounded(path, false) {
                 Ok(s) => s,
-                Err(e) => return Some(vec![('!', format!("cannot read {path}: {e}"))]),
+                Err(e) => {
+                    return Some(vec![('!', format!("cannot read {}: {e}", path.display()))]);
+                }
             };
-            match apply_edit(
+            match apply_edit_bounded(
                 &old,
                 call.arguments["old_string"].as_str()?,
                 call.arguments["new_string"].as_str()?,
                 call.arguments["replace_all"].as_bool().unwrap_or(false),
             ) {
-                Ok(new) => Some(diff_lines(&old, &new)),
+                Ok(new) => Some(match diff_lines_bounded(&old, &new) {
+                    Ok(lines) => lines,
+                    Err(error) => vec![('!', format!("preview unavailable: {error:#}"))],
+                }),
                 Err(e) => Some(vec![('!', format!("{e:#}"))]),
             }
         }
@@ -331,8 +650,188 @@ pub fn approval_preview(call: &ToolCall) -> Option<Vec<(char, String)>> {
     }
 }
 
+fn read_change_file_bounded(path: &Path, missing_is_empty: bool) -> Result<String> {
+    let initial_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if missing_is_empty && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(String::new());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if !initial_metadata.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    if initial_metadata.len() > MAX_EDITABLE_FILE_BYTES as u64 {
+        anyhow::bail!(
+            "{} is {} bytes; editable files are limited to {} bytes",
+            path.display(),
+            initial_metadata.len(),
+            MAX_EDITABLE_FILE_BYTES
+        );
+    }
+
+    let (file, opened_metadata) = open_regular_file_nonblocking(path)?;
+    if opened_metadata.len() > MAX_EDITABLE_FILE_BYTES as u64 {
+        anyhow::bail!(
+            "{} is {} bytes; editable files are limited to {} bytes",
+            path.display(),
+            opened_metadata.len(),
+            MAX_EDITABLE_FILE_BYTES
+        );
+    }
+
+    let mut bytes =
+        Vec::with_capacity((opened_metadata.len() as usize).min(MAX_EDITABLE_FILE_BYTES));
+    file.take((MAX_EDITABLE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() > MAX_EDITABLE_FILE_BYTES {
+        anyhow::bail!(
+            "{} exceeds the {}-byte editable-file limit",
+            path.display(),
+            MAX_EDITABLE_FILE_BYTES
+        );
+    }
+    String::from_utf8(bytes).with_context(|| {
+        format!(
+            "{} is not UTF-8 text; binary files cannot be previewed or edited safely",
+            path.display()
+        )
+    })
+}
+
+fn open_regular_file_nonblocking(path: &Path) -> Result<(std::fs::File, std::fs::Metadata)> {
+    let initial_metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !initial_metadata.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
+    if !opened_metadata.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    Ok((file, opened_metadata))
+}
+
+fn write_regular_file_nonblocking(
+    path: &Path,
+    content: &[u8],
+    reject_hard_links: bool,
+) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to open {} for writing", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    if reject_hard_links {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            anyhow::bail!(
+                "refusing to overwrite {} because it has multiple hard links under constrained authority",
+                path.display()
+            );
+        }
+    }
+    #[cfg(windows)]
+    if reject_hard_links {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a valid, open Windows file handle and
+        // `information` remains writable for the duration of the call.
+        let inspected =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+        if inspected == 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to inspect hard-link count for opened file {}",
+                    path.display()
+                )
+            });
+        }
+        if information.nNumberOfLinks > 1 {
+            anyhow::bail!(
+                "refusing to overwrite {} because it has multiple hard links under constrained authority",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    if reject_hard_links {
+        anyhow::bail!(
+            "refusing to overwrite {} because this platform cannot verify hard-link count under constrained authority",
+            path.display()
+        );
+    }
+    file.set_len(0)
+        .with_context(|| format!("failed to truncate {}", path.display()))?;
+    file.write_all(content)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))
+}
+
+fn diff_lines_bounded(old: &str, new: &str) -> Result<Vec<(char, String)>> {
+    for (label, text) in [("existing", old), ("replacement", new)] {
+        if text.len() > MAX_EDITABLE_FILE_BYTES {
+            anyhow::bail!(
+                "{label} content is {} bytes; diff inputs are limited to {} bytes",
+                text.len(),
+                MAX_EDITABLE_FILE_BYTES
+            );
+        }
+        if text.lines().take(MAX_DIFF_INPUT_LINES + 1).count() > MAX_DIFF_INPUT_LINES {
+            anyhow::bail!("{label} content exceeds the {MAX_DIFF_INPUT_LINES}-line diff limit");
+        }
+    }
+    Ok(diff_lines(old, new))
+}
+
 fn diff_lines(old: &str, new: &str) -> Vec<(char, String)> {
-    let diff = similar::TextDiff::from_lines(old, new);
+    let mut configuration = similar::TextDiff::configure();
+    configuration.timeout(MAX_DIFF_DURATION);
+    let diff = configuration.diff_lines(old, new);
     let mut out = Vec::new();
     for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
         out.push(('@', hunk.header().to_string()));
@@ -355,113 +854,253 @@ fn diff_lines(old: &str, new: &str) -> Vec<(char, String)> {
     out
 }
 
-pub async fn execute(call: &ToolCall) -> (String, bool) {
-    match run(call).await {
+/// Execute one call under explicit runtime authority. The call is reassessed
+/// immediately, and only the canonical target from that fresh assessment is
+/// used for filesystem I/O. A grant can satisfy `Ask`; it can never override
+/// `Deny`.
+pub async fn execute(
+    policy: &ExecutionPolicy,
+    call: &ToolCall,
+    authorization: &ToolAuthorization,
+) -> (String, bool) {
+    match run(policy, call, authorization).await {
         Ok(output) => (truncate(output), false),
         Err(e) => (format!("{e:#}"), true),
     }
 }
 
-async fn run(call: &ToolCall) -> Result<String> {
+async fn run(
+    policy: &ExecutionPolicy,
+    call: &ToolCall,
+    authorization: &ToolAuthorization,
+) -> Result<String> {
+    // This is intentionally independent from the assessment used to render an
+    // approval dialog. It closes policy-generation and symlink-retarget races.
+    let assessment = assess(policy, call);
+    let approved = authorize(policy, &assessment, authorization)?;
     let args = &call.arguments;
     match call.name.as_str() {
         "read_file" => {
-            let path = str_arg(args, "path")?;
+            let path = assessed_target(&assessment)?;
             read_file_bounded(path).await
         }
         "write_file" => {
-            let path = str_arg(args, "path")?;
+            let path = assessed_target(&assessment)?;
             let content = str_arg(args, "content")?;
-            if let Some(parent) = Path::new(path).parent() {
+            let reject_hard_links = policy.sandbox_mode() != SandboxMode::DangerFullAccess;
+            if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
             }
-            tokio::fs::write(path, content)
-                .await
-                .with_context(|| format!("failed to write {path}"))?;
-            Ok(format!("wrote {} bytes to {path}", content.len()))
+            let write_path = path.to_path_buf();
+            let write_content = content.as_bytes().to_vec();
+            tokio::task::spawn_blocking(move || {
+                write_regular_file_nonblocking(&write_path, &write_content, reject_hard_links)
+            })
+            .await
+            .context("regular-file writer task failed")??;
+            Ok(format!(
+                "wrote {} bytes to {}",
+                content.len(),
+                path.display()
+            ))
         }
         "edit_file" => {
-            let path = str_arg(args, "path")?;
-            let content = tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("failed to read {path}"))?;
-            let updated = apply_edit(
+            let path = assessed_target(&assessment)?;
+            let reject_hard_links = policy.sandbox_mode() != SandboxMode::DangerFullAccess;
+            let editable_path = path.to_path_buf();
+            let content = tokio::task::spawn_blocking(move || {
+                read_change_file_bounded(&editable_path, false)
+            })
+            .await
+            .context("editable-file reader task failed")??;
+            let updated = apply_edit_bounded(
                 &content,
                 str_arg(args, "old_string")?,
                 str_arg(args, "new_string")?,
                 args["replace_all"].as_bool().unwrap_or(false),
             )?;
-            tokio::fs::write(path, &updated)
-                .await
-                .with_context(|| format!("failed to write {path}"))?;
-            Ok(format!("edited {path}"))
+            let write_path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                write_regular_file_nonblocking(&write_path, updated.as_bytes(), reject_hard_links)
+            })
+            .await
+            .context("regular-file writer task failed")??;
+            Ok(format!("edited {}", path.display()))
         }
         "list_directory" => {
-            let path = args["path"].as_str().unwrap_or(".");
+            let path = assessed_target(&assessment)?;
             list_directory_bounded(path, MAX_DIRECTORY_ENTRIES).await
         }
         "grep" => {
             let pattern = str_arg(args, "pattern")?.to_owned();
-            let root = args["path"].as_str().unwrap_or(".").to_owned();
+            let root = assessed_target(&assessment)?.to_path_buf();
             run_cancellable_search(move |cancelled| {
-                grep_files_with_limits(&pattern, &root, &cancelled, DEFAULT_SEARCH_LIMITS)
+                grep_files_with_limits(&pattern, root.as_path(), &cancelled, DEFAULT_SEARCH_LIMITS)
             })
             .await
         }
         "glob" => {
             let pattern = str_arg(args, "pattern")?.to_owned();
-            let root = args["path"].as_str().unwrap_or(".").to_owned();
+            let root = assessed_target(&assessment)?.to_path_buf();
             run_cancellable_search(move |cancelled| {
-                glob_files_with_limits(&pattern, &root, &cancelled, DEFAULT_SEARCH_LIMITS)
+                glob_files_with_limits(&pattern, root.as_path(), &cancelled, DEFAULT_SEARCH_LIMITS)
             })
             .await
         }
         "run_command" => {
             let command = str_arg(args, "command")?;
-            let output = tokio::time::timeout(
-                COMMAND_TIMEOUT,
-                tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await
-            .context("command timed out after 60s")??;
-
-            let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                result.push_str("\n[stderr]\n");
-                result.push_str(&stderr);
-            }
-            if !output.status.success() {
-                anyhow::bail!("exit status {}\n{}", output.status, truncate(result));
-            }
-            Ok(if result.trim().is_empty() {
-                "(no output)".into()
-            } else {
-                result
-            })
+            // Approval for an untrusted *default* command is not escalation:
+            // the process still goes through the constrained backend.
+            let approved_escalation = assessment.requires_escalation() && approved;
+            let prepared =
+                crate::sandbox::prepare_shell_command(policy, command, approved_escalation)?;
+            let (command, cleanup) = prepared.into_tokio_parts();
+            let result = run_command_bounded(command).await;
+            cleanup.cleanup()?;
+            result
         }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
 
+fn authorize(
+    policy: &ExecutionPolicy,
+    assessment: &ToolAssessment,
+    authorization: &ToolAuthorization,
+) -> Result<bool> {
+    match assessment.decision() {
+        ToolDecision::Deny => anyhow::bail!(
+            "tool denied by policy: {}",
+            assessment.reason().unwrap_or("access is forbidden")
+        ),
+        ToolDecision::Allow => Ok(false),
+        ToolDecision::Ask => match authorization {
+            ToolAuthorization::Approved(grant)
+                if policy.accepts_grant(grant, assessment.scope()) =>
+            {
+                Ok(true)
+            }
+            ToolAuthorization::Approved(_) => {
+                anyhow::bail!("tool approval is stale or does not match this exact request")
+            }
+            ToolAuthorization::Default => anyhow::bail!(
+                "tool requires approval: {}",
+                assessment.reason().unwrap_or("approval required")
+            ),
+        },
+    }
+}
+
+fn assessed_target(assessment: &ToolAssessment) -> Result<&Path> {
+    assessment
+        .canonical_target()
+        .context("tool assessment has no canonical target")
+}
+
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn drain_bounded(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    max_bytes: usize,
+) -> std::io::Result<BoundedBytes> {
+    let mut output = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(output.len());
+        let retained = remaining.min(read);
+        output.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+    Ok(BoundedBytes {
+        bytes: output,
+        truncated,
+    })
+}
+
+async fn run_command_bounded(mut command: tokio::process::Command) -> Result<String> {
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("failed to start command")?;
+    #[cfg(unix)]
+    let mut process_group = ProcessGroupGuard::new(
+        child
+            .id()
+            .context("spawned command did not expose a process id")?,
+    )?;
+    let stdout = child.stdout.take().context("failed to capture stdout")?;
+    let stderr = child.stderr.take().context("failed to capture stderr")?;
+    let stdout_task = tokio::spawn(drain_bounded(stdout, MAX_OUTPUT_BYTES));
+    let stderr_task = tokio::spawn(drain_bounded(stderr, MAX_OUTPUT_BYTES));
+    let execution = async {
+        let status = child.wait().await.context("failed to wait for command")?;
+        #[cfg(unix)]
+        process_group
+            .terminate()
+            .context("failed to terminate command descendants")?;
+        let stdout = stdout_task
+            .await
+            .context("stdout drain task failed")?
+            .context("failed to read command stdout")?;
+        let stderr = stderr_task
+            .await
+            .context("stderr drain task failed")?
+            .context("failed to read command stderr")?;
+        Ok::<_, anyhow::Error>((status, stdout, stderr))
+    };
+    let (status, stdout, stderr) = tokio::time::timeout(COMMAND_TIMEOUT, execution)
+        .await
+        .context("command timed out after 60s")??;
+
+    let mut result = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    if !stderr.bytes.is_empty() {
+        result.push_str("\n[stderr]\n");
+        result.push_str(&String::from_utf8_lossy(&stderr.bytes));
+    }
+    if stdout.truncated || stderr.truncated {
+        result.push_str("\n[output truncated]");
+    }
+    let result = truncate(result);
+    if !status.success() {
+        anyhow::bail!("exit status {status}\n{result}");
+    }
+    Ok(if result.trim().is_empty() {
+        "(no output)".into()
+    } else {
+        result
+    })
+}
+
 /// Read only the prefix that can be returned to the model, plus one byte to
 /// detect overflow. This bounds regular files and special streams alike rather
 /// than allocating the entire input before the shared output truncation runs.
-async fn read_file_bounded(path: &str) -> Result<String> {
-    let file = tokio::fs::File::open(path)
+async fn read_file_bounded(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_file_bounded_sync(&path))
         .await
-        .with_context(|| format!("failed to read {path}"))?;
+        .context("bounded file reader task failed")?
+}
+
+fn read_file_bounded_sync(path: &Path) -> Result<String> {
+    let (file, _) = open_regular_file_nonblocking(path)?;
     let mut bytes = Vec::with_capacity(MAX_READ_FILE_BYTES + 1);
     file.take((MAX_READ_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .await
-        .with_context(|| format!("failed to read {path}"))?;
+        .with_context(|| format!("failed to read {}", path.display()))?;
 
     let overflow = bytes.len() > MAX_READ_FILE_BYTES;
     if overflow {
@@ -479,7 +1118,8 @@ async fn read_file_bounded(path: &str) -> Result<String> {
             String::from_utf8(bytes).expect("validated UTF-8 prefix")
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {path} as UTF-8"));
+            return Err(error)
+                .with_context(|| format!("failed to read {} as UTF-8", path.display()));
         }
     };
     if overflow {
@@ -491,10 +1131,10 @@ async fn read_file_bounded(path: &str) -> Result<String> {
     Ok(text)
 }
 
-async fn list_directory_bounded(path: &str, max_entries: usize) -> Result<String> {
+async fn list_directory_bounded(path: &Path, max_entries: usize) -> Result<String> {
     let mut entries = tokio::fs::read_dir(path)
         .await
-        .with_context(|| format!("failed to list {path}"))?;
+        .with_context(|| format!("failed to list {}", path.display()))?;
     let mut names = Vec::with_capacity(max_entries.min(256));
     let mut overflow = false;
     while let Some(entry) = entries.next_entry().await? {
@@ -539,14 +1179,129 @@ fn apply_edit(content: &str, old: &str, new: &str, replace_all: bool) -> Result<
     }
 }
 
+fn apply_edit_bounded(content: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
+    for (label, text) in [("file", content), ("old_string", old), ("new_string", new)] {
+        if text.len() > MAX_EDITABLE_FILE_BYTES {
+            anyhow::bail!(
+                "{label} is {} bytes; edits are limited to {} bytes",
+                text.len(),
+                MAX_EDITABLE_FILE_BYTES
+            );
+        }
+    }
+
+    let matches = content.matches(old).count();
+    let replacements = match matches {
+        1 => 1,
+        count if count > 1 && replace_all => count,
+        _ => 0,
+    };
+    if replacements > 0 {
+        let removed = old
+            .len()
+            .checked_mul(replacements)
+            .context("edit size overflow")?;
+        let inserted = new
+            .len()
+            .checked_mul(replacements)
+            .context("edit size overflow")?;
+        let updated_len = content
+            .len()
+            .checked_sub(removed)
+            .and_then(|len| len.checked_add(inserted))
+            .context("edit size overflow")?;
+        if updated_len > MAX_EDITABLE_FILE_BYTES {
+            anyhow::bail!(
+                "edited file would be {updated_len} bytes; edits are limited to {MAX_EDITABLE_FILE_BYTES} bytes"
+            );
+        }
+    }
+    apply_edit(content, old, new, replace_all)
+}
+
+struct BoundedSearchOutput {
+    text: String,
+    byte_limited: bool,
+}
+
+impl BoundedSearchOutput {
+    fn new() -> Self {
+        Self {
+            text: String::with_capacity(MAX_OUTPUT_BYTES),
+            byte_limited: false,
+        }
+    }
+
+    fn push_parts(&mut self, parts: &[&str]) -> bool {
+        if self.byte_limited {
+            return false;
+        }
+        let separator_len = usize::from(!self.text.is_empty());
+        let payload_limit = MAX_OUTPUT_BYTES - SEARCH_OUTPUT_LIMIT_MARKER.len() - 1;
+        let available = payload_limit
+            .saturating_sub(self.text.len())
+            .saturating_sub(separator_len);
+        let required = parts
+            .iter()
+            .fold(0usize, |total, part| total.saturating_add(part.len()));
+        if required <= available {
+            if separator_len == 1 {
+                self.text.push('\n');
+            }
+            for part in parts {
+                self.text.push_str(part);
+            }
+            return true;
+        }
+
+        if available > 0 {
+            if separator_len == 1 {
+                self.text.push('\n');
+            }
+            let mut remaining = available;
+            for part in parts {
+                if remaining == 0 {
+                    break;
+                }
+                let mut end = remaining.min(part.len());
+                while !part.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.text.push_str(&part[..end]);
+                remaining -= end;
+            }
+        }
+        if !self.text.is_empty() {
+            self.text.push('\n');
+        }
+        self.text.push_str(SEARCH_OUTPUT_LIMIT_MARKER);
+        self.byte_limited = true;
+        false
+    }
+
+    fn finish(mut self, empty: &str, stopped: Option<SearchStop>, limits: SearchLimits) -> String {
+        if self.text.is_empty() {
+            self.push_parts(&[empty]);
+        }
+        if !self.byte_limited {
+            if let Some(reason) = stopped {
+                let message = format!("… search stopped: {}", reason.message(limits));
+                self.push_parts(&[&message]);
+            }
+        }
+        self.text
+    }
+}
+
 fn grep_files_with_limits(
     pattern: &str,
-    root: &str,
+    root: &Path,
     cancelled: &AtomicBool,
     limits: SearchLimits,
 ) -> Result<String> {
     let re = regex::Regex::new(pattern).context("invalid regex")?;
-    let mut out = Vec::new();
+    let mut out = BoundedSearchOutput::new();
+    let mut matches = 0usize;
     let started = Instant::now();
     let mut visited_files = 0usize;
     let mut stopped = None;
@@ -579,25 +1334,32 @@ fn grep_files_with_limits(
                 break 'walk;
             }
             if re.is_match(line) {
-                out.push(format!(
-                    "{}:{}:{}",
-                    entry.path().display(),
-                    no + 1,
-                    line.trim_end()
-                ));
-                if out.len() >= MAX_SEARCH_RESULTS {
-                    out.push(format!("… stopped at {MAX_SEARCH_RESULTS} matches"));
-                    return Ok(out.join("\n"));
+                let path = entry.path().display().to_string();
+                let line_number = (no + 1).to_string();
+                if !out.push_parts(&[
+                    path.as_str(),
+                    ":",
+                    line_number.as_str(),
+                    ":",
+                    line.trim_end(),
+                ]) {
+                    return Ok(out.finish("no matches", None, limits));
+                }
+                matches += 1;
+                if matches >= MAX_SEARCH_RESULTS {
+                    let message = format!("… stopped at {MAX_SEARCH_RESULTS} matches");
+                    out.push_parts(&[&message]);
+                    return Ok(out.finish("no matches", None, limits));
                 }
             }
         }
     }
-    Ok(finish_search(out, "no matches", stopped, limits))
+    Ok(out.finish("no matches", stopped, limits))
 }
 
 fn glob_files_with_limits(
     pattern: &str,
-    root: &str,
+    root: &Path,
     cancelled: &AtomicBool,
     limits: SearchLimits,
 ) -> Result<String> {
@@ -653,18 +1415,18 @@ fn search_stop(
 }
 
 fn finish_search(
-    mut lines: Vec<String>,
+    lines: Vec<String>,
     empty: &str,
     stopped: Option<SearchStop>,
     limits: SearchLimits,
 ) -> String {
-    if lines.is_empty() {
-        lines.push(empty.into());
+    let mut output = BoundedSearchOutput::new();
+    for line in &lines {
+        if !output.push_parts(&[line]) {
+            break;
+        }
     }
-    if let Some(reason) = stopped {
-        lines.push(format!("… search stopped: {}", reason.message(limits)));
-    }
-    lines.join("\n")
+    output.finish(empty, stopped, limits)
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -688,7 +1450,44 @@ fn truncate(mut s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::policy::{ApprovalPolicy, SandboxMode, Workspace};
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "shaltaiboltai-tools-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create isolated test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let is_ours = self
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("shaltaiboltai-tools-"));
+            if is_ours {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
 
     fn call(name: &str, args: Value) -> ToolCall {
         ToolCall {
@@ -698,80 +1497,222 @@ mod tests {
         }
     }
 
-    fn temp_path(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "shaltai-tools-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+    fn policy(
+        root: &Path,
+        sandbox_mode: SandboxMode,
+        approval_policy: ApprovalPolicy,
+    ) -> ExecutionPolicy {
+        ExecutionPolicy::from_parts(
+            Workspace::new(root).expect("canonical test workspace"),
+            sandbox_mode,
+            approval_policy,
+        )
+    }
+
+    fn default_policy(root: &Path) -> ExecutionPolicy {
+        policy(root, SandboxMode::WorkspaceWrite, ApprovalPolicy::OnRequest)
+    }
+
+    fn decision(policy: &ExecutionPolicy, name: &str, args: Value) -> ToolDecision {
+        assess(policy, &call(name, args)).decision()
+    }
+
+    #[test]
+    fn run_command_schema_exposes_typed_sandbox_request() {
+        let definition = definitions()
+            .into_iter()
+            .find(|definition| definition.name == "run_command")
+            .expect("run_command definition");
+        assert_eq!(
+            definition.schema["properties"]["sandbox_permissions"]["enum"],
+            json!(["use_default", "require_escalated"])
+        );
+        assert_eq!(
+            definition.schema["properties"]["justification"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn sandbox_permission_parsing_is_exact_and_defaults_are_explicit() {
+        assert_eq!(
+            "use_default".parse::<SandboxPermission>(),
+            Ok(SandboxPermission::UseDefault)
+        );
+        assert_eq!(
+            "require_escalated".parse::<SandboxPermission>(),
+            Ok(SandboxPermission::RequireEscalated)
+        );
+        assert!("danger-full-access".parse::<SandboxPermission>().is_err());
+
+        let root = TestDirectory::new("sandbox-parse");
+        let policy = default_policy(root.path());
+        assert_eq!(
+            decision(&policy, "run_command", json!({"command": "pwd"})),
+            ToolDecision::Allow
+        );
+        for arguments in [
+            json!({"command": "pwd", "sandbox_permissions": "unknown"}),
+            json!({"command": "pwd", "sandbox_permissions": 7}),
+            json!({"command": "pwd", "justification": false}),
+        ] {
+            assert_eq!(
+                decision(&policy, "run_command", arguments),
+                ToolDecision::Deny
+            );
+        }
     }
 
     #[tokio::test]
     async fn read_file_reads_only_a_bounded_utf8_prefix() {
-        let path = temp_path("bounded-read");
+        let root = TestDirectory::new("bounded-read");
+        let path = root.path().join("large.txt");
         let content = format!("{}界unreachable-tail", "x".repeat(MAX_READ_FILE_BYTES - 1));
-        std::fs::write(&path, content).unwrap();
+        fs::write(&path, content).unwrap();
+        let policy = default_policy(root.path());
 
-        let (output, is_error) =
-            execute(&call("read_file", json!({"path": path.to_str().unwrap()}))).await;
+        let (output, is_error) = execute(
+            &policy,
+            &call("read_file", json!({"path": "large.txt"})),
+            &ToolAuthorization::Default,
+        )
+        .await;
 
         assert!(!is_error, "{output}");
         assert!(output.ends_with("[output truncated]"));
         assert!(!output.contains("unreachable-tail"));
         assert!(output.len() <= MAX_OUTPUT_BYTES + "\n[output truncated]".len());
-        std::fs::remove_file(path).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = TestDirectory::new("fifo-read");
+        let fifo = root.path().join("input.fifo");
+        let fifo_bytes = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path without NUL");
+        // SAFETY: `fifo_bytes` is a valid NUL-terminated path owned for the
+        // duration of the call, and the fixture path does not exist yet.
+        assert_eq!(unsafe { libc::mkfifo(fifo_bytes.as_ptr(), 0o600) }, 0);
+        let policy = default_policy(root.path());
+
+        let (output, is_error) = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute(
+                &policy,
+                &call("read_file", json!({"path": "input.fifo"})),
+                &ToolAuthorization::Default,
+            ),
+        )
+        .await
+        .expect("FIFO read must not block");
+        assert!(is_error);
+        assert!(output.contains("not a regular file"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_rejects_fifo_without_waiting_for_a_reader() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = TestDirectory::new("fifo-write");
+        let fifo = root.path().join("output.fifo");
+        let fifo_bytes = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path without NUL");
+        // SAFETY: `fifo_bytes` is a valid NUL-terminated path owned for the
+        // duration of the call, and the fixture path does not exist yet.
+        assert_eq!(unsafe { libc::mkfifo(fifo_bytes.as_ptr(), 0o600) }, 0);
+        let policy = default_policy(root.path());
+
+        let (output, is_error) = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute(
+                &policy,
+                &call(
+                    "write_file",
+                    json!({"path": "output.fifo", "content": "must not block"}),
+                ),
+                &ToolAuthorization::Default,
+            ),
+        )
+        .await
+        .expect("FIFO write must not block");
+        assert!(is_error);
+        assert!(output.contains("not a regular file"), "{output}");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn constrained_writers_reject_hard_links_to_protected_metadata() {
+        let root = TestDirectory::new("protected-hard-links");
+        for name in [".git", ".agents", ".codex"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+            fs::write(root.path().join(name).join("config"), "protected\n").unwrap();
+        }
+        let policy = default_policy(root.path());
+
+        for (index, name) in [".git", ".agents", ".codex"].into_iter().enumerate() {
+            let protected = root.path().join(name).join("config");
+            let alias_name = format!("innocent-{index}.txt");
+            let alias = root.path().join(&alias_name);
+            fs::hard_link(&protected, &alias).unwrap();
+            let write = call(
+                "write_file",
+                json!({"path": &alias_name, "content": "overwritten\n"}),
+            );
+            assert_eq!(assess(&policy, &write).decision(), ToolDecision::Allow);
+            let (output, is_error) = execute(&policy, &write, &ToolAuthorization::Default).await;
+            assert!(is_error);
+            assert!(output.contains("multiple hard links"), "{output}");
+            assert_eq!(fs::read_to_string(&protected).unwrap(), "protected\n");
+
+            let edit = call(
+                "edit_file",
+                json!({"path": &alias_name, "old_string": "protected", "new_string": "changed"}),
+            );
+            let (output, is_error) = execute(&policy, &edit, &ToolAuthorization::Default).await;
+            assert!(is_error);
+            assert!(output.contains("multiple hard links"), "{output}");
+            assert_eq!(fs::read_to_string(&protected).unwrap(), "protected\n");
+        }
     }
 
     #[tokio::test]
     async fn directory_listing_stops_at_the_entry_limit() {
-        let root = temp_path("bounded-list");
-        std::fs::create_dir_all(&root).unwrap();
+        let root = TestDirectory::new("bounded-list");
         for name in ["a", "b", "c"] {
-            std::fs::write(root.join(name), name).unwrap();
+            fs::write(root.path().join(name), name).unwrap();
         }
 
-        let output = list_directory_bounded(root.to_str().unwrap(), 2)
-            .await
-            .unwrap();
+        let output = list_directory_bounded(root.path(), 2).await.unwrap();
 
         assert_eq!(output.lines().count(), 3);
         assert!(output.ends_with("… stopped at 2 entries"));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn recursive_searches_stop_at_file_and_time_budgets() {
-        let root = temp_path("bounded-search");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("one.txt"), "needle").unwrap();
+        let root = TestDirectory::new("bounded-search");
+        fs::write(root.path().join("one.txt"), "needle").unwrap();
         let cancelled = AtomicBool::new(false);
 
-        let normal = grep_files_with_limits(
-            "needle",
-            root.to_str().unwrap(),
-            &cancelled,
-            DEFAULT_SEARCH_LIMITS,
-        )
-        .unwrap();
+        let normal =
+            grep_files_with_limits("needle", root.path(), &cancelled, DEFAULT_SEARCH_LIMITS)
+                .unwrap();
         assert!(normal.contains("one.txt:1:needle"));
         assert!(!normal.contains("search stopped"));
 
-        let normal_glob = glob_files_with_limits(
-            "**/*.txt",
-            root.to_str().unwrap(),
-            &cancelled,
-            DEFAULT_SEARCH_LIMITS,
-        )
-        .unwrap();
+        let normal_glob =
+            glob_files_with_limits("**/*.txt", root.path(), &cancelled, DEFAULT_SEARCH_LIMITS)
+                .unwrap();
         assert!(normal_glob.contains("one.txt"));
         assert!(!normal_glob.contains("search stopped"));
 
         let file_limited = grep_files_with_limits(
             "needle",
-            root.to_str().unwrap(),
+            root.path(),
             &cancelled,
             SearchLimits {
                 max_visited_files: 0,
@@ -783,7 +1724,7 @@ mod tests {
 
         let time_limited = glob_files_with_limits(
             "**/*.txt",
-            root.to_str().unwrap(),
+            root.path(),
             &cancelled,
             SearchLimits {
                 max_visited_files: 10,
@@ -792,7 +1733,21 @@ mod tests {
         )
         .unwrap();
         assert!(time_limited.contains("0-second time limit"));
-        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn grep_truncates_a_matching_megabyte_line_while_collecting() {
+        let root = TestDirectory::new("bounded-grep-line");
+        let mut content = String::from("needle:");
+        content.push_str(&"x".repeat(MAX_SEARCH_FILE_BYTES as usize - content.len()));
+        fs::write(root.path().join("huge.txt"), content).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let output =
+            grep_files_with_limits("needle", root.path(), &cancelled, DEFAULT_SEARCH_LIMITS)
+                .unwrap();
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+        assert!(output.contains(SEARCH_OUTPUT_LIMIT_MARKER));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -824,110 +1779,338 @@ mod tests {
     }
 
     #[test]
-    fn reads_inside_cwd_are_auto_approved() {
-        assert!(!requires_approval(&call(
-            "read_file",
-            json!({"path": "src/main.rs"})
-        )));
-        assert!(!requires_approval(&call("grep", json!({"pattern": "x"}))));
-        assert!(!requires_approval(&call("list_directory", json!({}))));
+    fn default_policy_allows_in_sandbox_calls_and_asks_at_boundaries() {
+        let root = TestDirectory::new("default-matrix");
+        let outside = TestDirectory::new("default-matrix-outside");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let policy = default_policy(root.path());
+
+        for (name, arguments) in [
+            ("read_file", json!({"path": "file"})),
+            ("read_file", json!({"path": outside.path().join("secret")})),
+            ("list_directory", json!({})),
+            ("grep", json!({"pattern": "x"})),
+            ("glob", json!({"pattern": "**/*.rs"})),
+            ("write_file", json!({"path": "file", "content": "x"})),
+            ("run_command", json!({"command": "pwd"})),
+        ] {
+            assert_eq!(
+                decision(&policy, name, arguments),
+                ToolDecision::Allow,
+                "{name} should stay inside default authority"
+            );
+        }
+        assert_eq!(
+            decision(
+                &policy,
+                "write_file",
+                json!({"path": ".git/config", "content": "x"})
+            ),
+            ToolDecision::Ask
+        );
+        assert_eq!(
+            decision(
+                &policy,
+                "write_file",
+                json!({"path": outside.path().join("file"), "content": "x"})
+            ),
+            ToolDecision::Ask
+        );
+        let escalated = assess(
+            &policy,
+            &call(
+                "run_command",
+                json!({"command": "pwd", "sandbox_permissions": "require_escalated"}),
+            ),
+        );
+        assert_eq!(escalated.decision(), ToolDecision::Ask);
+        assert!(escalated.requires_escalation());
     }
 
     #[test]
-    fn reads_outside_cwd_require_approval() {
-        assert!(requires_approval(&call(
-            "read_file",
-            json!({"path": "/etc/passwd"})
-        )));
-        assert!(requires_approval(&call(
-            "read_file",
-            json!({"path": "../secrets.txt"})
-        )));
-        assert!(requires_approval(&call(
-            "list_directory",
-            json!({"path": "/"})
-        )));
+    fn untrusted_asks_for_mutations_and_default_shell_without_escalating() {
+        let root = TestDirectory::new("untrusted-matrix");
+        let policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Untrusted,
+        );
+        assert_eq!(
+            decision(&policy, "read_file", json!({"path": "file"})),
+            ToolDecision::Allow
+        );
+        assert_eq!(
+            decision(
+                &policy,
+                "write_file",
+                json!({"path": "file", "content": "x"})
+            ),
+            ToolDecision::Ask
+        );
+        let command = assess(&policy, &call("run_command", json!({"command": "pwd"})));
+        assert_eq!(command.decision(), ToolDecision::Ask);
+        assert!(!command.requires_escalation());
     }
 
     #[test]
-    fn mutations_always_require_approval() {
-        assert!(requires_approval(&call(
-            "write_file",
-            json!({"path": "x", "content": ""})
-        )));
-        assert!(requires_approval(&call("edit_file", json!({"path": "x"}))));
-        assert!(requires_approval(&call(
-            "run_command",
-            json!({"command": "ls"})
-        )));
+    fn never_denies_boundary_crossings_without_prompting() {
+        let root = TestDirectory::new("never-matrix");
+        let outside = TestDirectory::new("never-matrix-outside");
+        let policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Never,
+        );
+        assert_eq!(
+            decision(
+                &policy,
+                "write_file",
+                json!({"path": "inside", "content": "x"})
+            ),
+            ToolDecision::Allow
+        );
+        for arguments in [
+            json!({"path": ".git/config", "content": "x"}),
+            json!({"path": outside.path().join("file"), "content": "x"}),
+        ] {
+            assert_eq!(
+                decision(&policy, "write_file", arguments),
+                ToolDecision::Deny
+            );
+        }
+        assert_eq!(
+            decision(
+                &policy,
+                "run_command",
+                json!({"command": "pwd", "sandbox_permissions": "require_escalated"})
+            ),
+            ToolDecision::Deny
+        );
+        assert_eq!(
+            decision(&policy, "run_command", json!({"command": "pwd"})),
+            ToolDecision::Allow
+        );
     }
 
     #[test]
-    fn session_approval_scopes_commands_and_paths() {
-        let first_command = call("run_command", json!({"command": "cargo test"}));
-        let second_command = call("run_command", json!({"command": "cargo publish"}));
-        assert_ne!(
-            approval_scope(&first_command),
-            approval_scope(&second_command)
+    fn read_only_and_full_access_have_distinct_authority() {
+        let root = TestDirectory::new("mode-matrix");
+        let read_only = policy(
+            root.path(),
+            SandboxMode::ReadOnly,
+            ApprovalPolicy::OnRequest,
+        );
+        assert_eq!(
+            decision(
+                &read_only,
+                "write_file",
+                json!({"path": "file", "content": "x"})
+            ),
+            ToolDecision::Ask
+        );
+        assert_eq!(
+            decision(&read_only, "run_command", json!({"command": "pwd"})),
+            ToolDecision::Allow
         );
 
+        let full_access = policy(
+            root.path(),
+            SandboxMode::DangerFullAccess,
+            ApprovalPolicy::Never,
+        );
+        assert_eq!(
+            decision(
+                &full_access,
+                "write_file",
+                json!({"path": "/tmp/full-access-target", "content": "x"})
+            ),
+            ToolDecision::Allow
+        );
+        assert_eq!(
+            decision(
+                &full_access,
+                "run_command",
+                json!({"command": "pwd", "sandbox_permissions": "require_escalated"})
+            ),
+            ToolDecision::Allow
+        );
+    }
+
+    #[test]
+    fn malformed_calls_fail_closed_before_execution() {
+        let root = TestDirectory::new("malformed");
+        let policy = default_policy(root.path());
+        for tool in [
+            call("read_file", json!({})),
+            call("write_file", json!({"path": "x"})),
+            call("edit_file", json!({"path": "x", "old_string": "a"})),
+            call("list_directory", json!({"path": 42})),
+            call("grep", json!({"pattern": "["})),
+            call("glob", json!({"pattern": "["})),
+            call("run_command", json!({})),
+            call("unknown", json!({})),
+        ] {
+            assert_eq!(assess(&policy, &tool).decision(), ToolDecision::Deny);
+        }
+    }
+
+    #[test]
+    fn approval_scopes_bind_policy_canonical_target_search_and_command() {
+        let root = TestDirectory::new("scopes");
+        let mut policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Untrusted,
+        );
         let first_path = call("write_file", json!({"path": "one.txt", "content": "same"}));
         let second_path = call("write_file", json!({"path": "two.txt", "content": "same"}));
-        assert_ne!(approval_scope(&first_path), approval_scope(&second_path));
-
         let same_path_new_content = call(
             "write_file",
             json!({"path": "one.txt", "content": "updated"}),
         );
+        assert_ne!(
+            assess(&policy, &first_path).scope(),
+            assess(&policy, &second_path).scope()
+        );
         assert_eq!(
-            approval_scope(&first_path),
-            approval_scope(&same_path_new_content)
+            assess(&policy, &first_path).scope(),
+            assess(&policy, &same_path_new_content).scope()
+        );
+
+        let first_search = call("grep", json!({"path": ".", "pattern": "one"}));
+        let second_search = call("grep", json!({"path": ".", "pattern": "two"}));
+        assert_ne!(
+            assess(&policy, &first_search).scope(),
+            assess(&policy, &second_search).scope()
+        );
+        let first_command = call("run_command", json!({"command": "cargo test"}));
+        let second_command = call("run_command", json!({"command": "cargo publish"}));
+        assert_ne!(
+            assess(&policy, &first_command).scope(),
+            assess(&policy, &second_command).scope()
+        );
+        let prior_scope = assess(&policy, &first_path).scope().to_owned();
+        assert!(policy.update(SandboxMode::ReadOnly, ApprovalPolicy::Untrusted));
+        assert_ne!(prior_scope, assess(&policy, &first_path).scope());
+    }
+
+    #[tokio::test]
+    async fn explicit_policy_cwd_controls_relative_file_io() {
+        let root = TestDirectory::new("explicit-cwd");
+        let policy = default_policy(root.path());
+        let tool = call(
+            "write_file",
+            json!({"path": "nested/result.txt", "content": "inside"}),
+        );
+        let assessment = assess(&policy, &tool);
+        assert_eq!(assessment.decision(), ToolDecision::Allow);
+        assert_eq!(
+            assessment.canonical_target(),
+            Some(policy.workspace().cwd().join("nested/result.txt").as_path())
+        );
+        let (output, is_error) = execute(&policy, &tool, &ToolAuthorization::Default).await;
+        assert!(!is_error, "{output}");
+        assert_eq!(
+            fs::read_to_string(root.path().join("nested/result.txt")).unwrap(),
+            "inside"
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn symlink_escape_from_project_requires_approval() {
+    #[tokio::test]
+    async fn approved_scope_cannot_follow_a_retargeted_symlink() {
         use std::os::unix::fs::symlink;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base =
-            std::env::temp_dir().join(format!("shaltai-path-scope-{}-{nonce}", std::process::id()));
-        let root = base.join("project");
-        let outside = base.join("outside");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("secret"), "private").unwrap();
-        std::fs::write(base.join("outside-secret"), "private").unwrap();
-        symlink(&outside, root.join("secrets")).unwrap();
-
-        assert!(!path_within_root(&root, "secrets/secret"));
-        assert!(!path_within_root(&root, "secrets/new-secret"));
-        assert!(!path_within_root(&root, "secrets/../outside-secret"));
-        assert!(path_within_root(&root, "new-file.txt"));
-
-        let dangling_target = outside.join("not-created-yet");
-        symlink(&dangling_target, root.join("dangling")).unwrap();
-        assert!(!path_within_root(&root, "dangling/secret"));
-        std::fs::create_dir_all(&dangling_target).unwrap();
-        std::fs::write(dangling_target.join("secret"), "private").unwrap();
-        assert!(!path_within_root(&root, "dangling/secret"));
-
-        let search = call("grep", json!({"path": "secrets", "pattern": "token"}));
-        let first_scope = approval_scope_in(&root, &search);
-        std::fs::remove_file(root.join("secrets")).unwrap();
-        symlink(&dangling_target, root.join("secrets")).unwrap();
-        let second_scope = approval_scope_in(&root, &search);
-        assert_ne!(
-            first_scope, second_scope,
-            "retargeted searches must reprompt"
+        let root = TestDirectory::new("retarget-workspace");
+        let inside = root.path().join("inside");
+        let outside = TestDirectory::new("retarget-outside");
+        fs::create_dir(&inside).unwrap();
+        let link = root.path().join("target");
+        symlink(&inside, &link).unwrap();
+        let policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Untrusted,
         );
+        let tool = call(
+            "write_file",
+            json!({"path": "target/result", "content": "secret"}),
+        );
+        let original = assess(&policy, &tool);
+        assert_eq!(original.decision(), ToolDecision::Ask);
+        let authorization = ToolAuthorization::approved(&policy, &original);
 
-        std::fs::remove_dir_all(base).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(outside.path(), &link).unwrap();
+        let retargeted = assess(&policy, &tool);
+        assert_ne!(original.scope(), retargeted.scope());
+        let (output, is_error) = execute(&policy, &tool, &authorization).await;
+        assert!(is_error);
+        assert!(output.contains("stale or does not match"), "{output}");
+        assert!(!outside.path().join("result").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn approval_scopes_preserve_non_utf8_path_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("non-utf8-scope-workspace");
+        let targets = TestDirectory::new("non-utf8-scope-targets");
+        let first = targets
+            .path()
+            .join(OsString::from_vec(b"outside-\x80".to_vec()));
+        let second = targets
+            .path()
+            .join(OsString::from_vec(b"outside-\x81".to_vec()));
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let link = root.path().join("target");
+        symlink(&first, &link).unwrap();
+        let policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Untrusted,
+        );
+        let tool = call(
+            "write_file",
+            json!({"path": "target/result", "content": "secret"}),
+        );
+        let original = assess(&policy, &tool);
+        let authorization = ToolAuthorization::approved(&policy, &original);
+
+        fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+        let retargeted = assess(&policy, &tool);
+        assert_eq!(
+            original.canonical_target().unwrap().to_string_lossy(),
+            retargeted.canonical_target().unwrap().to_string_lossy(),
+            "the regression requires paths that collide when rendered lossily"
+        );
+        assert_ne!(original.scope(), retargeted.scope());
+
+        let (output, is_error) = execute(&policy, &tool, &authorization).await;
+        assert!(is_error);
+        assert!(output.contains("stale or does not match"), "{output}");
+        assert!(!first.join("result").exists());
+        assert!(!second.join("result").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_encoding_does_not_collapse_lossy_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(b"outside-\x80".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"outside-\x81".to_vec()));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(
+            encoded_scope([first.as_os_str().as_encoded_bytes()]),
+            encoded_scope([second.as_os_str().as_encoded_bytes()])
+        );
     }
 
     #[test]
@@ -939,17 +2122,210 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_file_round_trip() {
-        let path = std::env::temp_dir().join(format!("shaltai-edit-{}.txt", std::process::id()));
-        std::fs::write(&path, "hello world\n").unwrap();
-        let (out, is_error) = execute(&call(
+    async fn exact_approval_executes_but_never_policy_cannot_be_bypassed() {
+        let root = TestDirectory::new("approved-write-workspace");
+        let outside = TestDirectory::new("approved-write-outside");
+        let default = default_policy(root.path());
+        let target = outside.path().join("result");
+        let tool = call(
+            "write_file",
+            json!({"path": &target, "content": "approved"}),
+        );
+        let assessment = assess(&default, &tool);
+        assert_eq!(assessment.decision(), ToolDecision::Ask);
+
+        let (output, is_error) = execute(&default, &tool, &ToolAuthorization::Default).await;
+        assert!(is_error);
+        assert!(output.contains("requires approval"));
+        assert!(!target.exists());
+
+        let authorization = ToolAuthorization::approved(&default, &assessment);
+        let (output, is_error) = execute(&default, &tool, &authorization).await;
+        assert!(!is_error, "{output}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "approved");
+
+        fs::remove_file(&target).unwrap();
+        let never = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Never,
+        );
+        let denied = assess(&never, &tool);
+        assert_eq!(denied.decision(), ToolDecision::Deny);
+        let forged = ToolAuthorization::approved(&never, &denied);
+        let (output, is_error) = execute(&never, &tool, &forged).await;
+        assert!(is_error);
+        assert!(output.contains("denied by policy"), "{output}");
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn policy_change_invalidates_previously_bound_approval() {
+        let root = TestDirectory::new("stale-policy");
+        let mut policy = default_policy(root.path());
+        let tool = call(
+            "write_file",
+            json!({"path": ".git/config", "content": "unsafe"}),
+        );
+        let assessment = assess(&policy, &tool);
+        let authorization = ToolAuthorization::approved(&policy, &assessment);
+        assert!(policy.update(SandboxMode::ReadOnly, ApprovalPolicy::OnRequest));
+        let (output, is_error) = execute(&policy, &tool, &authorization).await;
+        assert!(is_error);
+        assert!(output.contains("stale or does not match"), "{output}");
+        assert!(!root.path().join(".git/config").exists());
+    }
+
+    #[tokio::test]
+    async fn edit_file_round_trip_and_preview_use_the_policy_target() {
+        let root = TestDirectory::new("edit");
+        let path = root.path().join("file.txt");
+        fs::write(&path, "hello world\n").unwrap();
+        let policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Untrusted,
+        );
+        let tool = call(
             "edit_file",
-            json!({"path": path.to_str().unwrap(), "old_string": "world", "new_string": "rust"}),
-        ))
-        .await;
+            json!({"path": "file.txt", "old_string": "world", "new_string": "rust"}),
+        );
+        let assessment = assess(&policy, &tool);
+        let preview = approval_preview(&assessment, &tool).expect("canonical preview");
+        assert!(preview
+            .iter()
+            .any(|(tag, line)| *tag == '-' && line == "hello world"));
+        assert!(preview
+            .iter()
+            .any(|(tag, line)| *tag == '+' && line == "hello rust"));
+        let assessment = assess(&policy, &tool);
+        let authorization = ToolAuthorization::approved(&policy, &assessment);
+        let (out, is_error) = execute(&policy, &tool, &authorization).await;
         assert!(!is_error, "{out}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello rust\n");
-        std::fs::remove_file(&path).ok();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello rust\n");
+    }
+
+    #[tokio::test]
+    async fn edit_and_approval_preview_reject_large_or_binary_files() {
+        let root = TestDirectory::new("bounded-change-preview");
+        let large = root.path().join("large.txt");
+        let binary = root.path().join("binary.dat");
+        fs::write(&large, vec![b'x'; MAX_EDITABLE_FILE_BYTES + 1]).unwrap();
+        fs::write(&binary, [0xff, 0xfe, 0xfd]).unwrap();
+        let policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Untrusted,
+        );
+
+        for path in ["large.txt", "binary.dat"] {
+            let write = call(
+                "write_file",
+                json!({"path": path, "content": "replacement"}),
+            );
+            let assessment = assess(&policy, &write);
+            let preview = approval_preview(&assessment, &write).expect("write preview warning");
+            assert_eq!(preview[0].0, '!');
+            assert!(preview[0].1.contains("preview unavailable"), "{preview:?}");
+
+            let edit = call(
+                "edit_file",
+                json!({"path": path, "old_string": "x", "new_string": "y"}),
+            );
+            let assessment = assess(&policy, &edit);
+            let authorization = ToolAuthorization::approved(&policy, &assessment);
+            let (output, is_error) = execute(&policy, &edit, &authorization).await;
+            assert!(is_error);
+            assert!(
+                output.contains("editable files are limited") || output.contains("not UTF-8 text"),
+                "{output}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_preview_rejects_special_files_without_opening_them() {
+        use std::os::unix::net::UnixListener;
+
+        let root = TestDirectory::new("special-change-preview");
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
+        let socket_path = PathBuf::from("/tmp")
+            .join(format!("sb-preview-{}-{sequence}.sock", std::process::id()));
+        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let policy = policy(
+            root.path(),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Untrusted,
+        );
+        let write = call(
+            "write_file",
+            json!({"path": &socket_path, "content": "replacement"}),
+        );
+        let assessment = assess(&policy, &write);
+        let preview = approval_preview(&assessment, &write).expect("special-file warning");
+        assert_eq!(preview[0].0, '!');
+        assert!(preview[0].1.contains("not a regular file"), "{preview:?}");
+        drop(listener);
+        fs::remove_file(socket_path).expect("remove unix socket");
+    }
+
+    #[tokio::test]
+    async fn danger_full_access_command_uses_explicit_workspace_cwd() {
+        let root = TestDirectory::new("command-cwd");
+        let policy = policy(
+            root.path(),
+            SandboxMode::DangerFullAccess,
+            ApprovalPolicy::Never,
+        );
+        let (output, is_error) = execute(
+            &policy,
+            &call("run_command", json!({"command": "pwd"})),
+            &ToolAuthorization::Default,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert_eq!(output.trim(), policy.workspace().cwd().to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn command_streaming_is_memory_bounded_and_drained() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "i=0; while [ \"$i\" -lt 40000 ]; do printf x; i=$((i + 1)); done",
+        ]);
+        let output = run_command_bounded(command).await.unwrap();
+        assert!(output.ends_with("[output truncated]"));
+        assert!(output.len() <= MAX_OUTPUT_BYTES + "\n[output truncated]".len());
+    }
+
+    #[tokio::test]
+    async fn commands_receive_closed_stdin() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "if IFS= read -r value; then printf 'unexpected:%s' \"$value\"; else printf eof; fi",
+        ]);
+        let output = run_command_bounded(command).await.unwrap();
+        assert_eq!(output, "eof");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_completion_terminates_background_descendants() {
+        let root = TestDirectory::new("command-process-group");
+        let marker = root.path().join("leaked");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.env("SHALTAIBOLTAI_TEST_MARKER", &marker).args([
+            "-c",
+            "(sleep 1; printf leaked > \"$SHALTAIBOLTAI_TEST_MARKER\") >/dev/null 2>&1 & printf done",
+        ]);
+
+        let output = run_command_bounded(command).await.unwrap();
+        assert_eq!(output, "done");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!marker.exists(), "background descendant escaped cleanup");
     }
 
     #[test]
@@ -957,5 +2333,20 @@ mod tests {
         let lines = diff_lines("a\nb\nc\n", "a\nB\nc\n");
         assert!(lines.iter().any(|(t, l)| *t == '-' && l == "b"));
         assert!(lines.iter().any(|(t, l)| *t == '+' && l == "B"));
+    }
+
+    #[test]
+    fn adversarial_diff_preview_obeys_a_short_deadline() {
+        let old = (0..MAX_DIFF_INPUT_LINES)
+            .map(|index| format!("old-{index}\n"))
+            .collect::<String>();
+        let new = (0..MAX_DIFF_INPUT_LINES)
+            .map(|index| format!("new-{index}\n"))
+            .collect::<String>();
+        let started = Instant::now();
+        let lines = diff_lines_bounded(&old, &new).expect("bounded adversarial diff");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!lines.is_empty());
+        assert!(lines.len() <= MAX_DIFF_PREVIEW_LINES + 1);
     }
 }

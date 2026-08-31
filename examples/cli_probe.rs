@@ -4,6 +4,7 @@
 //! This bills the corresponding subscription one trivial read-only turn.
 
 use shaltaiboltai::config::Config;
+use shaltaiboltai::policy::{ApprovalPolicy, ExecutionPolicy, SandboxMode, Workspace};
 use shaltaiboltai::providers::{
     self, ChatEvent, ChatRequest, Message, ModelEntry, ProviderKind, RequestPolicy,
 };
@@ -29,6 +30,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let execution_policy = ExecutionPolicy::from_parts(
+        Workspace::new(std::env::current_dir()?)?,
+        SandboxMode::ReadOnly,
+        ApprovalPolicy::Never,
+    );
     let req = ChatRequest {
         model: ModelEntry {
             provider,
@@ -41,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         tools: Vec::new(),
         policy: RequestPolicy::Interactive,
         force_full_handoff: false,
+        execution_policy,
     };
     tokio::spawn(providers::stream_chat(Config::load(), req, tx));
 

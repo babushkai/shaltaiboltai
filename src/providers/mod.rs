@@ -5,6 +5,7 @@ pub mod openai;
 mod sse;
 
 use crate::config::Config;
+use crate::policy::ExecutionPolicy;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,7 +38,8 @@ impl ProviderKind {
     }
 
     /// Sub-agent providers run their own tool loop, so our tool definitions and
-    /// approval flow don't apply to them.
+    /// approval UI cannot mediate their inner calls. The captured execution
+    /// policy is translated to each CLI's native boundary instead.
     pub fn is_sub_agent(&self) -> bool {
         matches!(self, ProviderKind::ClaudeCode | ProviderKind::Codex)
     }
@@ -276,6 +278,10 @@ pub struct ChatRequest {
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
+    /// Immutable execution authority captured when this turn starts. Provider
+    /// subprocesses must use this snapshot instead of consulting mutable
+    /// configuration or inheriting a CLI's ambient permissions.
+    pub execution_policy: ExecutionPolicy,
     pub policy: RequestPolicy,
     /// Force CLI transports to include `system` and role-labelled history even
     /// for a single-user first turn. Orchestration relies on this for planner,
@@ -283,9 +289,10 @@ pub struct ChatRequest {
     pub force_full_handoff: bool,
 }
 
-/// Execution authority for a provider request. Interactive requests preserve
-/// the user's configured CLI permissions; read-only requests enforce a
-/// provider-specific non-mutating sandbox for advisory workers.
+/// Purpose-specific restriction layered over [`ChatRequest::execution_policy`].
+/// Interactive requests use the captured execution authority; read-only
+/// advisory requests are always narrowed to provider-specific non-mutating
+/// capabilities, regardless of the captured sandbox mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RequestPolicy {
     #[default]
@@ -424,8 +431,6 @@ mod tests {
             compact_threshold_chars: 80_000,
             ollama_num_ctx: 16_384,
             theme: None,
-            claude_code_bypass_permissions: false,
-            codex_full_access: false,
             reduced_motion: false,
         }
     }
@@ -443,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_catalogs_keep_the_cli_default_first() {
+    fn cli_model_rows_keep_the_cli_default_first() {
         let claude = claude_code_models();
         assert_eq!(claude[0].id, "claude-code");
         assert_eq!(claude[1].id, "claude-code:fable");

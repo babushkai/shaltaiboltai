@@ -18,13 +18,6 @@ pub struct Config {
     pub ollama_num_ctx: usize,
     /// Initial theme name; a theme picked at runtime (/theme) takes precedence.
     pub theme: Option<String>,
-    /// When the Claude Code subscription provider runs as a sub-agent, allow it
-    /// to run shell commands and other permissioned tools unsupervised. Off by
-    /// default: it may read and edit files but shell commands are auto-denied.
-    pub claude_code_bypass_permissions: bool,
-    /// Run the Codex sub-agent with `danger-full-access` (no sandbox) instead of
-    /// the default OS-sandboxed `workspace-write`. Off by default.
-    pub codex_full_access: bool,
     /// Freeze decorative motion while keeping state labels and progress text.
     pub reduced_motion: bool,
 }
@@ -42,8 +35,6 @@ struct FileConfig {
     compact_threshold_chars: Option<usize>,
     ollama_num_ctx: Option<usize>,
     theme: Option<String>,
-    claude_code_bypass_permissions: Option<bool>,
-    codex_full_access: Option<bool>,
     reduced_motion: Option<bool>,
 }
 
@@ -71,8 +62,6 @@ impl Config {
                 .unwrap_or(DEFAULT_COMPACT_THRESHOLD_CHARS),
             ollama_num_ctx: file.ollama_num_ctx.unwrap_or(DEFAULT_OLLAMA_NUM_CTX),
             theme: file.theme,
-            claude_code_bypass_permissions: file.claude_code_bypass_permissions.unwrap_or(false),
-            codex_full_access: file.codex_full_access.unwrap_or(false),
             reduced_motion: env("SHALTAIBOLTAI_REDUCED_MOTION")
                 .as_deref()
                 .and_then(parse_bool)

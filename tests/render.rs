@@ -1,8 +1,9 @@
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 use ratatui::Terminal;
-use shaltaiboltai::app::{App, AppEvent, Entry, Mode};
+use shaltaiboltai::app::{App, AppEvent, Entry, Mode, PermissionOverlay};
 use shaltaiboltai::config::Config;
+use shaltaiboltai::policy::{ExecutionPolicy, PermissionPreset, Workspace};
 use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
 use shaltaiboltai::{theme, ui};
 use tokio::sync::mpsc::unbounded_channel;
@@ -24,8 +25,6 @@ fn offline_config() -> Config {
         compact_threshold_chars: 80_000,
         ollama_num_ctx: 16_384,
         theme: None,
-        claude_code_bypass_permissions: false,
-        codex_full_access: false,
         reduced_motion: false,
     }
 }
@@ -43,6 +42,190 @@ fn screen(terminal: &Terminal<TestBackend>) -> String {
         .collect()
 }
 
+fn require_write_approval(app: &mut App) {
+    app.policy.apply_preset(PermissionPreset::ReadOnly);
+}
+
+fn visual_fingerprint(terminal: &Terminal<TestBackend>) -> u64 {
+    fn byte(hash: &mut u64, value: u8) {
+        *hash ^= u64::from(value);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    fn color(hash: &mut u64, value: Color) {
+        match value {
+            Color::Reset => byte(hash, 0),
+            Color::Black => byte(hash, 1),
+            Color::Red => byte(hash, 2),
+            Color::Green => byte(hash, 3),
+            Color::Yellow => byte(hash, 4),
+            Color::Blue => byte(hash, 5),
+            Color::Magenta => byte(hash, 6),
+            Color::Cyan => byte(hash, 7),
+            Color::Gray => byte(hash, 8),
+            Color::DarkGray => byte(hash, 9),
+            Color::LightRed => byte(hash, 10),
+            Color::LightGreen => byte(hash, 11),
+            Color::LightYellow => byte(hash, 12),
+            Color::LightBlue => byte(hash, 13),
+            Color::LightMagenta => byte(hash, 14),
+            Color::LightCyan => byte(hash, 15),
+            Color::White => byte(hash, 16),
+            Color::Indexed(index) => {
+                byte(hash, 17);
+                byte(hash, index);
+            }
+            Color::Rgb(red, green, blue) => {
+                byte(hash, 18);
+                byte(hash, red);
+                byte(hash, green);
+                byte(hash, blue);
+            }
+        }
+    }
+
+    let buffer = terminal.backend().buffer();
+    let mut hash = 0xcbf29ce484222325;
+    for cell in &buffer.content {
+        for value in cell.symbol().as_bytes() {
+            byte(&mut hash, *value);
+        }
+        byte(&mut hash, 0xff);
+        color(&mut hash, cell.fg);
+        color(&mut hash, cell.bg);
+        for value in cell.modifier.bits().to_le_bytes() {
+            byte(&mut hash, value);
+        }
+    }
+    hash
+}
+
+fn golden_app(selected_theme: theme::Theme) -> App {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let workspace = Workspace::new("/").expect("root is a stable golden workspace");
+    let mut app = App::with_policy(offline_config(), ExecutionPolicy::new(workspace), tx);
+    app.discovering = false;
+    app.theme = selected_theme;
+    app.cwd_display = "/".into();
+    app.git_branch = None;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::OpenAi,
+        id: "gpt-golden".into(),
+    });
+    app
+}
+
+fn golden_frame(selected_theme: theme::Theme, state: &str, width: u16, height: u16) -> u64 {
+    let mut app = golden_app(selected_theme);
+    match state {
+        "idle" => {}
+        "help" => app.open_help(),
+        "permissions" => app.open_permissions(),
+        "full-access" => {
+            app.open_permissions();
+            app.permission_move(1);
+            app.select_permission();
+        }
+        "approval" => {
+            require_write_approval(&mut app);
+            app.on_event(AppEvent::Chat {
+                gen: 0,
+                event: ChatEvent::Completed {
+                    tool_calls: vec![ToolCall {
+                        id: "golden-approval".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "/golden-approval.txt",
+                            "content": "first line\nsecond line\n",
+                        }),
+                    }],
+                    stop_reason: Some("tool_calls".into()),
+                    usage: None,
+                },
+            });
+            app.focus_approval();
+        }
+        other => panic!("unknown golden state {other}"),
+    }
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    if state != "idle" {
+        assert!(
+            !rendered.contains("─┌"),
+            "{state} {width}x{height}\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("┘─"),
+            "{state} {width}x{height}\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("│─"),
+            "{state} {width}x{height}\n{rendered}"
+        );
+    }
+    visual_fingerprint(&terminal)
+}
+
+#[tokio::test]
+async fn ink_and_paper_visual_matrix_matches_reviewed_goldens() {
+    let mut actual = Vec::new();
+    for selected_theme in [theme::INK, theme::PAPER] {
+        for state in ["idle", "help", "permissions", "full-access", "approval"] {
+            for (width, height) in [(120, 36), (80, 24), (60, 20), (40, 12)] {
+                actual.push(golden_frame(selected_theme, state, width, height));
+            }
+        }
+    }
+    let expected = [
+        // Ink: idle, help, permissions, Full Access, approval; each at
+        // 120×36, 80×24, 60×20, and 40×12.
+        18051856780018047632,
+        6793635348144853120,
+        17523623465100911483,
+        7399535153676875931,
+        7916747592767614418,
+        9766805106068794441,
+        7392134143799279625,
+        14127495065583846231,
+        4895029292874428120,
+        2503310590881834728,
+        16108201543158332212,
+        16535609583655917937,
+        17101991488478034557,
+        12566041740348679581,
+        10146448711041314622,
+        15870247430655268305,
+        17775131259198260367,
+        17104041888251279483,
+        8397692300777079118,
+        16600341820794276420,
+        // Paper: same state/size order.
+        8828966307763906173,
+        1243780950159226925,
+        12218775487749519745,
+        1869228612775065041,
+        6235617700968058889,
+        3478823323901343354,
+        15444914363686301305,
+        8298255705288041947,
+        3369525481403874887,
+        1106415762216010455,
+        12925748657151263656,
+        7986813052121011473,
+        13388693751731183036,
+        115114107704535180,
+        18203606322182210490,
+        2050690867392574069,
+        8821065850770950250,
+        9162302762075744110,
+        4056824799300614784,
+        57088319003368999,
+    ];
+    assert_eq!(actual, expected);
+}
+
 #[tokio::test]
 async fn renders_themed_frame() {
     isolate_data_dir();
@@ -56,9 +239,12 @@ async fn renders_themed_frame() {
     let top_row: String = (0..80)
         .map(|x| buffer[(x, 0)].symbol().to_owned())
         .collect();
-    assert!(top_row.contains("◆ shaltaiboltai"), "{top_row}");
+    assert!(top_row.contains("SB"), "{top_row}");
+    assert!(top_row.contains("SHALTAIBOLTAI"), "{top_row}");
     assert!(!top_row.contains("REAL AGENT"), "{top_row}");
     assert!(!top_row.contains("DANCING"), "{top_row}");
+    assert_eq!(buffer[(0, 0)].bg, theme::INK.accent);
+    assert_eq!(buffer[(4, 0)].bg, theme::INK.surface.unwrap());
     assert_eq!(app.render_cache_width, 76);
 }
 
@@ -77,7 +263,7 @@ async fn theme_switch_restyles_the_frame() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    assert_eq!(buffer[(0, 0)].bg, app.theme.bg.unwrap());
+    assert_eq!(buffer[(79, 10)].bg, app.theme.bg.unwrap());
 
     // Esc must restore the original theme.
     app.revert_theme();
@@ -160,17 +346,16 @@ async fn statusline_shows_cwd_and_branch() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    // Layout bottom-up: input is 3 rows (1 line + borders), status is the
-    // single row above it: 24 - 3 - 1 = 20.
     let status_row: String = (0..120)
-        .map(|x| buffer[(x, 20)].symbol().to_owned())
+        .map(|x| buffer[(x, 1)].symbol().to_owned())
         .collect();
     assert!(
         status_row.contains(app.cwd_display.as_str()),
         "{status_row}"
     );
     if let Some(branch) = &app.git_branch {
-        assert!(status_row.contains(branch.as_str()), "{status_row}");
+        let visible_prefix = branch.chars().take(10).collect::<String>();
+        assert!(status_row.contains(&visible_prefix), "{status_row}");
     }
 }
 
@@ -184,7 +369,9 @@ async fn terminal_theme_keeps_default_background() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+    assert_eq!(buffer[(0, 0)].bg, Color::Cyan);
+    assert_eq!(buffer[(4, 0)].bg, Color::Reset);
+    assert_eq!(buffer[(79, 10)].bg, Color::Reset);
 }
 
 #[tokio::test]
@@ -202,6 +389,14 @@ async fn help_is_a_responsive_overlay_instead_of_transcript_noise() {
     assert!(rendered.contains("keyboard guide"), "{rendered}");
     assert!(rendered.contains("restore queued, then quit"), "{rendered}");
     assert!(rendered.contains("F1 · Enter · Esc close"), "{rendered}");
+
+    let mut narrow = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    narrow.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&narrow);
+    assert!(rendered.contains("/team"), "{rendered}");
+    assert!(rendered.contains("lead + workers"), "{rendered}");
+    assert!(rendered.contains("y/a/n approve / deny"), "{rendered}");
+    assert!(!rendered.contains("]lead"), "{rendered}");
 }
 
 #[tokio::test]
@@ -215,6 +410,8 @@ async fn help_height_boundary_keeps_the_queue_safe_quit_binding() {
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = screen(&terminal);
+    assert!(rendered.contains("SB"), "{rendered}");
+    assert!(rendered.contains("Ask for approval"), "{rendered}");
     assert!(rendered.contains("queue-safe quit"), "{rendered}");
 }
 
@@ -223,6 +420,7 @@ async fn long_approval_keeps_actions_visible_and_scrolls_its_preview() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
+    require_write_approval(&mut app);
     let content = (0..80)
         .map(|line| format!("approval line {line}"))
         .collect::<Vec<_>>()
@@ -347,9 +545,12 @@ async fn conversation_rail_labels_people_and_tool_state() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let rendered = screen(&terminal);
     assert!(rendered.contains("YOU"), "{rendered}");
-    assert!(rendered.contains("ASSISTANT"), "{rendered}");
-    assert!(rendered.contains("DONE"), "{rendered}");
-    assert!(rendered.contains("TOOL · 1 output line"), "{rendered}");
+    assert!(rendered.contains("SHALTAIBOLTAI"), "{rendered}");
+    assert!(
+        rendered.contains("tool · done · 1 output line"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(" DONE "), "{rendered}");
 }
 
 #[tokio::test]
@@ -361,9 +562,115 @@ async fn narrow_terminal_preserves_conversation_status_and_composer() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let rendered = screen(&terminal);
-    assert!(rendered.contains("shaltaiboltai"), "{rendered}");
+    assert!(rendered.contains("SB"), "{rendered}");
     assert!(rendered.contains("discovering"), "{rendered}");
-    assert!(rendered.contains("compose"), "{rendered}");
+    assert!(rendered.contains('›'), "{rendered}");
+}
+
+#[tokio::test]
+async fn permissions_remain_complete_at_forty_by_twelve() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.open_permissions();
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    for label in ["Ask for approval", "Full Access", "Read Only"] {
+        assert!(rendered.contains(label), "{rendered}");
+    }
+    assert!(rendered.contains("DETAIL"), "{rendered}");
+    assert!(rendered.contains("sandboxed"), "{rendered}");
+    assert!(
+        rendered.contains("workspace. Ask before network"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("outside writes"), "{rendered}");
+    assert!(rendered.contains("Enter select"), "{rendered}");
+    assert!(rendered.contains("Esc close"), "{rendered}");
+    assert!(!rendered.contains("Codex"), "{rendered}");
+}
+
+#[tokio::test]
+async fn full_access_confirmation_defaults_to_the_safe_action() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.open_permissions();
+    app.permission_move(1);
+    app.select_permission();
+    assert_eq!(
+        app.permission_overlay,
+        Some(PermissionOverlay::FullAccessConfirm)
+    );
+    assert!(!app.full_access_enable_selected);
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    assert!(rendered.contains("Go back"), "{rendered}");
+    assert!(rendered.contains("Enable full access"), "{rendered}");
+    assert!(rendered.contains("Enter · Esc"), "{rendered}");
+
+    app.activate_full_access_confirmation();
+    assert_eq!(app.permission_overlay, Some(PermissionOverlay::Picker));
+    assert_ne!(
+        app.policy.sandbox_mode(),
+        shaltaiboltai::policy::SandboxMode::DangerFullAccess
+    );
+
+    app.select_permission();
+    app.move_full_access_confirmation(1);
+    assert!(app.full_access_enable_selected);
+    app.activate_full_access_confirmation();
+    assert_eq!(app.permission_overlay, None);
+    assert_eq!(
+        app.policy.matching_preset(),
+        Some(PermissionPreset::FullAccess)
+    );
+}
+
+#[tokio::test]
+async fn status_uses_grouped_product_chrome_without_stock_terminal_art() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.textarea.insert_str("/status");
+    app.submit_input();
+    for (width, height) in [(80, 24), (60, 20), (40, 12)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        for section in ["STATUS", "RUNTIME", "WORKSPACE", "USAGE"] {
+            assert!(rendered.contains(section), "{width}x{height}\n{rendered}");
+        }
+        assert!(rendered.contains("Permissions"), "{rendered}");
+        if width >= 60 {
+            assert!(rendered.contains("Network"), "{rendered}");
+        }
+        assert!(!rendered.contains(">_"), "{rendered}");
+        assert!(!rendered.contains("data not available yet"), "{rendered}");
+    }
+}
+
+#[tokio::test]
+async fn common_shell_uses_one_rule_and_no_oversized_hero() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    assert!(!rendered.contains("┌ ›"), "{rendered}");
+    assert!(!rendered.contains('▀'), "{rendered}");
+    assert!(!rendered.contains('▄'), "{rendered}");
+    assert!(!rendered.contains('█'), "{rendered}");
 }
 
 #[tokio::test]
@@ -427,6 +734,7 @@ async fn approval_arrives_with_composer_focus_and_explicit_review_hint() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
+    require_write_approval(&mut app);
     app.mode = Mode::Streaming;
     app.textarea.insert_str("typed y remains text");
     app.on_event(AppEvent::Chat {
@@ -455,6 +763,7 @@ async fn tall_draft_keeps_the_approval_review_escape_hatch_visible() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
+    require_write_approval(&mut app);
     app.mode = Mode::Streaming;
     app.textarea.insert_str(
         (1..=8)
@@ -527,7 +836,7 @@ async fn scrolled_transcript_stays_anchored_when_tail_reflows() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (1..19)
+        (2..21)
             .map(|y| {
                 (2..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
@@ -556,7 +865,7 @@ async fn error_and_cancel_replacements_keep_scrolled_content_anchored() {
     isolate_data_dir();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (1..19)
+        (2..21)
             .map(|y| {
                 (2..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
@@ -617,6 +926,8 @@ async fn long_approval_material_wraps_to_reachable_visual_rows() {
                 name: "run_command".into(),
                 arguments: serde_json::json!({
                     "command": format!("echo start; {} echo APPROVAL_TAIL_§", "echo segment; ".repeat(40)),
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "render the escalation review",
                 }),
             }],
             stop_reason: Some("tool_calls".into()),
@@ -637,6 +948,7 @@ async fn long_approval_material_wraps_to_reachable_visual_rows() {
 
     let (tx, _rx) = unbounded_channel();
     let mut diff_app = App::new(offline_config(), tx);
+    require_write_approval(&mut diff_app);
     diff_app.on_event(AppEvent::Chat {
         gen: 0,
         event: ChatEvent::Completed {
@@ -677,12 +989,12 @@ async fn narrow_help_prioritizes_safety_bindings_without_overflow() {
 }
 
 #[tokio::test]
-async fn light_theme_tool_badge_uses_a_readable_on_color() {
+async fn paper_theme_keeps_semantic_states_restrained_and_readable() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
     app.discovering = false;
-    app.theme = theme::LATTE;
+    app.theme = theme::PAPER;
     app.transcript = vec![Entry::Tool {
         summary: "checked contrast".into(),
         result: "ok".into(),
@@ -696,21 +1008,31 @@ async fn light_theme_tool_badge_uses_a_readable_on_color() {
     let done_cell = (0..buffer.area.height)
         .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
         .map(|position| &buffer[position])
-        .find(|cell| cell.symbol() == "D" && cell.bg == theme::LATTE.success)
-        .expect("DONE badge should be rendered on the success color");
-    assert_eq!(done_cell.fg, Color::Black);
+        .find(|cell| cell.symbol() == "✓")
+        .expect("tool completion glyph should be rendered");
+    assert_eq!(done_cell.fg, theme::PAPER.success);
+    assert_ne!(done_cell.bg, theme::PAPER.success);
+    let accent_fill_cells = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .map(|position| &buffer[position])
+        .filter(|cell| cell.bg == theme::PAPER.accent)
+        .count();
+    assert_eq!(
+        accent_fill_cells, 4,
+        "only the four-cell seal may be filled"
+    );
     assert!(
         (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
             .map(|position| &buffer[position])
-            .all(|cell| !(cell.bg == theme::LATTE.surface.unwrap()
-                && cell.fg == theme::LATTE.success)),
-        "low-contrast success text should fall back on Latte surfaces"
+            .all(|cell| cell.bg != theme::PAPER.success),
+        "semantic success must not become a filled badge"
     );
 
     let (tx, _rx) = unbounded_channel();
     let mut approval = App::new(offline_config(), tx);
-    approval.theme = theme::LATTE;
+    require_write_approval(&mut approval);
+    approval.theme = theme::PAPER;
     approval.on_event(AppEvent::Chat {
         gen: 0,
         event: ChatEvent::Completed {
@@ -734,8 +1056,7 @@ async fn light_theme_tool_badge_uses_a_readable_on_color() {
         (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
             .map(|position| &buffer[position])
-            .all(|cell| !(cell.bg == theme::LATTE.surface.unwrap()
-                && cell.fg == theme::LATTE.warning)),
-        "low-contrast warning text should fall back on Latte surfaces"
+            .all(|cell| cell.bg != theme::PAPER.warning),
+        "warning color must remain a foreground cue"
     );
 }

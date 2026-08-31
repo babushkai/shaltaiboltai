@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::images;
 use crate::mascot::MascotState;
 use crate::orchestration::{self, PlannedTask, WorkerOutcome};
+use crate::policy::{ApprovalPolicy, ExecutionPolicy, PermissionPreset, SandboxMode, Workspace};
 use crate::providers::{
     self, ChatEvent, ChatRequest, ImageData, Message, ModelEntry, ProviderKind, RequestPolicy,
     ToolCall, Usage, UserContent,
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
+use std::io::Read;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
@@ -31,10 +33,27 @@ const COMPACT_FLATTEN_CAP: usize = 4_000;
 /// Cap on project instruction files injected into the system prompt.
 const PROJECT_CONTEXT_CAP: usize = 8_000;
 
+/// Git pointer and HEAD files are tiny. Refuse oversized metadata instead of
+/// letting a hostile workspace turn status rendering into an unbounded read.
+const GIT_METADATA_CAP_BYTES: usize = 4 * 1024;
+
 /// Reserve space beyond worker evidence for the lead's system prompt, root
 /// task, and generated answer/tool calls.
 const ORCHESTRATION_SYSTEM_HEADROOM: usize = 8_000;
 const MIN_SYNTHESIS_EVIDENCE_CHARS: usize = 4_000;
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/// Upstream Codex implements `/init` as a hidden synthetic user turn, so the
+/// normal model, tool, sandbox, and approval path owns AGENTS.md creation.
+const INIT_PROMPT: &str = include_str!("../prompt_for_init_command.md");
+
+/// Current upstream presentation order. This intentionally differs from the
+/// enum declaration order because the workspace preset is the common action.
+pub const PERMISSION_PRESETS: [PermissionPreset; 3] = [
+    PermissionPreset::AskForApproval,
+    PermissionPreset::FullAccess,
+    PermissionPreset::ReadOnly,
+];
 
 /// One-turn lookahead keeps memory bounded and makes failure recovery exact:
 /// there can never be a second draft to merge with a restored queued prompt.
@@ -51,6 +70,7 @@ struct ActiveRootPrompt {
     history_len: usize,
     transcript_len: usize,
     observed_activity: bool,
+    restore_on_failure: bool,
 }
 
 impl QueuedPrompt {
@@ -67,6 +87,122 @@ impl QueuedPrompt {
 struct RestoredReferences {
     text: String,
     images: Vec<(String, ImageData)>,
+}
+
+/// Resolve image references against the immutable workspace selected at
+/// launch. The lower-level image module intentionally follows the process
+/// working directory, which can differ when the CLI is launched with `-C`.
+fn workspace_image_paths(text: &str, cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for candidate in image_path_tokens(text)
+        .iter()
+        .map(String::as_str)
+        .chain(text.lines())
+    {
+        if let Some(path) = workspace_image_path(candidate, cwd) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+/// A terminal file drop is a paste containing only image paths. Preserve the
+/// existing whole-path-first behavior so filenames with spaces stay intact.
+fn dropped_workspace_images(text: &str, cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if let Some(path) = workspace_image_path(text, cwd) {
+        return vec![path];
+    }
+    let tokens = image_path_tokens(text);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let paths: Vec<_> = tokens
+        .iter()
+        .filter_map(|token| workspace_image_path(token, cwd))
+        .collect();
+    if paths.len() == tokens.len() {
+        paths
+    } else {
+        Vec::new()
+    }
+}
+
+fn workspace_image_path(candidate: &str, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unquoted = ['"', '\'']
+        .into_iter()
+        .find_map(|quote| {
+            trimmed
+                .strip_prefix(quote)
+                .and_then(|inner| inner.strip_suffix(quote))
+        })
+        .unwrap_or(trimmed);
+    let mut unescaped = String::with_capacity(unquoted.len());
+    let mut chars = unquoted.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+            }
+        } else {
+            unescaped.push(character);
+        }
+    }
+    let mut path = if let Some(rest) = unescaped.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| std::path::PathBuf::from(&unescaped))
+    } else {
+        std::path::PathBuf::from(&unescaped)
+    };
+    if !path.is_absolute() {
+        path = cwd.join(path);
+    }
+    let is_image = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        });
+    (is_image && path.is_file()).then_some(path)
+}
+
+fn image_path_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                token.push('\\');
+                if let Some(&next) = chars.peek() {
+                    token.push(next);
+                    chars.next();
+                }
+            }
+            '"' | '\'' => match quote {
+                Some(open) if open == character => quote = None,
+                Some(_) => token.push(character),
+                None => quote = Some(character),
+            },
+            character if character.is_whitespace() && quote.is_none() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            character => token.push(character),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +253,24 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         aliases: &["models"],
         args: Some("[name]"),
         description: "switch model — also Ctrl+P",
+    },
+    SlashCommand {
+        name: "permissions",
+        aliases: &[],
+        args: None,
+        description: "choose what the agent is allowed to do",
+    },
+    SlashCommand {
+        name: "status",
+        aliases: &[],
+        args: None,
+        description: "show current session configuration and token usage",
+    },
+    SlashCommand {
+        name: "init",
+        aliases: &[],
+        args: None,
+        description: "create an AGENTS.md file with repository instructions",
     },
     SlashCommand {
         name: "theme",
@@ -212,7 +366,7 @@ pub enum AppEvent {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     Input,
     Streaming,
@@ -224,6 +378,12 @@ pub enum Mode {
     SessionPicker,
     ThemePicker,
     Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermissionOverlay {
+    Picker,
+    FullAccessConfirm,
 }
 
 /// What the transcript pane renders. Kept separate from the provider history
@@ -250,11 +410,17 @@ pub enum Entry {
         is_error: bool,
     },
     Info(String),
+    Status {
+        title: String,
+        fields: Vec<(String, String)>,
+    },
     Error(String),
 }
 
 pub struct App {
     pub config: Config,
+    /// Single effective authority used by status, tools, and provider launches.
+    pub policy: ExecutionPolicy,
     pub mode: Mode,
     pub should_quit: bool,
     pub compacting: bool,
@@ -321,10 +487,16 @@ pub struct App {
 
     /// Diff preview for the tool call currently awaiting approval.
     pub approval_preview: Option<Vec<(char, String)>>,
+    pending_approval_assessment: Option<tools::ToolAssessment>,
     pub approval_scroll: usize,
     /// Approval shortcuts are armed explicitly when type-ahead was available,
     /// so a typed `a`, `y`, or `n` can never decide a newly arrived modal.
     pub approval_focused: bool,
+    pub permission_index: usize,
+    pub permission_overlay: Option<PermissionOverlay>,
+    /// Full Access opens with the safe action selected. Arrow keys are needed
+    /// before Enter can activate the destructive choice.
+    pub full_access_enable_selected: bool,
 
     // Renderer cache, managed by ui::draw.
     pub render_cache: Vec<Vec<Line<'static>>>,
@@ -343,9 +515,10 @@ pub struct App {
     pending_calls: VecDeque<ToolCall>,
     /// Explicit grants for narrowly scoped paths/searches/commands. These are
     /// intentionally conversation-local and never persisted.
-    approved_scopes: HashSet<String>,
+    approved_scopes: HashSet<Vec<u8>>,
     agent_turns: usize,
     active_turn_model: Option<ModelEntry>,
+    active_execution_policy: Option<ExecutionPolicy>,
     active_turn_can_promote_queue: bool,
     /// Exact ownership of the submitted root prompt until the provider emits
     /// activity. A launch/model error can then roll it back for lossless retry.
@@ -369,6 +542,16 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
+        let cwd = std::env::current_dir().expect("current directory is available");
+        let workspace = Workspace::new(cwd).expect("current directory is a valid workspace");
+        Self::with_policy(config, ExecutionPolicy::new(workspace), tx)
+    }
+
+    pub fn with_policy(
+        config: Config,
+        policy: ExecutionPolicy,
+        tx: UnboundedSender<AppEvent>,
+    ) -> Self {
         let theme = session::load_theme_name()
             .or_else(|| config.theme.clone())
             .and_then(|name| theme::by_name(&name))
@@ -384,6 +567,7 @@ impl App {
         let discovery_models = models.clone();
         let mut app = App {
             config,
+            policy,
             mode: Mode::Input,
             should_quit: false,
             compacting: false,
@@ -422,8 +606,12 @@ impl App {
             restored_references: None,
             suppressed_reference_text: None,
             approval_preview: None,
+            pending_approval_assessment: None,
             approval_scroll: 0,
             approval_focused: true,
+            permission_index: 0,
+            permission_overlay: None,
+            full_access_enable_selected: false,
             render_cache: Vec::new(),
             render_cache_starts: Vec::new(),
             render_cache_total_lines: 0,
@@ -436,6 +624,7 @@ impl App {
             approved_scopes: HashSet::new(),
             agent_turns: 0,
             active_turn_model: None,
+            active_execution_policy: None,
             active_turn_can_promote_queue: true,
             active_root_prompt: None,
             team_workers: None,
@@ -452,10 +641,7 @@ impl App {
         };
         app.transcript.push(Entry::Banner {
             title: "Ready to build".into(),
-            subtitle: format!(
-                "v{} · Describe a change, ask about the code, or type / for commands. F1 opens the keyboard guide.",
-                env!("CARGO_PKG_VERSION"),
-            ),
+            subtitle: "Describe a change, ask about the code, or type / for commands.".into(),
         });
         app.refresh_environment();
         app.spawn_discovery();
@@ -470,13 +656,23 @@ impl App {
             || self.discovering
     }
 
+    /// Immutable authority snapshot currently governing model and tool work.
+    /// Permission changes made mid-turn affect the next turn, not this one.
+    pub fn effective_execution_policy(&self) -> &ExecutionPolicy {
+        self.active_execution_policy
+            .as_ref()
+            .unwrap_or(&self.policy)
+    }
+
     pub fn mascot_state(&self) -> MascotState {
         if matches!(
             self.mode,
             Mode::Streaming | Mode::RunningTool | Mode::Orchestrating
         ) {
             MascotState::Working
-        } else if matches!(self.mode, Mode::Approval | Mode::OrchestrationConfirm) {
+        } else if self.permission_overlay.is_some()
+            || matches!(self.mode, Mode::Approval | Mode::OrchestrationConfirm)
+        {
             MascotState::Waiting
         } else if self.compacting || self.discovering {
             MascotState::Thinking
@@ -504,10 +700,9 @@ impl App {
     /// Cwd and git branch for the statusline. Cheap (one small file read);
     /// refreshed after turns/tools and on a slow idle tick, not per frame.
     pub fn refresh_environment(&mut self) {
-        self.cwd_display = std::env::current_dir()
-            .map(|p| shorten_path(&p))
-            .unwrap_or_default();
-        self.git_branch = read_git_branch(std::path::Path::new(".git"));
+        let cwd = self.policy.workspace().cwd();
+        self.cwd_display = shorten_path(cwd);
+        self.git_branch = read_git_branch(&cwd.join(".git"));
     }
 
     // ---- slash-command menu ----
@@ -607,7 +802,7 @@ impl App {
     /// A captured lookahead prompt locks the editor until it is sent or
     /// restored, which keeps attachment ownership unambiguous.
     pub fn composer_accepts_input(&self) -> bool {
-        if self.queued_prompt.is_some() {
+        if self.queued_prompt.is_some() || self.permission_overlay.is_some() {
             return false;
         }
         match self.mode {
@@ -766,7 +961,7 @@ impl App {
                     }
                 }
                 // An explicitly entered CLI selector may not be present in a
-                // provider's detected catalog. Preserve it across /refresh as
+                // provider's detected model rows. Preserve it across /refresh as
                 // long as that CLI itself is still available.
                 if let Some(current) = self.model.as_ref().filter(|current| {
                     self.model_selected_explicitly
@@ -1119,6 +1314,7 @@ impl App {
                 self.transcript.push(Entry::Error(message));
                 self.pending_calls.clear();
                 self.approval_preview = None;
+                self.pending_approval_assessment = None;
                 self.repair_dangling_tool_calls();
                 // Fence any already-buffered events from this failed root turn
                 // before the restored draft can be submitted again.
@@ -1128,13 +1324,17 @@ impl App {
                 self.orchestration_run = None;
                 self.orchestration_context = None;
                 self.active_turn_model = None;
+                self.active_execution_policy = None;
                 self.active_turn_can_promote_queue = true;
                 self.approval_focused = true;
                 if restore_current {
-                    self.restore_prompt(
-                        active_root.expect("checked above").prompt,
-                        "message restored — the provider rejected it before producing output",
-                    );
+                    let active = active_root.expect("checked above");
+                    if active.restore_on_failure {
+                        self.restore_prompt(
+                            active.prompt,
+                            "message restored — the provider rejected it before producing output",
+                        );
+                    }
                 } else {
                     self.restore_queued_prompt("the previous request failed");
                 }
@@ -1154,6 +1354,7 @@ impl App {
         self.orchestration_run = None;
         self.orchestration_context = None;
         self.active_turn_model = None;
+        self.active_execution_policy = None;
         self.active_root_prompt = None;
         self.refresh_environment();
         let can_promote = std::mem::replace(&mut self.active_turn_can_promote_queue, true);
@@ -1189,34 +1390,58 @@ impl App {
     /// drained send the results back to the model.
     fn advance_tools(&mut self) {
         self.approval_preview = None;
+        self.pending_approval_assessment = None;
         self.approval_scroll = 0;
-        match self.pending_calls.front() {
-            None => self.start_request(),
-            Some(call)
-                if tools::requires_approval(call)
-                    && !self.approved_scopes.contains(&tools::approval_scope(call)) =>
-            {
-                self.approval_preview = tools::approval_preview(call);
+        let Some(call) = self.pending_calls.front() else {
+            self.start_request();
+            return;
+        };
+        let policy = self
+            .active_execution_policy
+            .as_ref()
+            .unwrap_or(&self.policy);
+        let assessment = tools::assess(policy, call);
+        match assessment.decision() {
+            tools::ToolDecision::Deny => {
+                let reason = assessment
+                    .reason()
+                    .unwrap_or("the active execution policy forbids this tool call")
+                    .to_owned();
+                let call = self.pending_calls.pop_front().expect("front checked above");
+                self.finish_tool(call, format!("Tool call blocked: {reason}"), true);
+            }
+            tools::ToolDecision::Ask if !self.approved_scopes.contains(assessment.scope()) => {
+                self.approval_preview = tools::approval_preview(&assessment, call);
+                self.pending_approval_assessment = Some(assessment);
                 // Always require an explicit Tab before decision shortcuts are
                 // armed. This also fences keys buffered just before the modal
                 // arrived, even when the one lookahead slot is already full.
                 self.approval_focused = false;
                 self.mode = Mode::Approval;
             }
-            Some(_) => {
-                let call = self.pending_calls.pop_front().unwrap();
-                self.run_tool(call);
+            decision => {
+                let authorization = if decision == tools::ToolDecision::Ask {
+                    tools::ToolAuthorization::approved(policy, &assessment)
+                } else {
+                    tools::ToolAuthorization::Default
+                };
+                let call = self.pending_calls.pop_front().expect("front checked above");
+                self.run_tool(call, authorization);
             }
         }
     }
 
-    fn run_tool(&mut self, call: ToolCall) {
+    fn run_tool(&mut self, call: ToolCall, authorization: tools::ToolAuthorization) {
         self.mode = Mode::RunningTool;
         self.gen += 1;
         let gen = self.gen;
         let tx = self.tx.clone();
+        let policy = self
+            .active_execution_policy
+            .clone()
+            .unwrap_or_else(|| self.policy.clone());
         self.tool_task = Some(tokio::spawn(async move {
-            let (content, is_error) = tools::execute(&call).await;
+            let (content, is_error) = tools::execute(&policy, &call, &authorization).await;
             let _ = tx.send(AppEvent::ToolFinished {
                 gen,
                 call,
@@ -1245,18 +1470,50 @@ impl App {
     }
 
     pub fn approve_pending(&mut self, always: bool) {
-        if let Some(call) = self.pending_calls.pop_front() {
-            if always {
-                self.approved_scopes.insert(tools::approval_scope(&call));
+        if let Some(call) = self.pending_calls.front().cloned() {
+            let policy = self
+                .active_execution_policy
+                .clone()
+                .unwrap_or_else(|| self.policy.clone());
+            let assessment = tools::assess(&policy, &call);
+            if self.pending_approval_assessment.as_ref() != Some(&assessment) {
+                self.approval_preview = None;
+                self.pending_approval_assessment = None;
+                self.transcript.push(Entry::Info(
+                    "Tool target changed while awaiting approval — re-evaluating the request."
+                        .into(),
+                ));
+                self.advance_tools();
+                return;
             }
+            let call = self.pending_calls.pop_front().expect("front cloned above");
+            if assessment.decision() == tools::ToolDecision::Deny {
+                let reason = assessment
+                    .reason()
+                    .unwrap_or("the active execution policy forbids this tool call");
+                self.approval_preview = None;
+                self.pending_approval_assessment = None;
+                self.finish_tool(call, format!("Tool call blocked: {reason}"), true);
+                return;
+            }
+            if always && assessment.decision() == tools::ToolDecision::Ask {
+                self.approved_scopes.insert(assessment.scope().to_owned());
+            }
+            let authorization = if assessment.decision() == tools::ToolDecision::Ask {
+                tools::ToolAuthorization::approved(&policy, &assessment)
+            } else {
+                tools::ToolAuthorization::Default
+            };
             self.approval_preview = None;
-            self.run_tool(call);
+            self.pending_approval_assessment = None;
+            self.run_tool(call, authorization);
         }
     }
 
     pub fn deny_pending(&mut self) {
         if let Some(call) = self.pending_calls.pop_front() {
             self.approval_preview = None;
+            self.pending_approval_assessment = None;
             self.finish_tool(call, "User denied this tool call.".into(), true);
         }
     }
@@ -1304,7 +1561,9 @@ impl App {
 
         if !text.starts_with('/') && self.team_workers.is_some() {
             let worker_count = self.team_workers.expect("checked above");
-            if self.pending_image_count() > 0 || !images::extract_image_paths(&text).is_empty() {
+            if self.pending_image_count() > 0
+                || !workspace_image_paths(&text, self.policy.workspace().cwd()).is_empty()
+            {
                 self.transcript.push(Entry::Error(
                     "team mode is text-only for now — attachments and prompt were preserved".into(),
                 ));
@@ -1410,7 +1669,7 @@ impl App {
             .take()
             .is_some_and(|suppressed| suppressed == text);
         if !reuse_restored && !references_suppressed {
-            for path in images::extract_image_paths(&text) {
+            for path in workspace_image_paths(&text, self.policy.workspace().cwd()) {
                 match images::load_image(&path) {
                     Ok(attachment) => referenced_images.push(attachment),
                     Err(e) => self.transcript.push(Entry::Error(format!("{e:#}"))),
@@ -1455,7 +1714,7 @@ impl App {
         // and originally staged attachments untouched.
         let staged_images = std::mem::take(&mut self.pending_images);
         let mut referenced_images = Vec::new();
-        for path in images::extract_image_paths(&text) {
+        for path in workspace_image_paths(&text, self.policy.workspace().cwd()) {
             match images::load_image(&path) {
                 Ok(attachment) => referenced_images.push(attachment),
                 Err(e) => {
@@ -1490,6 +1749,7 @@ impl App {
             &self.history,
             &prompt.text,
             worker_count,
+            &self.policy,
         )
         .expect("team planner safety is checked before planning");
         self.orchestration_run = Some(OrchestrationRun {
@@ -1566,7 +1826,11 @@ impl App {
         };
         let task_text = prompt.text.clone();
         let history = self.history.clone();
-        self.begin_root_prompt(prompt);
+        self.begin_root_prompt(prompt, true, true);
+        let execution_policy = self
+            .active_execution_policy
+            .clone()
+            .expect("root turn captures execution policy");
 
         run.entry_indices = run
             .tasks
@@ -1600,7 +1864,8 @@ impl App {
             let mut workers = FuturesUnordered::new();
             for task in tasks {
                 let config = config.clone();
-                let request = orchestration::worker_request(&history, &task_text, &task);
+                let request =
+                    orchestration::worker_request(&history, &task_text, &task, &execution_policy);
                 workers.push(async move {
                     let result = match request {
                         Ok(request) => orchestration::collect_worker_request(config, request)
@@ -1716,8 +1981,7 @@ impl App {
             )
         } else {
             format!(
-                "{successful}/{} agents reported — Shaltaiboltai is continuing with partial evidence",
-                task_count
+                "{successful}/{task_count} agents reported — Shaltaiboltai is continuing with partial evidence"
             )
         }));
         self.mode = Mode::Input;
@@ -1739,6 +2003,7 @@ impl App {
         self.streaming_text.clear();
         self.pending_calls.clear();
         self.approval_preview = None;
+        self.pending_approval_assessment = None;
         self.agent_turns = 0;
         self.approval_focused = true;
         let active = self.active_root_prompt.take();
@@ -1789,6 +2054,7 @@ impl App {
         self.orchestration_run = None;
         self.mode = Mode::Input;
         self.active_turn_model = None;
+        self.active_execution_policy = None;
         self.active_turn_can_promote_queue = true;
         self.apply_deferred_model_reconciliation();
     }
@@ -1842,11 +2108,22 @@ impl App {
         debug_assert!(self.tool_task.is_none());
         debug_assert!(self.pending_calls.is_empty());
 
-        self.begin_root_prompt(prompt);
+        self.begin_root_prompt(prompt, true, true);
         self.start_request();
     }
 
-    fn begin_root_prompt(&mut self, prompt: QueuedPrompt) {
+    fn dispatch_synthetic_prompt(&mut self, prompt: QueuedPrompt) {
+        debug_assert_eq!(self.mode, Mode::Input);
+        debug_assert!(!self.compacting);
+        debug_assert!(self.request_task.is_none());
+        debug_assert!(self.tool_task.is_none());
+        debug_assert!(self.pending_calls.is_empty());
+
+        self.begin_root_prompt(prompt, false, false);
+        self.start_request();
+    }
+
+    fn begin_root_prompt(&mut self, prompt: QueuedPrompt, visible: bool, restore_on_failure: bool) {
         debug_assert!(self.request_task.is_none());
         debug_assert!(self.tool_task.is_none());
         debug_assert!(self.pending_calls.is_empty());
@@ -1856,11 +2133,15 @@ impl App {
             history_len: self.history.len(),
             transcript_len: self.transcript.len(),
             observed_activity: false,
+            restore_on_failure,
         });
         let (text, model, images) = prompt.into_images();
         self.active_turn_model = Some(model);
+        self.active_execution_policy = Some(self.policy.clone());
         self.active_turn_can_promote_queue = true;
-        self.transcript.push(Entry::User(text.clone()));
+        if visible {
+            self.transcript.push(Entry::User(text.clone()));
+        }
         if !images.is_empty() {
             let names: Vec<&str> = images.iter().map(|(n, _)| n.as_str()).collect();
             self.transcript
@@ -1925,7 +2206,7 @@ impl App {
         }
         // Files dragged onto the terminal arrive as a paste of their paths:
         // stage them as attachments instead of cluttering the input.
-        let dropped = images::dropped_images(text);
+        let dropped = dropped_workspace_images(text, self.policy.workspace().cwd());
         if !dropped.is_empty() {
             for path in dropped {
                 match images::load_image(&path) {
@@ -2115,6 +2396,9 @@ impl App {
             }
             ("model", Some(filter)) => self.select_model_by_filter(filter),
             ("model", None) => self.open_picker(),
+            ("permissions", _) => self.open_permissions(),
+            ("status", _) => self.add_status_output(),
+            ("init", _) => self.start_init_turn(),
             ("theme", Some(name)) => self.set_theme_by_name(name),
             ("theme", None) => self.open_themes(),
             ("new", _) => self.reset_session(),
@@ -2146,6 +2430,257 @@ impl App {
     pub fn close_help(&mut self) {
         self.mode = Mode::Input;
         self.dispatch_queued_prompt();
+    }
+
+    pub fn open_permissions(&mut self) {
+        self.permission_index = self
+            .policy
+            .matching_preset()
+            .and_then(|current| {
+                PERMISSION_PRESETS
+                    .iter()
+                    .position(|preset| *preset == current)
+            })
+            .unwrap_or(0);
+        self.permission_overlay = Some(PermissionOverlay::Picker);
+    }
+
+    pub fn close_permissions(&mut self) {
+        self.permission_overlay = None;
+    }
+
+    pub fn permission_move(&mut self, delta: i64) {
+        if self.permission_overlay != Some(PermissionOverlay::Picker) {
+            return;
+        }
+        let len = PERMISSION_PRESETS.len() as i64;
+        self.permission_index = (self.permission_index as i64 + delta).rem_euclid(len) as usize;
+    }
+
+    pub fn select_permission(&mut self) {
+        if self.permission_overlay != Some(PermissionOverlay::Picker) {
+            return;
+        }
+        let preset = PERMISSION_PRESETS[self.permission_index];
+        if preset == PermissionPreset::FullAccess {
+            self.full_access_enable_selected = false;
+            self.permission_overlay = Some(PermissionOverlay::FullAccessConfirm);
+            return;
+        }
+        self.apply_permission_preset(preset);
+    }
+
+    pub fn cancel_full_access_confirmation(&mut self) {
+        if self.permission_overlay == Some(PermissionOverlay::FullAccessConfirm) {
+            self.full_access_enable_selected = false;
+            self.permission_overlay = Some(PermissionOverlay::Picker);
+        }
+    }
+
+    pub fn move_full_access_confirmation(&mut self, delta: i64) {
+        if self.permission_overlay == Some(PermissionOverlay::FullAccessConfirm) && delta != 0 {
+            self.full_access_enable_selected = delta > 0;
+        }
+    }
+
+    pub fn activate_full_access_confirmation(&mut self) {
+        if self.permission_overlay != Some(PermissionOverlay::FullAccessConfirm) {
+            return;
+        }
+        if self.full_access_enable_selected {
+            self.confirm_full_access();
+        } else {
+            self.cancel_full_access_confirmation();
+        }
+    }
+
+    pub fn confirm_full_access(&mut self) {
+        if self.permission_overlay == Some(PermissionOverlay::FullAccessConfirm) {
+            self.full_access_enable_selected = false;
+            self.apply_permission_preset(PermissionPreset::FullAccess);
+        }
+    }
+
+    fn apply_permission_preset(&mut self, preset: PermissionPreset) {
+        self.policy.apply_preset(preset);
+        // Grants are authority-generation bound as well, but eagerly clearing
+        // them keeps the session state legible and releases path/command data.
+        self.approved_scopes.clear();
+        self.permission_overlay = None;
+        self.full_access_enable_selected = false;
+        self.transcript.push(Entry::Info(format!(
+            "Permissions updated to {}",
+            preset.label()
+        )));
+    }
+
+    /// Run the two local commands upstream keeps available while a task is in
+    /// progress. The command is consumed locally and never enters the queued
+    /// prompt or provider history.
+    pub fn submit_active_local_command(&mut self) -> bool {
+        if !matches!(
+            self.mode,
+            Mode::Streaming | Mode::RunningTool | Mode::Orchestrating
+        ) {
+            return false;
+        }
+        let text = self.textarea.lines().join("\n").trim().to_owned();
+        match text.as_str() {
+            "/status" => {
+                self.textarea = make_textarea(&self.theme);
+                self.remember_input(&text);
+                self.add_status_output();
+                true
+            }
+            "/permissions" => {
+                // Never replace an approval or an executing tool with a
+                // settings surface. Streaming is safe because the current
+                // provider request already owns its policy snapshot.
+                if self.mode != Mode::Streaming {
+                    return false;
+                }
+                self.textarea = make_textarea(&self.theme);
+                self.remember_input(&text);
+                self.open_permissions();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn add_status_output(&mut self) {
+        let active_policy = self
+            .active_execution_policy
+            .as_ref()
+            .unwrap_or(&self.policy);
+        let model = self
+            .active_turn_model
+            .as_ref()
+            .or(self.model.as_ref())
+            .map(|model| model.display_id().to_owned())
+            .unwrap_or_else(|| "not selected".into());
+        let provider = self
+            .active_turn_model
+            .as_ref()
+            .or(self.model.as_ref())
+            .map(|model| model.provider.label().to_owned())
+            .unwrap_or_else(|| "not available".into());
+        let enforcement = self
+            .active_turn_model
+            .as_ref()
+            .or(self.model.as_ref())
+            .map_or_else(
+                || "App tool broker + OS sandbox".into(),
+                |model| match model.provider {
+                    ProviderKind::Codex => {
+                        "Codex CLI sandbox; app tools use the local OS sandbox".into()
+                    }
+                    ProviderKind::ClaudeCode => {
+                        "Claude CLI permission mode; app tools use the local OS sandbox".into()
+                    }
+                    _ => "App tool broker + OS sandbox".into(),
+                },
+            );
+        let roots = active_policy.effective_user_visible_roots();
+        let extra_roots = roots
+            .iter()
+            .skip(1)
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>();
+        let permissions = match active_policy.matching_preset() {
+            Some(PermissionPreset::AskForApproval) if extra_roots.is_empty() => {
+                "Workspace (Ask for approval)".to_string()
+            }
+            Some(PermissionPreset::AskForApproval) => {
+                format!("Workspace [{}] (Ask for approval)", extra_roots.join(", "))
+            }
+            Some(PermissionPreset::ReadOnly) => "Read Only (Ask for approval)".into(),
+            Some(PermissionPreset::FullAccess) => "Full Access".into(),
+            None => format!(
+                "Custom ({}, {})",
+                active_policy.sandbox_mode(),
+                active_policy.approval_policy()
+            ),
+        };
+        let instructions = project_instructions(active_policy.workspace().cwd());
+        let agents = if instructions.paths.is_empty() {
+            "<none>".into()
+        } else {
+            instructions
+                .paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let token_usage = self.last_usage.map_or_else(
+            || "—".into(),
+            |usage| {
+                format!(
+                    "{} input + {} output",
+                    usage.input_tokens, usage.output_tokens
+                )
+            },
+        );
+        let context_window = format!(
+            "~{} / ~{} tokens{}",
+            self.approx_tokens(),
+            self.effective_compact_threshold() / 4,
+            self.context_percent()
+                .map(|percent| format!(" ({percent}%)"))
+                .unwrap_or_default()
+        );
+        let mut fields = vec![
+            ("Model".into(), model),
+            ("Model provider".into(), provider),
+            ("Enforcement".into(), enforcement),
+            (
+                "Directory".into(),
+                active_policy.workspace().cwd().display().to_string(),
+            ),
+            ("Permissions".into(), permissions),
+            (
+                "Network".into(),
+                active_policy.network_status_label().into(),
+            ),
+            ("Agents.md".into(), agents),
+            ("Session".into(), self.session_id.clone()),
+            ("Token usage".into(), token_usage),
+            ("Context window".into(), context_window),
+            ("Limits".into(), "—".into()),
+        ];
+        if active_policy != &self.policy {
+            fields.push((
+                "Next turn permissions".into(),
+                self.policy.status_label().to_string(),
+            ));
+        }
+        self.transcript.push(Entry::Status {
+            title: format!("shaltaiboltai (v{})", env!("CARGO_PKG_VERSION")),
+            fields,
+        });
+    }
+
+    fn start_init_turn(&mut self) {
+        let Some(model) = self.model.clone() else {
+            self.transcript.push(Entry::Error(
+                "cannot run /init without an available model".into(),
+            ));
+            return;
+        };
+        if self.mode != Mode::Input || self.compacting {
+            self.transcript.push(Entry::Error(
+                "/init is unavailable while a task is running".into(),
+            ));
+            return;
+        }
+        let prompt = QueuedPrompt {
+            text: INIT_PROMPT.trim().to_owned(),
+            staged_images: Vec::new(),
+            referenced_images: Vec::new(),
+            model,
+        };
+        self.dispatch_synthetic_prompt(prompt);
     }
 
     /// `/model <name>`: select directly on a unique match, open the picker
@@ -2275,11 +2810,15 @@ impl App {
             tools::definitions()
         };
         let has_team_context = self.orchestration_context.is_some();
+        let execution_policy = self
+            .active_execution_policy
+            .clone()
+            .unwrap_or_else(|| self.policy.clone());
         let request = ChatRequest {
             model,
             system: match self.orchestration_context.as_deref() {
-                Some(context) => format!("{}\n\n{context}", system_prompt()),
-                None => system_prompt(),
+                Some(context) => format!("{}\n\n{context}", system_prompt(&execution_policy)),
+                None => system_prompt(&execution_policy),
             },
             messages: if has_team_context {
                 orchestration::text_only_history(&self.history)
@@ -2289,6 +2828,7 @@ impl App {
             tools,
             policy: RequestPolicy::Interactive,
             force_full_handoff: has_team_context,
+            execution_policy,
         };
         request
     }
@@ -2331,6 +2871,7 @@ impl App {
         }
         self.pending_calls.clear();
         self.approval_preview = None;
+        self.pending_approval_assessment = None;
         self.repair_dangling_tool_calls();
         self.transcript.push(Entry::Info("cancelled".into()));
         self.agent_turns = 0;
@@ -2338,6 +2879,7 @@ impl App {
         self.orchestration_run = None;
         self.orchestration_context = None;
         self.active_turn_model = None;
+        self.active_execution_policy = None;
         self.active_turn_can_promote_queue = true;
         self.active_root_prompt = None;
         self.approval_focused = true;
@@ -2587,9 +3129,7 @@ impl App {
             id: self.session_id.clone(),
             title,
             updated_at: session::now_secs(),
-            cwd: std::env::current_dir()
-                .ok()
-                .map(|p| p.display().to_string()),
+            cwd: Some(self.policy.workspace().cwd().display().to_string()),
             model: self.model.clone(),
             history: self.history.clone(),
             transcript: self.transcript.clone(),
@@ -2621,8 +3161,10 @@ impl App {
         self.clear_input();
         self.approved_scopes.clear();
         self.approval_preview = None;
+        self.pending_approval_assessment = None;
         self.approval_focused = true;
         self.active_turn_model = None;
+        self.active_execution_policy = None;
         self.active_turn_can_promote_queue = true;
         self.active_root_prompt = None;
         self.team_workers = None;
@@ -2640,7 +3182,8 @@ impl App {
         // Project-scoped ordering: this directory's sessions first (legacy
         // sessions without a cwd count as local), then everything else.
         // The picker badges entries from other directories.
-        sessions.sort_by_key(|s| usize::from(session_is_foreign(s)));
+        let cwd = self.policy.workspace().cwd();
+        sessions.sort_by_key(|session| usize::from(session_is_foreign_at(session, cwd)));
         self.sessions = sessions;
         self.session_index = 0;
         self.mode = Mode::SessionPicker;
@@ -2677,8 +3220,10 @@ impl App {
                 self.clear_input();
                 self.approved_scopes.clear();
                 self.approval_preview = None;
+                self.pending_approval_assessment = None;
                 self.approval_focused = true;
                 self.active_turn_model = None;
+                self.active_execution_policy = None;
                 self.active_turn_can_promote_queue = true;
                 self.active_root_prompt = None;
                 self.team_workers = None;
@@ -2862,6 +3407,11 @@ impl App {
         // The history is flattened to plain text so the summary request is
         // valid for every provider regardless of tool-call wire formats.
         let flat = flatten_history(&self.history);
+        let execution_policy = ExecutionPolicy::from_parts(
+            self.policy.workspace().clone(),
+            SandboxMode::ReadOnly,
+            ApprovalPolicy::Never,
+        );
         let request = ChatRequest {
             model,
             system: "You compress coding-assistant conversations into handoff summaries.".into(),
@@ -2874,6 +3424,7 @@ impl App {
             tools: Vec::new(),
             policy: RequestPolicy::ReadOnly,
             force_full_handoff: true,
+            execution_policy,
         };
         let session_id = self.session_id.clone();
         let config = self.config.clone();
@@ -3135,11 +3686,9 @@ fn flatten_history(history: &[Message]) -> String {
 /// Whether a saved session belongs to a different working directory (used
 /// for picker ordering and badges). Legacy sessions without a recorded cwd
 /// count as local.
-pub fn session_is_foreign(meta: &session::Meta) -> bool {
-    let here = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    meta.cwd.as_ref().is_some_and(|cwd| *cwd != here)
+pub fn session_is_foreign_at(meta: &session::Meta, cwd: &std::path::Path) -> bool {
+    let here = cwd.display().to_string();
+    meta.cwd.as_ref().is_some_and(|saved| *saved != here)
 }
 
 /// `~`-abbreviate the home directory and keep at most the last three
@@ -3165,13 +3714,76 @@ fn parse_git_head(head: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Read a bounded UTF-8 prefix from an already-existing regular file.
+///
+/// Symlinks and special files are deliberately rejected: repository metadata
+/// and instructions are ambient inputs, so following a workspace-controlled
+/// link could silently forward an outside file or block on a FIFO. The opened
+/// handle is rechecked to close replacement races within the documented
+/// no-concurrent-same-user boundary.
+fn read_regular_text_bounded(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> std::io::Result<(String, bool)> {
+    let link_metadata = std::fs::symlink_metadata(path)?;
+    if !link_metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository metadata must be a regular file, not a symlink or special file",
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository metadata changed to a non-regular file",
+        ));
+    }
+
+    let byte_limit = max_bytes.saturating_add(1);
+    let mut bytes = Vec::with_capacity(byte_limit.min(32 * 1024));
+    file.take(u64::try_from(byte_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid_up_to = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid_up_to);
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        }
+        Err(error) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+    };
+    Ok((text, truncated))
+}
+
 /// Resolve HEAD from both a normal `.git` directory and the `gitdir:` pointer
 /// file used by linked worktrees and submodules.
 fn read_git_branch(dot_git: &std::path::Path) -> Option<String> {
-    let head = if dot_git.is_dir() {
+    let dot_git_kind = std::fs::symlink_metadata(dot_git).ok()?.file_type();
+    let head = if dot_git_kind.is_dir() {
         dot_git.join("HEAD")
-    } else {
-        let pointer = std::fs::read_to_string(dot_git).ok()?;
+    } else if dot_git_kind.is_file() {
+        let (pointer, truncated) =
+            read_regular_text_bounded(dot_git, GIT_METADATA_CAP_BYTES).ok()?;
+        if truncated {
+            return None;
+        }
         let target = std::path::PathBuf::from(pointer.trim().strip_prefix("gitdir: ")?);
         let git_dir = if target.is_absolute() {
             target
@@ -3182,10 +3794,11 @@ fn read_git_branch(dot_git: &std::path::Path) -> Option<String> {
                 .join(target)
         };
         git_dir.join("HEAD")
+    } else {
+        return None;
     };
-    std::fs::read_to_string(head)
-        .ok()
-        .and_then(|head| parse_git_head(&head))
+    let (head, truncated) = read_regular_text_bounded(&head, GIT_METADATA_CAP_BYTES).ok()?;
+    (!truncated).then(|| parse_git_head(&head)).flatten()
 }
 
 fn provider_count(models: &[ModelEntry]) -> usize {
@@ -3195,29 +3808,99 @@ fn provider_count(models: &[ModelEntry]) -> usize {
     kinds.len()
 }
 
-fn system_prompt() -> String {
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "?".into());
+fn system_prompt(policy: &ExecutionPolicy) -> String {
+    let cwd = policy.workspace().cwd().display();
     let mut prompt = format!(
         "You are shaltaiboltai, an agentic coding assistant running in a terminal. \
          The user's working directory is {cwd} on {}. \
+         The active sandbox is {} with {} approval and network {}. \
          Use the available tools to read and modify files and run commands when the task calls for it. \
          Prefer edit_file over write_file for existing files, and grep/glob to explore before reading. \
          Prefer small, verifiable steps and report what you did. \
          Format responses in markdown.",
         std::env::consts::OS,
+        policy.sandbox_mode(),
+        policy.approval_policy(),
+        policy.network_status_label(),
     );
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        if let Ok(content) = std::fs::read_to_string(name) {
-            let capped: String = content.chars().take(PROJECT_CONTEXT_CAP).collect();
-            prompt.push_str(&format!(
-                "\n\n# Project instructions (from {name})\n{capped}"
-            ));
+    let instructions = project_instructions(policy.workspace().cwd());
+    if !instructions.content.is_empty() {
+        prompt.push_str("\n\n# Project instructions\n");
+        prompt.push_str(&instructions.content);
+    }
+    prompt
+}
+
+#[derive(Debug, Default)]
+struct ProjectInstructions {
+    content: String,
+    paths: Vec<std::path::PathBuf>,
+    truncated: bool,
+}
+
+/// Load repository instructions from the repository root down to the selected
+/// working directory. A nearer `AGENTS.override.md` replaces `AGENTS.md` for
+/// that directory, matching Codex's scoped-instruction model.
+fn project_instructions(cwd: &std::path::Path) -> ProjectInstructions {
+    let root = cwd
+        .ancestors()
+        .find(|ancestor| {
+            std::fs::symlink_metadata(ancestor.join(".git")).is_ok_and(|metadata| {
+                let kind = metadata.file_type();
+                kind.is_dir() || kind.is_file()
+            })
+        })
+        .unwrap_or(cwd);
+    let mut directories = vec![root.to_path_buf()];
+    if let Ok(relative) = cwd.strip_prefix(root) {
+        let mut cursor = root.to_path_buf();
+        for component in relative.components() {
+            cursor.push(component);
+            directories.push(cursor.clone());
+        }
+    }
+
+    let mut loaded = ProjectInstructions::default();
+    let mut remaining = PROJECT_CONTEXT_CAP;
+    for directory in directories {
+        let override_path = directory.join("AGENTS.override.md");
+        let default_path = directory.join("AGENTS.md");
+        let path = if std::fs::symlink_metadata(&override_path).is_ok() {
+            override_path
+        } else if std::fs::symlink_metadata(&default_path).is_ok() {
+            default_path
+        } else {
+            continue;
+        };
+        if remaining == 0 {
+            loaded.truncated = true;
+            break;
+        }
+        let max_bytes = remaining.saturating_mul(4).saturating_add(1);
+        let Ok((content, byte_truncated)) = read_regular_text_bounded(&path, max_bytes) else {
+            continue;
+        };
+        let original_chars = content.chars().count();
+        let capped: String = content.chars().take(remaining).collect();
+        remaining = remaining.saturating_sub(capped.chars().count());
+        if !loaded.content.is_empty() {
+            loaded.content.push_str("\n\n");
+        }
+        loaded
+            .content
+            .push_str(&format!("## {}\n{}", path.display(), capped));
+        loaded.paths.push(path);
+        if byte_truncated || original_chars > capped.chars().count() {
+            loaded.truncated = true;
             break;
         }
     }
-    prompt
+    if loaded.truncated {
+        loaded
+            .content
+            .push_str("\n\n[project instructions truncated]");
+    }
+    loaded
 }
 
 #[cfg(test)]
@@ -3234,8 +3917,6 @@ mod tests {
             compact_threshold_chars: 80_000,
             ollama_num_ctx: 16_384,
             theme: None,
-            claude_code_bypass_permissions: false,
-            codex_full_access: false,
             reduced_motion: false,
         }
     }
@@ -3253,6 +3934,98 @@ mod tests {
         assert_eq!(m, vec!["new"]);
 
         assert!(match_commands("zzz").is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_workspace_resolves_typed_queued_and_dropped_relative_images() {
+        let workspace = std::env::temp_dir().join(format!(
+            "shaltai-image-workspace-{}",
+            crate::session::new_id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("test workspace");
+        let image_path = workspace.join("reference image.png");
+        std::fs::write(&image_path, b"workspace-relative-image").expect("test image");
+        let model = ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "workspace-image-test".into(),
+        };
+        let make_app = || {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let policy = ExecutionPolicy::new(Workspace::new(&workspace).expect("workspace"));
+            let mut app = App::with_policy(offline_config(), policy, tx);
+            app.model = Some(model.clone());
+            app
+        };
+
+        let mut typed = make_app();
+        typed.set_input("inspect \"reference image.png\"");
+        typed.submit_input();
+        assert!(typed.history.iter().any(|message| matches!(
+            message,
+            Message::User(content) if content.images().len() == 1
+        )));
+        typed.cancel_request();
+
+        let mut queued = make_app();
+        queued.mode = Mode::Streaming;
+        queued.set_input("inspect \"reference image.png\"");
+        queued.queue_input();
+        assert_eq!(queued.queued_image_count(), 1);
+
+        let mut dropped = make_app();
+        dropped.paste("reference image.png");
+        assert_eq!(dropped.pending_image_count(), 1);
+        assert!(dropped.input_is_empty());
+
+        drop((typed, queued, dropped));
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn init_is_a_hidden_synthetic_turn_with_an_immutable_policy_snapshot() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        app.model = Some(ModelEntry {
+            provider: ProviderKind::Ollama,
+            id: "test-init-model".into(),
+        });
+        let original_policy = app.policy.clone();
+        let visible_user_entries = app
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, Entry::User(_)))
+            .count();
+
+        app.set_input("/init");
+        app.submit_input();
+
+        assert_eq!(app.mode, Mode::Streaming);
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|entry| matches!(entry, Entry::User(_)))
+                .count(),
+            visible_user_entries,
+            "the synthetic /init prompt must stay out of the visible transcript"
+        );
+        assert!(matches!(
+            app.history.last(),
+            Some(Message::User(UserContent::Text(text))) if text == INIT_PROMPT.trim()
+        ));
+        assert_eq!(app.effective_execution_policy(), &original_policy);
+        assert!(
+            !app.active_root_prompt
+                .as_ref()
+                .expect("active synthetic turn")
+                .restore_on_failure
+        );
+
+        app.apply_permission_preset(PermissionPreset::FullAccess);
+        assert_eq!(app.effective_execution_policy(), &original_policy);
+        assert_ne!(&app.policy, &original_policy);
+
+        app.request_task.take().expect("init request").abort();
+        app.cancel_request();
     }
 
     #[tokio::test]
@@ -3892,6 +4665,92 @@ mod tests {
     }
 
     #[test]
+    fn project_instructions_follow_hierarchy_and_bound_sparse_files() {
+        let root = std::env::temp_dir().join(format!(
+            "shaltai-instructions-{}-{}",
+            std::process::id(),
+            session::new_id()
+        ));
+        let nested = root.join("src/module");
+        std::fs::create_dir_all(root.join(".git")).expect("repository marker");
+        std::fs::create_dir_all(&nested).expect("nested working directory");
+        std::fs::write(root.join("AGENTS.md"), "root guidance\n").expect("root instructions");
+        std::fs::write(root.join("src/AGENTS.md"), "shadowed guidance\n")
+            .expect("default nested instructions");
+        let override_path = root.join("src/AGENTS.override.md");
+        let mut override_file =
+            std::fs::File::create(&override_path).expect("override instructions");
+        std::io::Write::write_all(&mut override_file, &vec![b'x'; PROJECT_CONTEXT_CAP + 1])
+            .expect("write bounded prefix");
+        override_file
+            .set_len(1024 * 1024 * 1024)
+            .expect("create sparse instruction tail");
+
+        let loaded = project_instructions(&nested);
+
+        assert_eq!(loaded.paths, vec![root.join("AGENTS.md"), override_path]);
+        assert!(loaded.content.contains("root guidance"));
+        assert!(!loaded.content.contains("shadowed guidance"));
+        assert!(loaded.truncated);
+        assert!(loaded.content.contains("[project instructions truncated]"));
+        assert!(loaded.content.len() < PROJECT_CONTEXT_CAP + 1_024);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_metadata_rejects_symlinks_and_fifos_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "shaltai-hostile-metadata-{}-{}",
+            std::process::id(),
+            session::new_id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "shaltai-outside-instructions-{}-{}",
+            std::process::id(),
+            session::new_id()
+        ));
+        std::fs::create_dir_all(root.join(".git")).expect("repository marker");
+        std::fs::write(root.join("AGENTS.md"), "safe fallback must stay shadowed\n")
+            .expect("default instructions");
+        std::fs::write(&outside, "outside secret\n").expect("outside instructions");
+        std::os::unix::fs::symlink(&outside, root.join("AGENTS.override.md"))
+            .expect("instruction symlink");
+        std::os::unix::fs::symlink(&outside, root.join(".git/HEAD")).expect("HEAD symlink");
+
+        let loaded = project_instructions(&root);
+        assert!(loaded.paths.is_empty());
+        assert!(!loaded.content.contains("outside secret"));
+        assert_eq!(read_git_branch(&root.join(".git")), None);
+
+        std::fs::remove_file(root.join("AGENTS.override.md")).expect("remove symlink");
+        std::fs::remove_file(root.join(".git/HEAD")).expect("remove HEAD symlink");
+        let instruction_fifo = root.join("AGENTS.override.md");
+        let head_fifo = root.join(".git/HEAD");
+        for fifo in [&instruction_fifo, &head_fifo] {
+            let bytes = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path without NUL");
+            // SAFETY: `bytes` is a valid NUL-terminated path and each fixture
+            // path is absent before this call.
+            assert_eq!(unsafe { libc::mkfifo(bytes.as_ptr(), 0o600) }, 0);
+        }
+
+        let started = std::time::Instant::now();
+        let loaded = project_instructions(&root);
+        assert!(loaded.paths.is_empty());
+        assert_eq!(read_git_branch(&root.join(".git")), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "special repository metadata must not wait for another endpoint"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_file(outside).ok();
+    }
+
+    #[test]
     fn linked_worktree_gitdir_resolves_branch() {
         let root = std::env::temp_dir().join(format!(
             "shaltai-gitdir-{}-{}",
@@ -4077,10 +4936,12 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(offline_config(), tx);
-        app.approved_scopes.insert("run_command\0cargo test".into());
+        app.approved_scopes
+            .insert(b"run_command\0cargo test".to_vec());
         app.cancel_request();
         assert!(
-            app.approved_scopes.contains("run_command\0cargo test"),
+            app.approved_scopes
+                .contains(b"run_command\0cargo test".as_slice()),
             "cancelling work must not revoke a conversation-level grant"
         );
         app.reset_session();
@@ -4104,7 +4965,8 @@ mod tests {
             updated_at: resumed.updated_at,
             cwd: None,
         }];
-        app.approved_scopes.insert("read_file\0/etc/passwd".into());
+        app.approved_scopes
+            .insert(b"read_file\0/etc/passwd".to_vec());
         app.pick_session();
         assert!(app.approved_scopes.is_empty());
 
@@ -4112,15 +4974,18 @@ mod tests {
         std::fs::write(&blocked_data_root, "occupied").unwrap();
         std::env::set_var("SHALTAIBOLTAI_DATA_DIR", &blocked_data_root);
         app.history.push(Message::User("must be saved".into()));
-        app.approved_scopes.insert("run_command\0cargo test".into());
+        app.approved_scopes
+            .insert(b"run_command\0cargo test".to_vec());
         app.reset_session();
         assert!(
-            app.approved_scopes.contains("run_command\0cargo test"),
+            app.approved_scopes
+                .contains(b"run_command\0cargo test".as_slice()),
             "a blocked session transition must retain the current grants"
         );
         app.pick_session();
         assert!(
-            app.approved_scopes.contains("run_command\0cargo test"),
+            app.approved_scopes
+                .contains(b"run_command\0cargo test".as_slice()),
             "a blocked resume must retain the current grants"
         );
         assert!(
