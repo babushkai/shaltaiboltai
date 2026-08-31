@@ -173,17 +173,15 @@ async fn production_linux_boundary_enforces_read_write_metadata_network_and_clea
     drop(listener);
     std::fs::remove_file(&socket_path).expect("remove host Unix socket");
 
-    let unix_sendmsg = "/usr/bin/python3 -c 'import errno,socket\n\
-a,b=socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM)\n\
-try:\n\
- a.sendmsg([b\"denied\"])\n\
-except OSError as error:\n\
- raise SystemExit(0 if error.errno == errno.EPERM else 2)\n\
-raise SystemExit(3)'";
-    let blocked_sendmsg = run(prepare(&workspace, unix_sendmsg, application_binary)).await;
+    let blocked_socket_syscalls = run(prepare(
+        &workspace,
+        "/usr/bin/python3 -c 'import ctypes,errno,platform; libc=ctypes.CDLL(None,use_errno=True); socket_nr,connect_nr,sendmsg_nr={\"x86_64\":(41,42,46),\"aarch64\":(198,203,211)}[platform.machine()]; socket_result=libc.syscall(socket_nr,2,1,0); socket_errno=ctypes.get_errno(); connect_result=libc.syscall(connect_nr,-1,0,0); connect_errno=ctypes.get_errno(); sendmsg_result=libc.syscall(sendmsg_nr,-1,0,0); sendmsg_errno=ctypes.get_errno(); raise SystemExit(0 if (socket_result,socket_errno,connect_result,connect_errno,sendmsg_result,sendmsg_errno)==(-1,errno.EPERM,-1,errno.EPERM,-1,errno.EPERM) else 1)'",
+        application_binary,
+    ))
+    .await;
     assert!(
-        blocked_sendmsg.status.success(),
-        "seccomp must reject message-oriented Unix socket I/O with EPERM: {blocked_sendmsg:?}"
+        blocked_socket_syscalls.status.success(),
+        "seccomp must reject socket, connect, and sendmsg with EPERM: {blocked_socket_syscalls:?}"
     );
 
     #[cfg(target_arch = "x86_64")]
