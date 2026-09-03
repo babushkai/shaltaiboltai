@@ -171,8 +171,7 @@ fn append_tool_fragment(
     })?;
     if index >= MAX_STREAM_TOOL_CALLS {
         anyhow::bail!(
-            "{provider} returned tool call index {index}, above the {}-call limit",
-            MAX_STREAM_TOOL_CALLS
+            "{provider} returned tool call index {index}, above the {MAX_STREAM_TOOL_CALLS}-call limit"
         );
     }
     while pending.len() <= index {
