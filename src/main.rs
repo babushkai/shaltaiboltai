@@ -34,8 +34,9 @@ OPTIONS:
     -V, --version                     Print version and exit
 
 With no options it launches the interactive TUI. Configure providers via
-ANTHROPIC_API_KEY / OPENAI_API_KEY / a running Ollama, or a logged-in
-`claude` / `codex` CLI for subscription use on Unix. See the README for details.";
+ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / a running Ollama,
+or a logged-in `claude` / `codex` CLI for subscription use on Unix. See the
+README for details.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalDecision {
@@ -663,6 +664,8 @@ mod tests {
             anthropic_api_key: None,
             openai_api_key: None,
             openai_base_url: "http://127.0.0.1:9".into(),
+            openrouter_api_key: None,
+            openrouter_base_url: "http://127.0.0.1:9".into(),
             ollama_host: "http://127.0.0.1:9".into(),
             default_model: None,
             compact_threshold_chars: 80_000,

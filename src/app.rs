@@ -558,10 +558,12 @@ impl App {
             .unwrap_or(theme::DEFAULT);
         let models = providers::immediate_models(&config);
         let model = match config.default_model.as_ref() {
-            Some(wanted) if providers::cli_model_selector(wanted).is_none() => {
-                models.iter().find(|entry| &entry.id == wanted).cloned()
-            }
-            Some(_) => None,
+            Some(wanted) => providers::custom_qualified_model(wanted, &models).or_else(|| {
+                providers::qualified_model_selector(wanted)
+                    .is_none()
+                    .then(|| models.iter().find(|entry| &entry.id == wanted).cloned())
+                    .flatten()
+            }),
             None => models.first().cloned(),
         };
         let discovery_models = models.clone();
@@ -960,13 +962,12 @@ impl App {
                         self.discovery_models.push(model);
                     }
                 }
-                // An explicitly entered CLI selector may not be present in a
-                // provider's detected model rows. Preserve it across /refresh as
-                // long as that CLI itself is still available.
+                // An explicitly entered selector may not be present in a
+                // provider's detected rows. Preserve it across /refresh as
+                // long as that provider itself is still available.
                 if let Some(current) = self.model.as_ref().filter(|current| {
                     self.model_selected_explicitly
-                        && current.provider.is_sub_agent()
-                        && current.id.contains(':')
+                        && current.provider.supports_unlisted_models()
                         && self
                             .discovery_models
                             .iter()
@@ -986,7 +987,7 @@ impl App {
                     self.discovering = false;
                     if models.is_empty() {
                         self.transcript.push(Entry::Error(
-                            "no models found: configure Anthropic/OpenAI, start Ollama, or sign in to Claude Code/Codex — /refresh retries".into(),
+                            "no models found: configure Anthropic/OpenAI/OpenRouter, start Ollama, or sign in to Claude Code/Codex — /refresh retries".into(),
                         ));
                     } else {
                         self.transcript.push(Entry::Info(format!(
@@ -1080,8 +1081,8 @@ impl App {
 
     fn reconcile_discovered_model(&mut self, finished: bool) {
         let configured_default = self.config.default_model.as_ref().and_then(|wanted| {
-            if providers::cli_model_selector(wanted).is_some() {
-                providers::custom_cli_model(wanted, &self.models)
+            if providers::qualified_model_selector(wanted).is_some() {
+                providers::custom_qualified_model(wanted, &self.models)
             } else {
                 self.models
                     .iter()
@@ -1586,12 +1587,19 @@ impl App {
                 )));
                 return;
             }
+            if !orchestration::supports_scoped_advisory(&model) {
+                self.transcript.push(Entry::Error(format!(
+                    "team mode cannot use {} because it may resolve to different models; planning, workers, and synthesis must stay pinned — choose an exact OpenRouter model with /model or Ctrl+P; prompt preserved",
+                    model.display_id()
+                )));
+                return;
+            }
             if orchestration::choose_planner_model(&model, &self.models).is_none()
                 || orchestration::choose_worker_models(&model, &self.models, worker_count).len()
                     != worker_count
             {
                 self.transcript.push(Entry::Error(
-                    "team mode needs at least one workspace-scoped advisory model; Codex is kept as the post-confirmation lead because its read-only CLI sandbox can read outside the workspace — prompt preserved"
+                    "team mode needs an exact workspace-scoped advisory model; choose an explicit CLI or OpenRouter model (openrouter/auto is solo-only) — prompt preserved"
                         .into(),
                 ));
                 return;
@@ -1799,11 +1807,26 @@ impl App {
             }
             Err(error) => {
                 let prompt = run.prompt.take();
+                let planner = format!(
+                    "{} · {}",
+                    run.planner_model.display_id(),
+                    run.planner_model.provider.label()
+                );
+                let hint = if run.planner_model.provider == providers::ProviderKind::Codex
+                    && ["oauth", "authenticate", "authentication", "login"]
+                        .iter()
+                        .any(|needle| error.to_ascii_lowercase().contains(needle))
+                {
+                    " — run `codex login`, then retry"
+                } else {
+                    ""
+                };
                 self.team_workers = Some(run.worker_count);
                 self.orchestration_run = None;
                 self.mode = Mode::Input;
-                self.transcript
-                    .push(Entry::Error(format!("team planning failed: {error}")));
+                self.transcript.push(Entry::Error(format!(
+                    "team planning failed via {planner}: {error}{hint}"
+                )));
                 if let Some(prompt) = prompt {
                     self.restore_prompt(prompt, "team planning failed before any worker started");
                 }
@@ -2688,9 +2711,9 @@ impl App {
     fn select_model_by_filter(&mut self, filter: &str) {
         // Provider-qualified selectors are exact identities, including
         // unlisted model IDs. Never let substring matching silently turn one
-        // explicit CLI model into another.
-        if let Some(requested) = providers::cli_model_selector(filter) {
-            if let Some(model) = providers::custom_cli_model(filter, &self.models) {
+        // explicit provider model into another.
+        if let Some(requested) = providers::qualified_model_selector(filter) {
+            if let Some(model) = providers::custom_qualified_model(filter, &self.models) {
                 if !self
                     .models
                     .iter()
@@ -2707,10 +2730,16 @@ impl App {
                 self.model = Some(model);
                 self.model_selected_explicitly = true;
             } else {
-                self.transcript.push(Entry::Error(format!(
-                    "{} CLI is not available — sign in or run /refresh",
-                    requested.provider.label()
-                )));
+                let message = if requested.provider == providers::ProviderKind::OpenRouter {
+                    "OpenRouter is not configured — set OPENROUTER_API_KEY and run /refresh"
+                        .to_owned()
+                } else {
+                    format!(
+                        "{} CLI is not available — sign in or run /refresh",
+                        requested.provider.label()
+                    )
+                };
+                self.transcript.push(Entry::Error(message));
             }
             return;
         }
@@ -3001,8 +3030,16 @@ impl App {
                 .push(Entry::Error("no models discovered yet".into()));
             return;
         }
-        self.picker_index = 0;
         self.picker_filter.clear();
+        self.picker_index = self
+            .model
+            .as_ref()
+            .and_then(|current| {
+                self.models
+                    .iter()
+                    .position(|model| model.provider == current.provider && model.id == current.id)
+            })
+            .unwrap_or(0);
         self.mode = Mode::ModelPicker;
     }
 
@@ -3234,8 +3271,12 @@ impl App {
                         .find(|model| model.id == saved.id && model.provider == saved.provider)
                         .cloned()
                         .or_else(|| {
-                            providers::custom_cli_model(&saved.id, &self.models)
-                                .filter(|model| model.provider == saved.provider)
+                            (saved.provider.supports_unlisted_models()
+                                && self
+                                    .models
+                                    .iter()
+                                    .any(|model| model.provider == saved.provider))
+                            .then(|| saved.clone())
                         });
                     // Discovery is incremental, so a saved provider may not
                     // have published yet. Retain its exact provider+ID
@@ -3912,6 +3953,8 @@ mod tests {
             anthropic_api_key: None,
             openai_api_key: None,
             openai_base_url: "http://127.0.0.1:9".into(),
+            openrouter_api_key: None,
+            openrouter_base_url: "http://127.0.0.1:9".into(),
             ollama_host: "http://127.0.0.1:9".into(),
             default_model: None,
             compact_threshold_chars: 80_000,
@@ -4129,7 +4172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_team_lead_requires_and_uses_a_workspace_scoped_advisory_model() {
+    async fn explicit_codex_lead_starts_a_codex_only_team() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(offline_config(), tx);
         let codex = ModelEntry {
@@ -4143,29 +4186,11 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.mode, Mode::Input);
-        assert_eq!(
-            app.textarea.lines().join("\n"),
-            "review this repository safely"
-        );
-        assert!(app.orchestration_run.is_none());
-        assert!(matches!(
-            app.transcript.last(),
-            Some(Entry::Error(error)) if error.contains("workspace-scoped advisory model")
-        ));
-
-        let safe = ModelEntry {
-            provider: ProviderKind::OpenAi,
-            id: "safe-planner".into(),
-        };
-        app.models.push(safe.clone());
-        app.submit_input();
-
         assert_eq!(app.mode, Mode::Orchestrating);
         assert_eq!(
             app.orchestration_planner()
                 .map(|model| (&model.provider, &model.id)),
-            Some((&safe.provider, &safe.id))
+            Some((&codex.provider, &codex.id))
         );
         assert!(app
             .orchestration_run
@@ -4178,19 +4203,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_codex_worker_plan_is_rejected_before_confirmation() {
+    async fn variable_openrouter_selector_cannot_enter_team_mode_via_an_exact_alternative() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let router = ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: "openrouter/free".into(),
+        };
+        let exact_alternative = ModelEntry {
+            provider: ProviderKind::OpenAi,
+            id: "gpt-exact".into(),
+        };
+        app.model = Some(router.clone());
+        app.models = vec![router, exact_alternative];
+        app.team_workers = Some(2);
+        app.set_input("preserve this root task");
+
+        app.submit_input();
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.textarea.lines().join("\n"), "preserve this root task");
+        assert!(app.orchestration_run.is_none());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Entry::Error(error))
+                if error.contains("openrouter/free") && error.contains("exact OpenRouter model")
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_planner_auth_failure_names_provider_and_recovery() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let codex = ModelEntry {
+            provider: ProviderKind::Codex,
+            id: "codex:gpt-5.6-sol".into(),
+        };
+        app.model = Some(codex.clone());
+        app.models = vec![codex];
+        app.team_workers = Some(2);
+        app.set_input("preserve this root task");
+        app.submit_input();
+        let run_id = app.orchestration_run_id().expect("planning run");
+        app.orchestration_task.take().unwrap().abort();
+
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Err(
+                "Failed to authenticate: OAuth session expired and could not be refreshed".into(),
+            ),
+        });
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.textarea.lines().join("\n"), "preserve this root task");
+        assert!(app.transcript.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Error(error)
+                    if error.contains("gpt-5.6-sol · codex")
+                        && error.contains("codex login")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn injected_auto_router_worker_plan_is_rejected_before_confirmation() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(offline_config(), tx);
         let lead = ModelEntry {
             provider: ProviderKind::Ollama,
             id: "safe-lead".into(),
         };
-        let codex = ModelEntry {
-            provider: ProviderKind::Codex,
-            id: "codex:gpt-5.6-sol".into(),
+        let auto = ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: providers::openrouter::AUTO_MODEL.into(),
         };
         app.model = Some(lead.clone());
-        app.models = vec![lead.clone(), codex.clone()];
+        app.models = vec![lead.clone(), auto.clone()];
         app.start_orchestration_plan(
             QueuedPrompt {
                 text: "preserve this root".into(),
@@ -4205,7 +4294,7 @@ mod tests {
 
         app.on_event(AppEvent::OrchestrationPlanned {
             run_id,
-            result: Ok(vec![planned_task(1, &codex), planned_task(2, &codex)]),
+            result: Ok(vec![planned_task(1, &auto), planned_task(2, &auto)]),
         });
 
         assert_eq!(app.mode, Mode::Input);
