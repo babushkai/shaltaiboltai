@@ -1,6 +1,7 @@
 use crate::app::{App, Entry, Mode, PermissionOverlay, PERMISSION_PRESETS};
 use crate::markdown;
 use crate::mascot;
+use crate::providers::{self, ProviderKind};
 use crate::session;
 use crate::theme::{self, Theme};
 use crate::tools;
@@ -929,19 +930,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             .border_type(BorderType::Plain)
             .border_style(Style::new().fg(theme.border));
 
-        let mut workspace = app.cwd_display.clone();
-        if let Some(branch) = &app.git_branch {
-            if !workspace.is_empty() {
-                workspace.push_str(" · ");
-            }
-            workspace.push_str(branch);
-        }
+        let workspace = workspace_context_label(
+            &app.cwd_display,
+            app.git_branch.as_deref(),
+            (area.width / 2) as usize,
+        );
         if !workspace.is_empty() && area.width >= 44 {
             shell = shell.title_bottom(Line::styled(
-                format!(
-                    " {} ",
-                    truncate_width(&workspace, (area.width / 2) as usize)
-                ),
+                format!(" {workspace} "),
                 Style::new().fg(theme.dim),
             ));
         }
@@ -982,14 +978,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(shell, area);
 
     let wide = area.width >= 58;
-    let (state, state_color) = if let Some(status) = app.orchestration_status() {
+    let orchestration_status = app.orchestration_status();
+    let team_identity_critical = orchestration_status.is_some()
+        || app.team_workers().is_some()
+        || matches!(app.mode, Mode::OrchestrationConfirm | Mode::Orchestrating);
+    let (state, state_color) = if let Some(status) = orchestration_status {
         (status, theme.accent2)
     } else if app.compacting {
         ("compacting context…".into(), theme.accent)
-    } else if app.discovering && app.mode == Mode::Input {
-        ("discovering models…".into(), theme.accent)
     } else if let Some(workers) = app.team_workers().filter(|_| app.mode == Mode::Input) {
         (format!("TEAM · {workers} workers armed"), theme.accent2)
+    } else if app.discovering && app.mode == Mode::Input {
+        ("discovering models…".into(), theme.accent)
     } else {
         match app.mode {
             Mode::Input => ("ready".into(), theme.success),
@@ -1011,7 +1011,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Mode::Help => ("keyboard guide".into(), theme.accent2),
         }
     };
-    let state = if app.mode == Mode::Approval && !app.approval_focused {
+    let mut state = if app.mode == Mode::Approval && !app.approval_focused {
         if app.queued_prompt_count() > 0 {
             format!("{state} · next queued · Tab review")
         } else {
@@ -1022,6 +1022,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         state
     };
+    if team_identity_critical && area.width < 58 {
+        state = compact_team_state(&state).to_owned();
+    }
 
     let mut left = vec![Span::styled(
         " SB ",
@@ -1030,7 +1033,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             .bg(theme.accent)
             .add_modifier(Modifier::BOLD),
     )];
-    if area.width >= 18 {
+    if area.width >= 18 && !(team_identity_critical && area.width < 58) {
         left.push(Span::styled(
             if area.width >= 34 {
                 "  SHALTAIBOLTAI"
@@ -1046,10 +1049,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    let model = app
-        .model
-        .as_ref()
-        .map(|m| format!("{} · {}", m.display_id(), m.provider.label()));
+    let model = app.model.as_ref().map(|model| {
+        (
+            model.display_id().to_owned(),
+            model.provider.label().to_owned(),
+        )
+    });
     let permission = app
         .effective_execution_policy()
         .matching_preset()
@@ -1062,19 +1067,46 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let mut right = Vec::new();
     let room = available.saturating_sub(left_width + 2);
     let model_width = model
-        .as_deref()
-        .map(UnicodeWidthStr::width)
+        .as_ref()
+        .map(|(id, provider)| UnicodeWidthStr::width(format!("{id} · {provider}").as_str()))
         .unwrap_or_default();
     let permission_width = UnicodeWidthStr::width(permission);
-    if wide && room > state_width + permission_width + model_width + 6 {
-        if let Some(model) = model {
-            right.push(Span::styled(model, Style::new().fg(theme.accent2)));
+    if team_identity_critical {
+        let include_permission =
+            area.width >= 100 && room > state_width + permission_width + model_width.min(24) + 6;
+        let permission_reserve = if include_permission {
+            permission_width + 3
+        } else {
+            0
+        };
+        if let Some((id, provider)) = model {
+            let model_budget = room.saturating_sub(state_width + permission_reserve + 3);
+            if model_budget > 0 {
+                right.push(Span::styled(
+                    compact_model_identity(&id, &provider, model_budget),
+                    Style::new().fg(theme.accent2),
+                ));
+                right.push(Span::styled(" · ", Style::new().fg(theme.border)));
+            }
+        }
+        if include_permission {
+            right.push(Span::styled(permission, Style::new().fg(theme.secondary)));
             right.push(Span::styled(" · ", Style::new().fg(theme.border)));
         }
-    }
-    if room > state_width + permission_width + 3 {
-        right.push(Span::styled(permission, Style::new().fg(theme.secondary)));
-        right.push(Span::styled(" · ", Style::new().fg(theme.border)));
+    } else {
+        if wide && room > state_width + permission_width + model_width + 6 {
+            if let Some((id, provider)) = model {
+                right.push(Span::styled(
+                    format!("{id} · {provider}"),
+                    Style::new().fg(theme.accent2),
+                ));
+                right.push(Span::styled(" · ", Style::new().fg(theme.border)));
+            }
+        }
+        if room > state_width + permission_width + 3 {
+            right.push(Span::styled(permission, Style::new().fg(theme.secondary)));
+            right.push(Span::styled(" · ", Style::new().fg(theme.border)));
+        }
     }
     right.push(if app.is_busy() {
         Span::styled(
@@ -1098,6 +1130,48 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn compact_team_state(state: &str) -> &str {
+    if state.contains("approval needed") {
+        "TEAM · approval"
+    } else if state.contains("applying") {
+        "TEAM · apply · Esc"
+    } else if state.contains("synthesizing") {
+        "TEAM · synth · Esc"
+    } else if state.contains("armed") {
+        "TEAM · armed"
+    } else if state.contains("workers") {
+        "TEAM · work · Esc"
+    } else if state.contains("planning") {
+        "TEAM · planning"
+    } else if state.contains("plan ready") {
+        "TEAM · ready"
+    } else if state.contains("working") || state.contains("worker") {
+        "TEAM · working"
+    } else {
+        "TEAM"
+    }
+}
+
+fn compact_model_identity(id: &str, provider: &str, max: usize) -> String {
+    let full = format!("{id} · {provider}");
+    if UnicodeWidthStr::width(full.as_str()) <= max {
+        return full;
+    }
+    let provider_width = UnicodeWidthStr::width(provider);
+    let separator = " · ";
+    let separator_width = UnicodeWidthStr::width(separator);
+    if max <= provider_width + separator_width {
+        return truncate_width(provider, max);
+    }
+    let id_budget = max - provider_width - separator_width;
+    format!(
+        "{}{}{}",
+        truncate_left_width(id, id_budget),
+        separator,
+        provider
+    )
+}
+
 fn truncate_width(text: &str, max: usize) -> String {
     if UnicodeWidthStr::width(text) <= max {
         return text.to_owned();
@@ -1117,6 +1191,51 @@ fn truncate_width(text: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// Keep the branch (the volatile, actionable value) intact when possible and
+/// compact the directory from the left so its project-name tail remains
+/// recognizable. This avoids long worktree paths erasing the branch entirely.
+fn workspace_context_label(cwd: &str, branch: Option<&str>, max: usize) -> String {
+    let Some(branch) = branch.filter(|branch| !branch.is_empty()) else {
+        return truncate_left_width(cwd, max);
+    };
+    if cwd.is_empty() {
+        return truncate_width(branch, max);
+    }
+    let separator = " · ";
+    let branch_width = UnicodeWidthStr::width(branch);
+    let separator_width = UnicodeWidthStr::width(separator);
+    if branch_width + separator_width >= max {
+        return truncate_width(branch, max);
+    }
+    let cwd_budget = max - branch_width - separator_width;
+    format!(
+        "{}{}{}",
+        truncate_left_width(cwd, cwd_budget),
+        separator,
+        branch
+    )
+}
+
+fn truncate_left_width(text: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut reversed = String::new();
+    let mut width = 0;
+    for ch in text.chars().rev() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + 1 > max {
+            break;
+        }
+        reversed.push(ch);
+        width += ch_width;
+    }
+    format!("…{}", reversed.chars().rev().collect::<String>())
 }
 
 /// Pick a legible foreground for filled badges independently of the theme's
@@ -1258,30 +1377,87 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
 fn draw_model_picker(frame: &mut Frame, app: &App) {
     let theme = app.theme;
     let models = app.filtered_models();
+    let configured_default = app.config.default_model.as_deref().and_then(|selector| {
+        providers::qualified_model_selector(selector).or_else(|| {
+            app.models
+                .iter()
+                .find(|model| model.id == selector)
+                .cloned()
+        })
+    });
     let provider_width = models
         .iter()
         .map(|model| UnicodeWidthStr::width(model.provider.label()))
         .max()
         .unwrap_or(0);
+    let picker_width = 110.min(frame.area().width.saturating_sub(2));
+    let row_width = picker_width.saturating_sub(4) as usize;
     let items: Vec<ListItem> = models
         .iter()
         .map(|m| {
+            let is_default = configured_default
+                .as_ref()
+                .is_some_and(|default| default.provider == m.provider && default.id == m.id);
+            let is_current = app
+                .model
+                .as_ref()
+                .is_some_and(|current| current.provider == m.provider && current.id == m.id);
+            let marker = match (is_current, is_default) {
+                (true, true) => "● current/default · ",
+                (true, false) => "● current · ",
+                (false, true) => "◇ default · ",
+                (false, false) => "",
+            };
+            let id_budget =
+                row_width.saturating_sub(provider_width + 2 + UnicodeWidthStr::width(marker));
             let mut spans = vec![
                 Span::styled(
                     format!("{:<provider_width$}  ", m.provider.label()),
                     Style::new().fg(theme.accent2),
                 ),
-                Span::styled(m.display_id().to_owned(), Style::new().fg(theme.fg)),
+                Span::styled(
+                    marker,
+                    Style::new()
+                        .fg(if is_current { theme.accent } else { theme.dim })
+                        .add_modifier(if is_current {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    truncate_width(m.display_id(), id_budget),
+                    Style::new().fg(theme.fg),
+                ),
             ];
-            if m.provider.is_sub_agent() {
-                let detail = if m.is_claude_alias() {
-                    " · latest alias · subscription sub-agent"
+            let detail = if m.provider.is_sub_agent() {
+                Some(if providers::is_cli_default_model(m) {
+                    "unpinned · solo-only · subscription sub-agent"
+                } else if m.is_claude_alias() {
+                    "latest alias · subscription sub-agent"
                 } else {
-                    " · subscription sub-agent"
-                };
-                spans.push(Span::styled(detail, Style::new().fg(theme.dim)));
+                    "subscription sub-agent"
+                })
+            } else if m.provider == ProviderKind::OpenRouter {
+                Some(if crate::providers::openrouter::is_variable_model(&m.id) {
+                    "variable route · solo-only · pricing varies"
+                } else {
+                    "routed API · pricing varies"
+                })
+            } else {
+                None
+            };
+            let mut lines = vec![Line::from(std::mem::take(&mut spans))];
+            if let Some(detail) = detail {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(provider_width + 2)),
+                    Span::styled(
+                        truncate_width(detail, row_width.saturating_sub(provider_width + 2)),
+                        Style::new().fg(theme.dim),
+                    ),
+                ]));
             }
-            ListItem::new(Line::from(spans))
+            ListItem::new(lines)
         })
         .collect();
     let title = format!(
@@ -1289,12 +1465,23 @@ fn draw_model_picker(frame: &mut Frame, app: &App) {
         app.picker_filter,
         models.len()
     );
-    draw_overlay_list(
+    let preferred_height = (models
+        .iter()
+        .map(|model| {
+            usize::from(model.provider.is_sub_agent() || model.provider == ProviderKind::OpenRouter)
+                + 1
+        })
+        .sum::<usize>() as u16
+        + 2)
+    .clamp(5, 22);
+    draw_overlay_list_sized(
         frame,
         &theme,
         title,
         items,
         app.picker_index.min(models.len().saturating_sub(1)),
+        110,
+        preferred_height,
     );
 }
 
@@ -1526,10 +1713,22 @@ fn draw_overlay_list(
     items: Vec<ListItem>,
     selected: usize,
 ) {
+    let preferred_height = (items.len() as u16 + 2).clamp(5, 22);
+    draw_overlay_list_sized(frame, theme, title, items, selected, 76, preferred_height);
+}
+
+fn draw_overlay_list_sized(
+    frame: &mut Frame,
+    theme: &Theme,
+    title: String,
+    items: Vec<ListItem>,
+    selected: usize,
+    preferred_width: u16,
+    preferred_height: u16,
+) {
     let root = frame.area();
     draw_modal_scrim(frame, theme, root);
-    let preferred_height = (items.len() as u16 + 2).clamp(5, 22);
-    let area = modal_area(frame.area(), 76, preferred_height);
+    let area = modal_area(frame.area(), preferred_width, preferred_height);
     frame.render_widget(Clear, area);
 
     let empty = items.is_empty();
@@ -1572,13 +1771,42 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
     let tasks = app.orchestration_plan();
     let workers = tasks.len();
     let focused = app.orchestration_confirm_focused;
-    let detailed_height = (workers as u16).saturating_mul(3).saturating_add(9);
+    let uses_metered_api = app
+        .orchestration_planner()
+        .is_some_and(|model| model.provider.is_metered_api())
+        || tasks
+            .iter()
+            .any(|task| task.model.provider.is_metered_api());
+    let uses_codex = app
+        .orchestration_planner()
+        .is_some_and(|model| model.provider == ProviderKind::Codex)
+        || tasks
+            .iter()
+            .any(|task| task.model.provider == ProviderKind::Codex);
+    let uses_openrouter = app
+        .orchestration_planner()
+        .is_some_and(|model| model.provider == ProviderKind::OpenRouter)
+        || tasks
+            .iter()
+            .any(|task| task.model.provider == ProviderKind::OpenRouter);
+    // USED, START, RULE, and SHARE are always present. Each conditional risk
+    // receives its own row so a long mixed-provider sentence cannot hide the
+    // billing or data-boundary disclosure through horizontal truncation.
+    let header_line_count = 4_u16
+        + u16::from(uses_metered_api)
+        + u16::from(uses_codex)
+        + 2 * u16::from(uses_openrouter);
+    let extra_header_lines = header_line_count.saturating_sub(3);
+    let detailed_height = (workers as u16)
+        .saturating_mul(3)
+        .saturating_add(9)
+        .saturating_add(extra_header_lines);
     let show_instructions =
         frame.area().width >= 64 && frame.area().height.saturating_sub(2) >= detailed_height;
     let preferred_height = if show_instructions {
         detailed_height
     } else {
-        (workers as u16 + 8).clamp(8, 16)
+        (workers as u16 + 8 + extra_header_lines).clamp(8, 20)
     };
     let area = modal_area(frame.area(), 92, preferred_height);
     frame.render_widget(Clear, area);
@@ -1607,10 +1835,13 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
 
     let actions = orchestration_confirm_action_lines(focused, inner.width as usize, &theme);
     let action_height = (actions.len() as u16).min(inner.height);
-    let desired_header_height = 3;
+    // Preserve a heading and at least one exact-model row on very short
+    // terminals; risk rows are priority ordered below for the remaining room.
+    let minimum_task_height = u16::from(!tasks.is_empty()) * 2;
+    let desired_header_height = header_line_count;
     let header_height = inner
         .height
-        .saturating_sub(action_height)
+        .saturating_sub(action_height.saturating_add(minimum_task_height))
         .min(desired_header_height);
     let [header_area, tasks_area, action_area] = Layout::vertical([
         Constraint::Length(header_height),
@@ -1634,36 +1865,60 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
             )
         },
     );
-    let header_lines = vec![
+    let value_width = inner.width.saturating_sub(7) as usize;
+    let header_line = |label: &'static str, value: String, style: Style| {
         Line::from(vec![
-            Span::styled("USED   ", Style::new().fg(theme.dim)),
-            Span::styled(
-                truncate_width(&planner_line, inner.width.saturating_sub(7) as usize),
-                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("START  ", Style::new().fg(theme.dim)),
-            Span::styled(
-                truncate_width(&start_line, inner.width.saturating_sub(7) as usize),
-                Style::new().fg(theme.warning),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("SCOPE  ", Style::new().fg(theme.dim)),
-            Span::styled(
-                truncate_width(
-                    if show_instructions {
-                        "text → listed providers · workers read-only · only lead may edit"
-                    } else {
-                        "text shared · read-only"
-                    },
-                    inner.width.saturating_sub(7) as usize,
-                ),
-                Style::new().fg(theme.accent2),
-            ),
-        ]),
-    ];
+            Span::styled(label, Style::new().fg(theme.dim)),
+            Span::styled(truncate_width(&value, value_width), style),
+        ])
+    };
+    let mut header_lines = vec![header_line(
+        "USED   ",
+        planner_line,
+        Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+    )];
+    if uses_metered_api {
+        header_lines.push(header_line(
+            "BILL   ",
+            "metered API calls may bill".into(),
+            Style::new().fg(theme.warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    header_lines.push(header_line(
+        "RULE   ",
+        "workers are read-only".into(),
+        Style::new().fg(theme.accent2),
+    ));
+    header_lines.push(header_line(
+        "START  ",
+        start_line,
+        Style::new().fg(theme.warning),
+    ));
+    header_lines.push(header_line(
+        "SHARE  ",
+        "text sent to task-listed services".into(),
+        Style::new().fg(theme.accent2),
+    ));
+    if uses_codex {
+        header_lines.push(header_line(
+            "CODEX  ",
+            "global Codex rules excluded".into(),
+            Style::new().fg(theme.accent2),
+        ));
+    }
+    if uses_openrouter {
+        header_lines.push(header_line(
+            "ROUTE  ",
+            "OpenRouter picks endpoints".into(),
+            Style::new().fg(theme.accent2),
+        ));
+        header_lines.push(header_line(
+            "PRIV   ",
+            "privacy settings apply".into(),
+            Style::new().fg(theme.accent2),
+        ));
+    }
+    debug_assert_eq!(header_lines.len(), header_line_count as usize);
     frame.render_widget(
         Paragraph::new(
             header_lines
@@ -1685,15 +1940,14 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
     )];
     for task in tasks {
         let id = format!("{}  ", task.id);
-        let mut model = format!(
-            "{} · {}",
-            task.model.display_id(),
-            task.model.provider.label()
-        );
         let model_budget = row_width
             .saturating_sub(id.width() + 4)
             .min(if show_instructions { 32 } else { 22 });
-        model = truncate_width(&model, model_budget);
+        let model = compact_model_identity(
+            task.model.display_id(),
+            task.model.provider.label(),
+            model_budget,
+        );
         let title_budget = row_width
             .saturating_sub(id.width() + UnicodeWidthStr::width(model.as_str()) + 3)
             .max(1);
@@ -2328,6 +2582,8 @@ mod tests {
             anthropic_api_key: None,
             openai_api_key: None,
             openai_base_url: "http://127.0.0.1:9".into(),
+            openrouter_api_key: None,
+            openrouter_base_url: "http://127.0.0.1:9".into(),
             ollama_host: "http://127.0.0.1:9".into(),
             default_model: None,
             compact_threshold_chars: 80_000,
@@ -2488,7 +2744,33 @@ mod tests {
         assert!(rendered.contains("SB"), "{rendered}");
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
         assert!(!has_inline_mascot(&terminal), "{rendered}");
-        assert!(rendered.contains("team working"), "{rendered}");
+        assert!(rendered.contains("TEAM · working"), "{rendered}");
+    }
+
+    #[test]
+    fn compact_team_states_preserve_phase_and_safety_action() {
+        assert_eq!(compact_team_state("TEAM · planning"), "TEAM · planning");
+        assert_eq!(compact_team_state("TEAM · 2 workers armed"), "TEAM · armed");
+        assert_eq!(
+            compact_team_state("TEAM · plan ready · Tab to review"),
+            "TEAM · ready"
+        );
+        assert_eq!(
+            compact_team_state("TEAM · workers 1/3 · Esc cancel"),
+            "TEAM · work · Esc"
+        );
+        assert_eq!(
+            compact_team_state("TEAM · synthesizing · Esc cancel"),
+            "TEAM · synth · Esc"
+        );
+        assert_eq!(
+            compact_team_state("TEAM · applying changes · Esc cancel"),
+            "TEAM · apply · Esc"
+        );
+        assert_eq!(
+            compact_team_state("TEAM · applying · approval needed"),
+            "TEAM · approval"
+        );
     }
 
     #[tokio::test]
@@ -2897,8 +3179,8 @@ mod tests {
         );
         assert!(rendered.contains("2 worker calls"), "{rendered}");
         assert!(rendered.contains("1 synthesis call"), "{rendered}");
-        assert!(rendered.contains("listed providers"), "{rendered}");
-        assert!(rendered.contains("workers read-only"), "{rendered}");
+        assert!(rendered.contains("task-listed services"), "{rendered}");
+        assert!(rendered.contains("workers are read-only"), "{rendered}");
         assert!(
             rendered.contains("TASK SUMMARIES · EXACT MODELS"),
             "{rendered}"
@@ -2921,10 +3203,69 @@ mod tests {
         );
         assert!(rendered.contains("2 worker calls"), "{rendered}");
         assert!(rendered.contains("synthesis"), "{rendered}");
-        assert!(rendered.contains("text shared · read-only"), "{rendered}");
+        assert!(rendered.contains("workers are read-only"), "{rendered}");
+        assert!(rendered.contains("text sent to task-listed"), "{rendered}");
         assert!(rendered.contains("TASKS · EXACT MODELS"), "{rendered}");
         assert!(rendered.contains("team-test · ollama"), "{rendered}");
         assert!(rendered.contains("Tab"), "{rendered}");
         assert!(rendered.contains("n / Esc"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn mixed_team_confirmation_keeps_cost_and_routing_boundaries_visible() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.textarea.insert_str("/team 2");
+        app.submit_input();
+        app.textarea
+            .insert_str("coordinate this mixed-provider change");
+        app.submit_input();
+        let run_id = app.orchestration_run_id().expect("orchestration run");
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![
+                PlannedTask {
+                    id: 1,
+                    title: "inspect with Codex".into(),
+                    instructions: "read the relevant code".into(),
+                    model: ModelEntry {
+                        provider: ProviderKind::Codex,
+                        id: "codex:gpt-5.6-sol".into(),
+                    },
+                },
+                PlannedTask {
+                    id: 2,
+                    title: "review independently".into(),
+                    instructions: "check the provider boundary".into(),
+                    model: ModelEntry {
+                        provider: ProviderKind::OpenRouter,
+                        id: "openai/gpt-5.4".into(),
+                    },
+                },
+            ]),
+        });
+
+        for width in [40, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let rendered = screen(&terminal);
+            assert!(
+                rendered.contains("metered API calls may bill"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("workers are read-only"), "{rendered}");
+            assert!(
+                rendered.contains("global Codex rules excluded"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("OpenRouter picks endpoints"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("privacy settings apply"), "{rendered}");
+            assert!(rendered.contains("EXACT MODELS"), "{rendered}");
+            assert!(rendered.contains("codex"), "{rendered}");
+            assert!(rendered.contains("openrouter"), "{rendered}");
+        }
     }
 }

@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod cli_agent;
 pub mod ollama;
 pub mod openai;
+pub mod openrouter;
 mod sse;
 
 use crate::config::Config;
@@ -17,6 +18,9 @@ use tokio::sync::mpsc::UnboundedSender;
 pub enum ProviderKind {
     Anthropic,
     OpenAi,
+    /// OpenAI-compatible routed API with its own identity, catalog, and
+    /// billing/data boundary.
+    OpenRouter,
     Ollama,
     /// Claude Code CLI driven as a sub-agent — billed to the user's Claude
     /// subscription, not an API key.
@@ -31,6 +35,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::OpenAi => "openai",
+            ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Ollama => "ollama",
             ProviderKind::ClaudeCode => "claude-code",
             ProviderKind::Codex => "codex",
@@ -42,6 +47,21 @@ impl ProviderKind {
     /// policy is translated to each CLI's native boundary instead.
     pub fn is_sub_agent(&self) -> bool {
         matches!(self, ProviderKind::ClaudeCode | ProviderKind::Codex)
+    }
+
+    /// Providers whose exact model IDs may be entered even when discovery did
+    /// not return that row. Availability is still anchored to a discovered
+    /// provider identity, so a selector cannot conjure missing credentials or
+    /// an unsigned CLI into existence.
+    pub fn supports_unlisted_models(&self) -> bool {
+        self.is_sub_agent() || *self == ProviderKind::OpenRouter
+    }
+
+    pub fn is_metered_api(&self) -> bool {
+        matches!(
+            self,
+            ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::OpenRouter
+        )
     }
 }
 
@@ -139,6 +159,19 @@ pub fn cli_model_selector(selector: &str) -> Option<ModelEntry> {
     })
 }
 
+/// Parse a provider-qualified exact selector. The local `openrouter:` prefix
+/// is deliberately stripped because OpenRouter expects the raw
+/// `author/model` ID on its API.
+pub fn qualified_model_selector(selector: &str) -> Option<ModelEntry> {
+    cli_model_selector(selector).or_else(|| {
+        let id = selector.strip_prefix("openrouter:")?;
+        openrouter::valid_model_id(id).then(|| ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: id.to_owned(),
+        })
+    })
+}
+
 /// Bare CLI selectors delegate model choice to the CLI's own configuration.
 /// They are suitable for ordinary one-off turns, but not for multi-request
 /// workflows that promise one exact model across every phase.
@@ -154,6 +187,14 @@ pub fn is_cli_default_model(model: &ModelEntry) -> bool {
 /// [`cli_model_selector`] until discovery finishes.
 pub fn custom_cli_model(selector: &str, available: &[ModelEntry]) -> Option<ModelEntry> {
     let model = cli_model_selector(selector)?;
+    available
+        .iter()
+        .any(|available| available.provider == model.provider)
+        .then_some(model)
+}
+
+pub fn custom_qualified_model(selector: &str, available: &[ModelEntry]) -> Option<ModelEntry> {
+    let model = qualified_model_selector(selector)?;
     available
         .iter()
         .any(|available| available.provider == model.provider)
@@ -304,6 +345,7 @@ pub async fn stream_chat(config: Config, req: ChatRequest, tx: UnboundedSender<C
     let result = match req.model.provider {
         ProviderKind::Anthropic => anthropic::stream_chat(&config, &req, &tx).await,
         ProviderKind::OpenAi => openai::stream_chat(&config, &req, &tx).await,
+        ProviderKind::OpenRouter => openrouter::stream_chat(&config, &req, &tx).await,
         ProviderKind::Ollama => ollama::stream_chat(&config, &req, &tx).await,
         ProviderKind::ClaudeCode => cli_agent::stream_chat_claude(&config, &req, &tx).await,
         ProviderKind::Codex => cli_agent::stream_chat_codex(&config, &req, &tx).await,
@@ -337,6 +379,12 @@ pub fn immediate_models(config: &Config) -> Vec<ModelEntry> {
                 id: id.into(),
             });
         }
+    }
+    if config.openrouter_api_key.is_some() {
+        models.push(ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: openrouter::AUTO_MODEL.into(),
+        });
     }
     models
 }
@@ -373,6 +421,25 @@ pub async fn discover_dynamic_models(config: &Config, mut publish: impl FnMut(Ve
                     })
                     .collect(),
             }
+        }));
+    }
+
+    if config.openrouter_api_key.is_some() {
+        probes.push(Box::pin(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                openrouter::list_models(config),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| ModelEntry {
+                provider: ProviderKind::OpenRouter,
+                id,
+            })
+            .collect()
         }));
     }
 
@@ -426,6 +493,8 @@ mod tests {
             anthropic_api_key: anthropic_api_key.map(str::to_owned),
             openai_api_key: None,
             openai_base_url: "http://127.0.0.1:9".into(),
+            openrouter_api_key: None,
+            openrouter_base_url: "http://127.0.0.1:9".into(),
             ollama_host: "http://127.0.0.1:9".into(),
             default_model: None,
             compact_threshold_chars: 80_000,
@@ -445,6 +514,16 @@ mod tests {
             .iter()
             .all(|model| model.provider == ProviderKind::Anthropic));
         assert_eq!(models[0].id, "claude-fable-5");
+
+        let mut openrouter_config = config(None);
+        openrouter_config.openrouter_api_key = Some("test-key".into());
+        assert_eq!(
+            immediate_models(&openrouter_config)
+                .into_iter()
+                .map(|model| (model.provider, model.id))
+                .collect::<Vec<_>>(),
+            vec![(ProviderKind::OpenRouter, openrouter::AUTO_MODEL.into())]
+        );
     }
 
     #[test]
@@ -480,5 +559,15 @@ mod tests {
             Some(ProviderKind::Codex)
         );
         assert!(custom_cli_model("codex:", &available).is_none());
+
+        let openrouter = vec![ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: openrouter::AUTO_MODEL.into(),
+        }];
+        let exact = custom_qualified_model("openrouter:anthropic/claude-sonnet-4.6", &openrouter)
+            .expect("configured OpenRouter provider");
+        assert_eq!(exact.provider, ProviderKind::OpenRouter);
+        assert_eq!(exact.id, "anthropic/claude-sonnet-4.6");
+        assert!(custom_qualified_model("openrouter:bad model", &openrouter).is_none());
     }
 }

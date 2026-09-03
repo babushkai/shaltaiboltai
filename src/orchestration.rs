@@ -56,12 +56,14 @@ pub struct WorkerOutcome {
     pub result: std::result::Result<String, String>,
 }
 
-/// Codex's legacy `read-only` sandbox prevents writes but intentionally grants
-/// full-disk reads. That is not strong enough for an advisory agent receiving
-/// untrusted repository context, so Codex is reserved for the post-confirmation
-/// coordinator until the CLI exposes a workspace-scoped read policy.
+/// Team assignments must pin one exact model and have an enforceable
+/// workspace-scoped read boundary. Explicit Codex models use a named
+/// permission profile in the CLI launcher; bare CLI defaults and OpenRouter's
+/// variable auto-router cannot satisfy the exact-model confirmation contract.
 pub fn supports_scoped_advisory(model: &ModelEntry) -> bool {
-    model.provider != providers::ProviderKind::Codex && !providers::is_cli_default_model(model)
+    !(providers::is_cli_default_model(model)
+        || model.provider == providers::ProviderKind::OpenRouter
+            && providers::openrouter::is_variable_model(&model.id))
 }
 
 /// Use the selected lead for planning when its read boundary is enforceable;
@@ -95,6 +97,15 @@ pub fn choose_worker_models(
     count: usize,
 ) -> Vec<ModelEntry> {
     let count = count.clamp(MIN_WORKERS, MAX_WORKERS);
+    // A Codex subscription lead is an explicit request to stay on that
+    // provider/model boundary. Repeating the pinned model also lets users with
+    // no API keys run a complete team, and avoids silently sharing their task
+    // with unrelated providers merely because those CLIs are installed.
+    if coordinator.provider == providers::ProviderKind::Codex
+        && supports_scoped_advisory(coordinator)
+    {
+        return vec![coordinator.clone(); count];
+    }
     let mut candidates = available.to_vec();
     candidates.sort_by(compare_model);
     candidates.dedup_by(|left, right| same_model(left, right));
@@ -1127,6 +1138,8 @@ mod tests {
             anthropic_api_key: None,
             openai_api_key: None,
             openai_base_url: "http://127.0.0.1:9".into(),
+            openrouter_api_key: None,
+            openrouter_base_url: "http://127.0.0.1:9".into(),
             ollama_host: "http://127.0.0.1:9".into(),
             default_model: None,
             compact_threshold_chars: 80_000,
@@ -1170,71 +1183,66 @@ mod tests {
     }
 
     #[test]
-    fn codex_is_reserved_for_the_post_confirmation_coordinator() {
+    fn exact_codex_can_run_a_codex_only_team() {
         let codex = model(ProviderKind::Codex, "codex:gpt-5.6-sol");
-        let safe = model(ProviderKind::OpenAi, "gpt-5.6-sol");
+        let bare_codex = model(ProviderKind::Codex, "codex");
         let bare_claude = model(ProviderKind::ClaudeCode, "claude-code");
-        let exact_claude = model(ProviderKind::ClaudeCode, "claude-code:sonnet");
+        let openrouter = model(ProviderKind::OpenRouter, "openai/gpt-5.6-sol");
 
-        assert!(!supports_scoped_advisory(&codex));
+        assert!(supports_scoped_advisory(&codex));
+        assert!(!supports_scoped_advisory(&bare_codex));
         assert!(!supports_scoped_advisory(&bare_claude));
-        assert!(choose_planner_model(&codex, &[]).is_none());
-        assert!(choose_planner_model(&codex, std::slice::from_ref(&bare_claude)).is_none());
-        assert!(choose_worker_models(&codex, &[], DEFAULT_WORKERS).is_empty());
-
-        let candidates = vec![bare_claude, exact_claude.clone(), safe];
-        let planner = choose_planner_model(&codex, &candidates).unwrap();
-        assert_eq!(model_key(&planner), model_key(&exact_claude));
-        let workers = choose_worker_models(&codex, &candidates, DEFAULT_WORKERS);
+        assert_eq!(
+            model_key(&choose_planner_model(&codex, &[]).unwrap()),
+            model_key(&codex)
+        );
+        let workers =
+            choose_worker_models(&codex, &[bare_claude.clone(), openrouter], DEFAULT_WORKERS);
         assert_eq!(workers.len(), DEFAULT_WORKERS);
-        assert!(workers
-            .iter()
-            .all(|worker| worker.provider != ProviderKind::Codex));
+        assert!(workers.iter().all(|worker| same_model(worker, &codex)));
         assert!(workers.iter().all(supports_scoped_advisory));
     }
 
-    #[tokio::test]
-    async fn direct_codex_advisory_paths_are_rejected_before_provider_launch() {
+    #[test]
+    fn exact_codex_advisory_requests_are_read_only_and_tool_free() {
         let codex = model(ProviderKind::Codex, "codex:gpt-5.6-sol");
-        assert!(planner_request(&codex, [], "root", 2, &execution_policy())
-            .err()
-            .expect("Codex planner must be rejected")
-            .contains("cannot plan"));
+        let planner = planner_request(&codex, [], "root", 2, &execution_policy())
+            .expect("exact Codex planner");
+        assert_eq!(planner.policy, RequestPolicy::ReadOnly);
+        assert!(planner.tools.is_empty());
 
         let worker = PlannedTask {
             id: 1,
-            title: "unsafe".into(),
+            title: "inspect".into(),
             instructions: "inspect".into(),
             model: codex.clone(),
         };
-        assert!(worker_request([], "root", &worker, &execution_policy())
-            .err()
-            .expect("Codex worker must be rejected")
-            .contains("cannot run advisory"));
+        let worker_request =
+            worker_request([], "root", &worker, &execution_policy()).expect("exact Codex worker");
+        assert_eq!(worker_request.policy, RequestPolicy::ReadOnly);
+        assert!(worker_request.tools.is_empty());
         assert!(parse_plan(
             r#"[{"id":1,"title":"one","instructions":"inspect"},{"id":2,"title":"two","instructions":"inspect"}]"#,
             &[codex.clone(), codex.clone()],
             2,
         )
-        .is_err());
+        .is_ok());
+    }
 
-        let direct_request = || ChatRequest {
-            model: codex.clone(),
-            system: "unsafe direct request".into(),
-            messages: vec![Message::User("root".into())],
-            tools: Vec::new(),
-            execution_policy: read_only_execution_policy(),
-            policy: RequestPolicy::ReadOnly,
-            force_full_handoff: true,
-        };
-        assert!(collect_planner_request(offline_config(), direct_request())
-            .await
-            .unwrap_err()
-            .contains("workspace-scoped"));
-        assert!(collect_worker_request(offline_config(), direct_request())
-            .await
-            .unwrap_err()
-            .contains("workspace-scoped"));
+    #[test]
+    fn variable_openrouter_routes_are_solo_only_but_exact_models_are_team_eligible() {
+        let exact = model(ProviderKind::OpenRouter, "anthropic/claude-sonnet-4.6");
+        for id in [
+            providers::openrouter::AUTO_MODEL,
+            "openrouter/free",
+            "~openai/gpt-latest",
+        ] {
+            assert!(!supports_scoped_advisory(&model(
+                ProviderKind::OpenRouter,
+                id
+            )));
+        }
+        assert!(supports_scoped_advisory(&exact));
     }
 
     #[tokio::test]

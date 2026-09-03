@@ -3,7 +3,7 @@
 > [!NOTE]
 > This project is built along with Claude Fable, which is now regulated by US government. 
 
-A multi-provider agentic coding TUI in Rust with a Codex-style authority shell: typed startup policy, OS-enforced command sandboxing, scoped approvals, `/permissions`, `/status`, `/init`, and a polished Ink/Paper interface. Chat with Anthropic, OpenAI-compatible APIs, Ollama, Claude Code, or Codex and switch providers without changing the active safety contract.
+A multi-provider agentic coding TUI in Rust with a Codex-style authority shell: typed startup policy, OS-enforced command sandboxing, scoped approvals, `/permissions`, `/status`, `/init`, and a polished Ink/Paper interface. Chat with Anthropic, OpenAI, OpenRouter, Ollama, Claude Code, or Codex and switch providers without changing the active safety contract.
 
 ## Install
 
@@ -21,7 +21,20 @@ From source (Rust 1.88+; constrained shell execution is supported on macOS and L
 cargo install --git https://github.com/babushkai/shaltaiboltai --locked
 ```
 
-Or clone and `cargo run --release`.
+Or clone and run locally:
+
+```sh
+git clone https://github.com/babushkai/shaltaiboltai.git
+cd shaltaiboltai
+cargo run --release
+```
+
+Set at least one API key, start Ollama, or sign in with `codex login` / the Claude CLI first. For example:
+
+```sh
+export OPENROUTER_API_KEY="your-key"
+cargo run --release -- --model openrouter:anthropic/claude-sonnet-4.6
+```
 
 On Linux, constrained `run_command` calls require Bubblewrap at `/usr/bin/bwrap` or `/bin/bwrap`. The app fails closed if the backend is unavailable; install the `bubblewrap` package with your distribution's package manager. Ubuntu 24.04 hosts that restrict unprivileged user namespaces must also load the distribution's capability-dropping `bwrap-userns-restrict` AppArmor profile from `apparmor-profiles`; do not disable AppArmor globally. Shaltaiboltai never retries a constrained command outside the boundary. macOS uses the system Seatbelt backend.
 
@@ -31,29 +44,34 @@ Providers are auto-discovered at startup:
 |---|---|---|
 | Anthropic | `ANTHROPIC_API_KEY` | Claude (Fable, Opus, Sonnet, Haiku) |
 | OpenAI | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | fetched from `/v1/models` |
+| OpenRouter | `OPENROUTER_API_KEY` (+ optional `OPENROUTER_BASE_URL`) | `openrouter/auto` immediately, then an account-filtered ranked catalog of tool-capable text models |
 | Ollama | running locally (`OLLAMA_HOST`, default `http://localhost:11434`) | fetched from `/api/tags` |
 | Claude Code | the `claude` CLI installed and signed in (Unix) | CLI default plus the documented Fable, Opus, and Sonnet aliases |
 | Codex | the `codex` CLI installed and signed in (Unix) | CLI default; exact model IDs can be entered explicitly |
 
-No keys needed for Ollama — if it's running, its models just show up. Models without tool support automatically fall back to plain chat.
+No keys are needed for Ollama — if it is running, its models just show up. OpenRouter is a separate provider rather than an `OPENAI_BASE_URL` alias, so its provider identity and metered-call boundary stay visible in the model picker and team review. OpenRouter can load-balance a selected model across hosting endpoints and fallbacks; Shaltaiboltai does not claim that the model-author slug identifies the hosting endpoint. Your OpenRouter [routing and privacy settings](https://openrouter.ai/docs/guides/routing/provider-selection) apply.
+
+`/model openrouter:<author>/<model>` selects any exact OpenRouter model ID even when it is not in the curated list. OpenRouter-owned routers such as `openrouter/auto` and `openrouter/free`, plus rolling `~...` aliases, remain available for solo work but are intentionally excluded from team assignments because the concrete model can vary between calls.
 
 ### Subscription providers (no API key)
 
-If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://github.com/openai/codex) is installed and signed in, subscription-backed choices appear in the picker (Claude Pro/Max, ChatGPT Plus/Pro) instead of using a metered API key. `claude-code` and `codex` mean **use that CLI's configured default**. Explicit selectors pass a model override to the CLI: for example, `/model claude-code:sonnet` uses Claude's latest Sonnet alias and `/model codex:gpt-5.6-sol` requests that exact Codex model. Claude aliases come from the installed CLI's documented interface; Codex advertises only its default row because the app never executes a CLI merely to discover models. You can enter any provider-qualified full model ID directly with `/model`, even when it is not listed—the CLI remains authoritative about access.
+If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://github.com/openai/codex) is installed and signed in, subscription-backed choices appear in the picker (Claude Pro/Max, ChatGPT Plus/Pro) instead of using a metered API key. `claude-code` and `codex` mean **use that CLI's configured default**. Explicit selectors pass a model override to the CLI: for example, `/model claude-code:sonnet` uses Claude's latest Sonnet alias and `/model codex:gpt-5.6-sol` requests that exact Codex model. Claude aliases come from the installed CLI's documented interface; Codex shows the current list-visible upstream models from its bundled catalog without executing a CLI during discovery. You can enter any provider-qualified full model ID directly with `/model`, even when it is not listed—the CLI remains authoritative about account access.
 
 CLI discovery is metadata-only and currently Unix-only. At startup the app snapshots the first absolute `claude` and `codex` candidate on `PATH`, rejects candidates inside the workspace or a temporary writable root, and never executes them during discovery. A rejected first hit fails closed instead of falling through to another executable. Restart after installing a CLI or changing `PATH`; `/refresh` does not replace this executable snapshot. The executable identity is revalidated immediately before every launch. Non-Unix CLI bridging stays unavailable until the app can bind a stable executable identity there; API providers remain available.
 
-We never see or store a subscription token — each CLI owns its authentication. shaltaiboltai launches a fresh headless child (`claude --print --output-format stream-json`, `codex exec --json`) and renders its event stream. The child drives its own tool loop, while shaltaiboltai maps the active permission snapshot onto every launch instead of inheriting ambient authority:
+We never read or store a subscription token — each CLI owns its authentication. Shaltaiboltai launches a fresh headless child (`claude --print --output-format stream-json`, interactive `codex exec --json`) and renders its event stream. Read-only Codex planning/workers use the separately attested `codex app-server --stdio` path described below. The child drives its own tool loop, while Shaltaiboltai maps the active permission snapshot onto every launch instead of inheriting ambient authority:
 
 | Permission | Codex CLI | Claude Code CLI |
 |---|---|---|
-| Read Only | `read-only`, user config/rules ignored | `plan` + safe mode, read/search tools only |
+| Read Only | attested workspace-read profile in an isolated one-request Codex home | `plan` + safe mode, read/search tools only |
 | Ask for approval | `workspace-write`, no network, canonical roots only | `plan` + safe mode, read/search tools only |
 | Full Access | `danger-full-access` | `bypassPermissions` |
 
-Headless children cannot route an inner approval prompt back into this TUI, so their inner approval policy is fail-closed. Claude Code cannot express the protected-path carve-outs required by the normal workspace policy, so constrained Claude turns are advisory-only; use the Anthropic API provider for app-owned, policy-mediated edits. Claude Code editing requires the explicit Full Access preset. Full Access is available only through the startup policy or the two-step `/permissions` confirmation; there are no provider-specific bypass switches. An unavailable model is reported as an error and is never silently replaced. Unsupported older CLI interfaces fail closed.
+Headless children cannot route an inner approval prompt back into this TUI, so their inner approval policy is fail-closed. Codex Read Only uses a default-deny permission profile with minimal runtime reads, the captured workspace roots as read-only, and network disabled; legacy `--sandbox read-only` is never used for this path. Before launch, Shaltaiboltai creates a private one-request `CODEX_HOME`, links only a safe regular `auth.json` from the signed-in home, and explicitly denies model tools both authentication locations. The isolated home removes ordinary user configuration and trust state; pinned session overrides prevent ambient user or ordinarily untrusted project configuration, global Codex instructions, skills, MCP/browser surfaces, shell snapshots, secret-bearing environment inheritance, and nested Codex agents from widening the advisory child. Managed/system configuration can still be discovered, so the effective boundary and every repository instruction source reported by app-server are independently attested. Repository `AGENTS.md` instructions inside the reviewed workspace may still apply. The app-server must report Codex CLI **0.152.1**, the exact model/provider, canonical workspace roots, no model fallback, `never` approvals, network denial, and the fresh permission-profile ID during `initialize` + `thread/start`; only then does Shaltaiboltai send the first model-bearing `turn/start`. Any mismatch fails with zero planner/worker model calls.
 
-Each CLI request starts an ephemeral fresh process with an explicit handoff of this app's conversation history. That avoids attaching to an unrelated “last” CLI session in the same directory or duplicating the handoff in CLI session storage. Images are represented in the handoff but their binary contents aren't forwarded to these providers yet (they work with the API providers).
+Codex team/read-only execution currently requires exactly CLI 0.152.1 and a safe file-backed login at `$CODEX_HOME/auth.json`; keychain-only login state and unreviewed newer protocol versions fail closed. Interactive Codex use remains available through the normal `codex exec` path. Claude Code cannot express the protected-path carve-outs required by the normal workspace policy, so constrained Claude turns are advisory-only; use the Anthropic API provider for app-owned, policy-mediated edits. Claude Code editing requires the explicit Full Access preset. Full Access is available only through the startup policy or the two-step `/permissions` confirmation; there are no provider-specific bypass switches. An unavailable model is reported as an error and is never silently replaced.
+
+Each CLI request starts an ephemeral fresh process with an explicit handoff of this app's conversation history. Read-only Codex keeps initialization, attestation, and its one turn inside that same owned app-server process. Nothing attaches to an unrelated “last” CLI session or persists the handoff in CLI session storage. Images are represented in the handoff but their binary contents aren't forwarded to these providers yet (they work with the API providers).
 
 ## Startup policy
 
@@ -79,7 +97,7 @@ In workspace mode, protected `.git`, `.agents`, and `.codex` paths are carved ba
 
 ## Keys & commands
 
-Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). `/permissions` changes the next-turn authority, `/status` shows the immutable snapshot governing an active turn, and `/init` asks the selected model to create repository-scoped `AGENTS.md` guidance through the normal tool and approval path. Commands also take arguments directly: `/theme paper`, `/model qwen`, `/model codex:gpt-5.6-sol`, `/team 3`, and `/refresh`. The statusline prioritizes active state on narrow terminals, then adds model, project, linked-worktree branch, policy, and live context usage as space allows.
+Typing `/` opens a command menu above the input (filters as you type, `Up`/`Down` to navigate, `Tab` to complete, `Enter` to run, `Esc` to dismiss). `/permissions` changes the next-turn authority, `/status` shows the immutable snapshot governing an active turn, and `/init` asks the selected model to create repository-scoped `AGENTS.md` guidance through the normal tool and approval path. Commands also take arguments directly: `/theme paper`, `/model qwen`, `/model codex:gpt-5.6-sol`, `/model openrouter:openai/gpt-5.4`, `/team 3`, and `/refresh`. The statusline prioritizes active state on narrow terminals, then adds model, project, linked-worktree branch, policy, and live context usage as space allows.
 
 The composer stays live while a response streams or a tool runs. Press `Enter` to queue one next message; it is sent automatically only after the current turn finishes cleanly (and after any context compaction). Cancellation, provider errors, truncation, or persistence/compaction failures restore that message to the composer instead. The one-message queue locks after capture, and slash commands wait until the active turn ends.
 
@@ -87,9 +105,9 @@ The composer stays live while a response streams or a tool runs. Press `Enter` t
 
 `/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent. The mascot appears only on genuinely large, quiet canvases; common 120×36 and narrower layouts preserve transcript hierarchy instead of sacrificing half the viewport to decoration. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan.
 
-After confirmation, workers run concurrently under a read-only policy and cannot use Shaltaiboltai's mutating tools. API workers whose models support tools get a bounded, app-owned read-only repository tool loop. Claude Code uses safe mode with `Read`, `Glob`, and `Grep`; a local model without tool support instead reasons from the supplied conversation. Codex CLI is deliberately excluded from planning and worker assignments: its `read-only` sandbox blocks writes but allows reads outside the workspace. An explicitly selected Codex model can still be the post-confirmation lead that synthesizes and edits under its normal sandbox. Every selected advisory provider receives the text conversation, so review the provider/model rows before sharing it. Images are omitted from team fan-out; use `/team off` for a vision prompt. Shaltaiboltai waits for every worker request to finish, synthesizes their reports, and becomes the only agent allowed to edit through the normal approval or CLI sandbox rules. This prevents concurrent team edits; it cannot prevent an unrelated process or person from changing the workspace at the same time.
+After confirmation, workers run concurrently under a read-only policy and cannot use Shaltaiboltai's mutating tools. API workers whose models support tools get a bounded, app-owned read-only repository tool loop. Claude Code uses safe mode with `Read`, `Glob`, and `Grep`; explicit Codex models use the default-deny workspace-read permission profile described above. This makes Codex-only teams possible: select an exact row such as `codex:gpt-5.6-sol`, run `/team 3`, and submit the root task. A Codex lead pins that same Codex model for the planner, every worker, and synthesis even when other providers are installed. A local model without tool support instead reasons from the supplied conversation. Every selected advisory provider receives the text conversation; Codex may apply repository instructions found inside the scoped workspace but excludes ambient global instructions, OpenRouter sends text to provider endpoint(s) chosen under the account's routing/privacy settings, and metered APIs may bill every planner, worker, tool-loop, and synthesis request. Review the exact provider/model rows and scope disclosure before sharing it. Images are omitted from team fan-out; use `/team off` for a vision prompt. Shaltaiboltai waits for every worker request to finish, synthesizes their reports, and becomes the only agent allowed to edit through the normal approval or CLI sandbox rules. This prevents concurrent team edits; it cannot prevent an unrelated process or person from changing the workspace at the same time.
 
-The selected lead provider/model is pinned for synthesis and is also the planner when it has an enforceable workspace-read boundary. With a Codex lead, the overlay identifies the safe alternate planner; team mode requires at least one such advisory model to be available. Because a bare `codex` or `claude-code` selector delegates model choice to that CLI, team mode asks you to choose an explicit row such as `codex:gpt-5.6-sol` or `claude-code:sonnet` first. Worker assignments may deliberately use other providers for diversity; their exact provider/selectors are snapshotted in the plan and never silently replaced. Reaching the confirmation has already used **1 planner call**; accepting it adds at least **N worker calls + 1 synthesis call**, with additional calls possible when workers use read tools or the lead later uses tools. `Esc` cancels planning, workers, or streaming synthesis and terminates their owned requests. Once synthesis reaches a normal tool approval, the usual approval controls apply: `Tab` focuses the review, then `n` or `Esc` denies it. During the worker phase the normal one-message lookahead remains available.
+The selected lead provider/model is pinned for synthesis and is also the planner when it has an enforceable workspace-read boundary. Because bare `codex` / `claude-code` selectors delegate model choice to those CLIs, while OpenRouter-owned routers and `~...` aliases can vary their concrete model, team mode asks you to choose an exact model first. Non-Codex leads may deliberately use other providers for diversity; their exact provider/selectors are snapshotted in the plan and never silently replaced. Reaching the confirmation has already used **1 planner call**; accepting it adds at least **N worker calls + 1 synthesis call**, with additional calls possible when workers use read tools or the lead later uses tools. `Esc` cancels planning, workers, or streaming synthesis and terminates their owned requests. Once synthesis reaches a normal tool approval, the usual approval controls apply: `Tab` focuses the review, then `n` or `Esc` denies it. During the worker phase the normal one-message lookahead remains available. Authentication failures identify the exact planner; for an expired Codex session, run `codex login` once and retry instead of repeatedly launching the same failed plan.
 
 | Key | Action |
 |---|---|
@@ -165,6 +183,8 @@ default_model = "qwen3.5:latest"
 # anthropic_api_key = "sk-ant-..."
 # openai_api_key = "sk-..."
 # openai_base_url = "https://api.openai.com/v1"   # any OpenAI-compatible server
+# openrouter_api_key = "sk-or-..."
+# openrouter_base_url = "https://openrouter.ai/api/v1"
 # ollama_host = "http://localhost:11434"
 # theme = "paper"                                  # default is ink
 # reduced_motion = false                           # freeze the mascot pose while retaining status text
@@ -176,7 +196,7 @@ Set `SHALTAIBOLTAI_REDUCED_MOTION=1` for the same motion-free behavior without c
 
 `cargo run --example smoke [model_id]` exercises the provider layer end-to-end (discovery → streaming → tool call → result → final answer) without the TUI.
 
-Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic/OpenAI, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model. `src/policy.rs` owns typed authority and canonical path classification; `src/sandbox.rs` turns that authority into fail-closed OS process boundaries; `src/tools.rs` reassesses and binds every execution. `src/app.rs` owns immutable turn snapshots, approvals, orchestration, and cancellation. `src/ui.rs` uses dirty-entry caching plus cumulative line offsets, so redraw cost follows changed and visible content rather than transcript length.
+Architecture: `src/providers/` speaks each API natively over reqwest (SSE for Anthropic and the shared OpenAI/OpenRouter wire format, NDJSON for Ollama) and normalizes everything to one `Message`/`ToolCall`/`ChatEvent` model. `src/policy.rs` owns typed authority and canonical path classification; `src/sandbox.rs` turns that authority into fail-closed OS process boundaries; `src/tools.rs` reassesses and binds every execution. `src/app.rs` owns immutable turn snapshots, approvals, orchestration, and cancellation. `src/ui.rs` uses dirty-entry caching plus cumulative line offsets, so redraw cost follows changed and visible content rather than transcript length. OpenRouter discovery uses its authenticated user catalog so account privacy/provider restrictions are respected, then defensively validates and caps the ranked tool-capable text rows at 40 before publishing them behind the immediate auto-router row.
 
 The render suite exercises idle, help, status, permissions, Full Access confirmation, and tool approvals down to 40×12, including Ink/Paper semantic styles. CI runs formatting, installer ShellCheck, strict Clippy, all targets, the production Linux sandbox integration test, macOS/Linux release builds, and a Windows compile plus hard-link boundary test before release artifacts are cut.
 

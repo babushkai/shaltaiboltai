@@ -13,6 +13,8 @@ fn offline_config() -> Config {
         anthropic_api_key: None,
         openai_api_key: None,
         openai_base_url: "http://127.0.0.1:9".into(),
+        openrouter_api_key: None,
+        openrouter_base_url: "http://127.0.0.1:9".into(),
         ollama_host: "http://127.0.0.1:9".into(),
         default_model: None,
         compact_threshold_chars: 80_000,
@@ -817,6 +819,33 @@ async fn slash_model_accepts_explicit_cli_selectors() {
 }
 
 #[tokio::test]
+async fn reopening_model_picker_keeps_the_current_model_selected() {
+    let (mut app, _rx) = test_app();
+    let first = ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "first-model".into(),
+    };
+    let current = ModelEntry {
+        provider: ProviderKind::Codex,
+        id: "codex:gpt-5.6-sol".into(),
+    };
+    app.models = vec![first, current.clone()];
+    app.model = Some(current.clone());
+
+    app.open_picker();
+    assert_eq!(app.picker_index, 1);
+    app.pick_model();
+
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(
+        app.model
+            .as_ref()
+            .map(|model| (model.provider, model.id.as_str())),
+        Some((current.provider, current.id.as_str()))
+    );
+}
+
+#[tokio::test]
 async fn configured_cli_selector_materializes_after_provider_discovery() {
     let mut config = offline_config();
     config.default_model = Some("codex:gpt-future".into());
@@ -1336,6 +1365,51 @@ async fn dynamic_default_replaces_only_the_provisional_model() {
             .as_ref()
             .map(|model| (model.id.as_str(), model.provider))
     );
+}
+
+#[tokio::test]
+async fn qualified_openrouter_default_is_available_without_catalog_latency() {
+    let mut config = offline_config();
+    config.openrouter_api_key = Some("test-key".into());
+    config.default_model = Some("openrouter:anthropic/claude-sonnet-4.6".into());
+
+    let (app, _rx) = test_app_with_config(config);
+    let model = app.model.expect("qualified OpenRouter default");
+    assert_eq!(model.provider, ProviderKind::OpenRouter);
+    assert_eq!(model.id, "anthropic/claude-sonnet-4.6");
+}
+
+#[tokio::test]
+async fn unlisted_openrouter_selection_survives_refresh() {
+    let mut config = offline_config();
+    config.openrouter_api_key = Some("test-key".into());
+    let (mut app, _rx) = test_app_with_config(config);
+    app.textarea
+        .insert_str("/model openrouter:anthropic/claude-sonnet-4.6");
+    app.submit_input();
+    assert_eq!(
+        app.model
+            .as_ref()
+            .map(|model| (model.provider, model.id.as_str())),
+        Some((ProviderKind::OpenRouter, "anthropic/claude-sonnet-4.6"))
+    );
+
+    app.discovering = false;
+    app.refresh_models();
+    app.on_event(AppEvent::ModelsDiscovered {
+        models: Vec::new(),
+        finished: true,
+    });
+
+    assert_eq!(
+        app.model
+            .as_ref()
+            .map(|model| (model.provider, model.id.as_str())),
+        Some((ProviderKind::OpenRouter, "anthropic/claude-sonnet-4.6"))
+    );
+    assert!(app.models.iter().any(|model| {
+        model.provider == ProviderKind::OpenRouter && model.id == "anthropic/claude-sonnet-4.6"
+    }));
 }
 
 #[tokio::test]

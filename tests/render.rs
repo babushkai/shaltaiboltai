@@ -20,6 +20,8 @@ fn offline_config() -> Config {
         anthropic_api_key: None,
         openai_api_key: None,
         openai_base_url: "http://127.0.0.1:9".into(),
+        openrouter_api_key: None,
+        openrouter_base_url: "http://127.0.0.1:9".into(),
         ollama_host: "http://127.0.0.1:9".into(),
         default_model: None,
         compact_threshold_chars: 80_000,
@@ -300,7 +302,7 @@ async fn slash_input_opens_the_command_menu() {
 }
 
 #[tokio::test]
-async fn model_picker_distinguishes_cli_defaults_aliases_and_exact_models() {
+async fn model_picker_distinguishes_cli_and_openrouter_model_contracts() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
@@ -317,20 +319,50 @@ async fn model_picker_distinguishes_cli_defaults_aliases_and_exact_models() {
             provider: ProviderKind::Codex,
             id: "codex:gpt-5.6-sol".into(),
         },
+        ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: "openrouter/auto".into(),
+        },
+        ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: "anthropic/claude-sonnet-4.6".into(),
+        },
     ];
+    app.config.default_model = Some("codex:gpt-5.6-sol".into());
+    app.model = app
+        .models
+        .iter()
+        .find(|model| model.id == "codex:gpt-5.6-sol")
+        .cloned();
     app.open_picker();
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = screen(&terminal);
 
-    assert!(rendered.contains("claude-code  CLI default"), "{rendered}");
     assert!(
-        rendered.contains("claude-code  sonnet · latest alias · subscription sub-agent"),
+        rendered.contains("claude-code  CLI default")
+            && rendered.contains("unpinned · solo-only · subscription sub-agent"),
         "{rendered}"
     );
     assert!(
-        rendered.contains("codex        gpt-5.6-sol · subscription sub-agent"),
+        rendered.contains("claude-code  sonnet")
+            && rendered.contains("latest alias · subscription sub-agent"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("codex        ● current/default · gpt-5.6-sol")
+            && rendered.contains("subscription sub-agent"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("openrouter   openrouter/auto")
+            && rendered.contains("variable route · solo-only · pricing varies"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("openrouter   anthropic/claude-sonnet-4.6")
+            && rendered.contains("routed API · pricing varies"),
         "{rendered}"
     );
 }
@@ -349,13 +381,35 @@ async fn statusline_shows_cwd_and_branch() {
     let status_row: String = (0..120)
         .map(|x| buffer[(x, 1)].symbol().to_owned())
         .collect();
-    assert!(
-        status_row.contains(app.cwd_display.as_str()),
-        "{status_row}"
-    );
+    let cwd_tail = app.cwd_display.chars().rev().take(12).collect::<String>();
+    let cwd_tail = cwd_tail.chars().rev().collect::<String>();
+    assert!(status_row.contains(&cwd_tail), "{status_row}");
     if let Some(branch) = &app.git_branch {
-        let visible_prefix = branch.chars().take(10).collect::<String>();
-        assert!(status_row.contains(&visible_prefix), "{status_row}");
+        assert!(status_row.contains(branch), "{status_row}");
+    }
+}
+
+#[tokio::test]
+async fn team_status_keeps_the_exact_codex_identity_at_common_widths() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    let codex = ModelEntry {
+        provider: ProviderKind::Codex,
+        id: "codex:gpt-5.6-sol".into(),
+    };
+    app.models = vec![codex.clone()];
+    app.model = Some(codex);
+    app.textarea.insert_str("/team 2");
+    app.submit_input();
+
+    for width in [40, 80, 120] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("TEAM"), "width {width}: {rendered}");
+        assert!(rendered.contains("5.6-sol"), "width {width}: {rendered}");
+        assert!(rendered.contains("codex"), "width {width}: {rendered}");
     }
 }
 
