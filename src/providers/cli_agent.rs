@@ -2914,15 +2914,6 @@ mod tests {
             assert_eq!(turn_start["params"]["input"][0]["type"], "text");
             assert_eq!(turn_start["params"]["input"][0]["text"], "inspect only");
             assert_eq!(turn_start["params"]["input"][0]["textElements"], json!([]));
-            send_codex_app_server_message(
-                &mut server_write,
-                &json!({
-                    "id": CODEX_APP_SERVER_TURN_START_ID,
-                    "result": {"turn": {"id": "turn-1", "status": "inProgress"}}
-                }),
-            )
-            .await?;
-
             // Wrongly correlated events cannot leak another thread's output or usage.
             send_codex_app_server_message(
                 &mut server_write,
@@ -3050,6 +3041,25 @@ mod tests {
                             ]
                         }
                     }
+                }),
+            )
+            .await?;
+            // A turn can begin and finish before its start response reaches the
+            // client. The one-shot transport must replay this entire prefix.
+            send_codex_app_server_message(
+                &mut server_write,
+                &json!({
+                    "id": CODEX_APP_SERVER_TURN_START_ID,
+                    "result": {"turn": {
+                        "id": "turn-1",
+                        "items": [],
+                        "itemsView": "notLoaded",
+                        "status": "inProgress",
+                        "error": null,
+                        "startedAt": null,
+                        "completedAt": null,
+                        "durationMs": null
+                    }}
                 }),
             )
             .await?;
