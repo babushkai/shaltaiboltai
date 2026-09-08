@@ -3,10 +3,12 @@ use ratatui::style::Color;
 use ratatui::Terminal;
 use shaltaiboltai::app::{App, AppEvent, Entry, Mode, PermissionOverlay};
 use shaltaiboltai::config::Config;
+use shaltaiboltai::orchestration::PlannedTask;
 use shaltaiboltai::policy::{ExecutionPolicy, PermissionPreset, Workspace};
 use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
 use shaltaiboltai::{theme, ui};
 use tokio::sync::mpsc::unbounded_channel;
+use unicode_width::UnicodeWidthStr;
 
 /// Tests must never read or write the user's real data dir (persisted theme,
 /// sessions, input history).
@@ -123,6 +125,46 @@ fn golden_app(selected_theme: theme::Theme) -> App {
     app.model = Some(ModelEntry {
         provider: ProviderKind::OpenAi,
         id: "gpt-golden".into(),
+    });
+    app
+}
+
+fn mixed_team_confirmation_app() -> App {
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "team-test".into(),
+    });
+    app.textarea.insert_str("/team 2");
+    app.submit_input();
+    app.textarea
+        .insert_str("coordinate this mixed-provider change");
+    app.submit_input();
+    let run_id = app.orchestration_run_id().expect("orchestration run");
+    app.on_event(AppEvent::OrchestrationPlanned {
+        run_id,
+        result: Ok(vec![
+            PlannedTask {
+                id: 1,
+                title: "inspect with Codex".into(),
+                instructions: "read the relevant code".into(),
+                model: ModelEntry {
+                    provider: ProviderKind::Codex,
+                    id: "codex:gpt-5.6-sol".into(),
+                },
+            },
+            PlannedTask {
+                id: 2,
+                title: "review independently".into(),
+                instructions: "check the provider boundary".into(),
+                model: ModelEntry {
+                    provider: ProviderKind::OpenRouter,
+                    id: "openai/gpt-5.4".into(),
+                },
+            },
+        ]),
     });
     app
 }
@@ -278,6 +320,50 @@ async fn codex_style_idle_shell_matches_reviewed_text_snapshot() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let actual = text_snapshot(&terminal);
     assert_eq!(actual, include_str!("codex_style_idle_48x11.snap"));
+}
+
+#[tokio::test]
+async fn mixed_team_confirmation_pages_match_reviewed_40x12_snapshots() {
+    isolate_data_dir();
+    let mut app = mixed_team_confirmation_app();
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let review_screen = screen(&terminal);
+    assert_eq!(review_screen.lines().count(), 12);
+    assert!(
+        review_screen
+            .lines()
+            .all(|line| UnicodeWidthStr::width(line) == 40),
+        "{review_screen}"
+    );
+    assert_eq!(
+        text_snapshot(&terminal),
+        include_str!("codex_style_team_confirmation_40x12_review.snap")
+    );
+
+    app.confirm_orchestration();
+    assert_eq!(app.mode, Mode::OrchestrationConfirm);
+    assert!(!app.orchestration_confirm_focused);
+    app.toggle_orchestration_confirm_focus();
+    assert!(app.orchestration_confirm_focused);
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let tasks_screen = screen(&terminal);
+    assert_eq!(tasks_screen.lines().count(), 12);
+    assert!(
+        tasks_screen
+            .lines()
+            .all(|line| UnicodeWidthStr::width(line) == 40),
+        "{tasks_screen}"
+    );
+    assert_eq!(
+        text_snapshot(&terminal),
+        include_str!("codex_style_team_confirmation_40x12_tasks.snap")
+    );
+
+    app.toggle_orchestration_confirm_focus();
+    assert!(!app.orchestration_confirm_focused);
 }
 
 #[tokio::test]

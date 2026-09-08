@@ -1685,6 +1685,10 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
         || tasks
             .iter()
             .any(|task| task.model.provider == ProviderKind::OpenRouter);
+    if root.width <= 48 && root.height <= 14 {
+        draw_paged_orchestration_confirm(frame, app, uses_metered_api, uses_codex, uses_openrouter);
+        return;
+    }
     // USED, START, RULE, and SHARE are always present. Each conditional risk
     // receives its own row so a long mixed-provider sentence cannot hide the
     // billing or data-boundary disclosure through horizontal truncation.
@@ -1882,6 +1886,198 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
     task_lines.truncate(tasks_area.height as usize);
     frame.render_widget(Paragraph::new(task_lines), tasks_area);
     frame.render_widget(Paragraph::new(actions), action_area);
+}
+
+fn draw_paged_orchestration_confirm(
+    frame: &mut Frame,
+    app: &App,
+    uses_metered_api: bool,
+    uses_codex: bool,
+    uses_openrouter: bool,
+) {
+    let theme = app.theme;
+    let area = frame.area();
+    let width = area.width as usize;
+    let workers = app.orchestration_plan().len();
+    let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
+    let success = semantic_foreground(theme.success, theme.surface, theme.fg);
+    let error = semantic_foreground(theme.error, theme.surface, theme.fg);
+
+    frame.render_widget(Clear, area);
+    if let Some(surface) = theme.surface {
+        frame.render_widget(
+            Block::default().style(Style::new().bg(surface).fg(theme.fg)),
+            area,
+        );
+    }
+
+    if !app.orchestration_confirm_focused {
+        let [top_pad, title_area, risk_area, action_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .areas(area);
+        let _ = top_pad;
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  Team plan · review 1/2",
+                Style::new().fg(warning).add_modifier(Modifier::BOLD),
+            )),
+            title_area,
+        );
+
+        let mut risks = vec![Line::styled(
+            "  USED  1 planner call already ran",
+            Style::new().fg(theme.fg),
+        )];
+        if uses_metered_api {
+            risks.push(Line::styled(
+                "  BILL  metered API calls may bill",
+                Style::new().fg(warning).add_modifier(Modifier::BOLD),
+            ));
+        }
+        risks.push(Line::styled(
+            "  RULE  workers are read-only",
+            Style::new().fg(theme.accent2),
+        ));
+        risks.push(Line::styled(
+            truncate_width(
+                &format!("  START ≥{workers} worker calls → synthesis"),
+                width,
+            ),
+            Style::new().fg(warning),
+        ));
+        risks.push(Line::styled(
+            "  SHARE text sent to listed services",
+            Style::new().fg(theme.accent2),
+        ));
+        if uses_codex {
+            risks.push(Line::styled(
+                "  CODEX global rules excluded",
+                Style::new().fg(theme.accent2),
+            ));
+        }
+        if uses_openrouter {
+            risks.push(Line::styled(
+                "  ROUTE OpenRouter picks endpoints",
+                Style::new().fg(theme.accent2),
+            ));
+            risks.push(Line::styled(
+                "  PRIV  privacy settings apply",
+                Style::new().fg(theme.accent2),
+            ));
+        }
+        risks.truncate(risk_area.height as usize);
+        frame.render_widget(Paragraph::new(risks), risk_area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("› ", Style::new().fg(theme.accent)),
+                    key_span("Tab", theme.accent),
+                    Span::styled(" review tasks", Style::new().fg(theme.fg)),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    key_span("n / Esc", error),
+                    Span::styled(" cancel", Style::new().fg(theme.fg)),
+                ]),
+            ]),
+            action_area,
+        );
+        return;
+    }
+
+    let [top_pad, title_area, tasks_area, gap_area, action_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    let _ = (top_pad, gap_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "  Team plan · tasks 2/2",
+            Style::new().fg(warning).add_modifier(Modifier::BOLD),
+        )),
+        title_area,
+    );
+
+    let tasks = app.orchestration_plan();
+    let mut task_lines = Vec::new();
+    if tasks.len() <= 2 {
+        for task in tasks {
+            task_lines.push(Line::styled(
+                truncate_width(&format!("  {} {}", task.id, task.title), width),
+                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ));
+            task_lines.push(Line::styled(
+                format!(
+                    "    {}",
+                    compact_model_identity(
+                        task.model.display_id(),
+                        task.model.provider.label(),
+                        width.saturating_sub(4),
+                    )
+                ),
+                Style::new().fg(theme.dim),
+            ));
+            let instruction = instruction_preview(&task.instructions, width.saturating_sub(4), 1)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            task_lines.push(Line::styled(
+                format!("    {instruction}"),
+                Style::new().fg(theme.dim),
+            ));
+        }
+    } else {
+        for task in tasks {
+            task_lines.push(Line::styled(
+                format!(
+                    "  {} {}",
+                    task.id,
+                    compact_model_identity(
+                        task.model.display_id(),
+                        task.model.provider.label(),
+                        width.saturating_sub(4),
+                    )
+                ),
+                Style::new().fg(theme.fg),
+            ));
+        }
+        if task_lines.len() < tasks_area.height as usize {
+            task_lines.push(Line::styled(
+                "  resize to review task instructions",
+                Style::new().fg(theme.dim),
+            ));
+        }
+    }
+    task_lines.truncate(tasks_area.height as usize);
+    frame.render_widget(Paragraph::new(task_lines), tasks_area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("› ", Style::new().fg(success)),
+                key_span("y / Enter", success),
+                Span::styled(" start", Style::new().fg(theme.fg)),
+            ]),
+            Line::from(vec![
+                Span::raw("  "),
+                key_span("Tab", theme.accent),
+                Span::styled(" back", Style::new().fg(theme.fg)),
+            ]),
+            Line::from(vec![
+                Span::raw("  "),
+                key_span("n / Esc", error),
+                Span::styled(" cancel", Style::new().fg(theme.fg)),
+            ]),
+        ]),
+        action_area,
+    );
 }
 
 fn instruction_preview(text: &str, width: usize, max_lines: usize) -> Vec<String> {
@@ -3079,7 +3275,7 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("team plan ready"), "{rendered}");
+        assert!(rendered.contains("Team plan · review 1/2"), "{rendered}");
         assert!(
             rendered.contains("1 planner call already ran"),
             "{rendered}"
@@ -3087,10 +3283,21 @@ mod tests {
         assert!(rendered.contains("2 worker calls"), "{rendered}");
         assert!(rendered.contains("synthesis"), "{rendered}");
         assert!(rendered.contains("workers are read-only"), "{rendered}");
-        assert!(rendered.contains("text sent to task-listed"), "{rendered}");
-        assert!(rendered.contains("TASKS · EXACT MODELS"), "{rendered}");
+        assert!(
+            rendered.contains("text sent to listed services"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Tab review tasks"), "{rendered}");
+        assert!(!rendered.contains("team-test · ollama"), "{rendered}");
+        assert!(rendered.contains("n / Esc"), "{rendered}");
+
+        app.toggle_orchestration_confirm_focus();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("Team plan · tasks 2/2"), "{rendered}");
         assert!(rendered.contains("team-test · ollama"), "{rendered}");
         assert!(rendered.contains("Tab"), "{rendered}");
+        assert!(rendered.contains("y / Enter start"), "{rendered}");
         assert!(rendered.contains("n / Esc"), "{rendered}");
     }
 
