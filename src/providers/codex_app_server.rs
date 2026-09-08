@@ -620,3 +620,8 @@ fn first_line(value: &str) -> String {
         line.to_owned()
     }
 }
+
+// The transport remains dormant until the provider and session layers can
+// persist thread ownership and uncertain-delivery state.
+#[allow(dead_code)]
+pub(super) mod persistent;
