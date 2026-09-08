@@ -737,7 +737,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
-    use tokio::io::{duplex, split};
+    use tokio::io::{duplex, split, AsyncReadExt};
     use tokio::sync::mpsc::unbounded_channel;
 
     async fn targeted_terminal_error(params: Value) -> String {
@@ -1009,6 +1009,177 @@ mod tests {
         assert_eq!(interrupt["method"], "turn/interrupt");
         assert_eq!(interrupt["params"]["threadId"], "thread-1");
         assert_eq!(interrupt["params"]["turnId"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn foreign_pre_response_model_reroute_does_not_interrupt_or_leak() {
+        let (client, server) = duplex(16 * 1024);
+        let (client_read, mut client_write) = split(client);
+        let (mut server_read, mut server_write) = split(server);
+        let mut client_read = BufReader::new(client_read);
+        let (tx, mut rx) = unbounded_channel();
+
+        for message in [
+            json!({
+                "method": "model/rerouted",
+                "params": {
+                    "threadId": "other-thread",
+                    "turnId": "turn-1",
+                    "fromModel": "gpt-5.6-sol",
+                    "toModel": "gpt-5.5",
+                    "reason": "unavailable"
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-1",
+                        "items": [],
+                        "itemsView": "notLoaded",
+                        "status": "completed",
+                        "error": null,
+                        "startedAt": 1,
+                        "completedAt": 2,
+                        "durationMs": 1000
+                    }
+                }
+            }),
+            json!({
+                "id": TURN_START_ID,
+                "result": {"turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                    "status": "inProgress",
+                    "error": null,
+                    "startedAt": null,
+                    "completedAt": null,
+                    "durationMs": null
+                }}
+            }),
+        ] {
+            send_message(&mut server_write, &message)
+                .await
+                .expect("write pre-response frame");
+        }
+
+        let mut buffered = BufferedNotifications::default();
+        read_response_buffering(
+            &mut client_read,
+            &mut client_write,
+            TURN_START_ID,
+            &tx,
+            &mut buffered,
+        )
+        .await
+        .expect("read turn/start response");
+        consume_turn_with_pending(
+            &mut client_read,
+            &mut client_write,
+            "thread-1",
+            "turn-1",
+            buffered.messages,
+            &tx,
+        )
+        .await
+        .expect("foreign reroute must not fail matching turn");
+        assert!(matches!(rx.try_recv(), Ok(ChatEvent::Completed { .. })));
+        assert!(rx.try_recv().is_err());
+
+        let mut written = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), server_read.read(&mut written))
+                .await
+                .is_err(),
+            "foreign reroute must not send interrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_response_nonretry_error_wins_over_nominal_completion() {
+        let (client, mut server) = duplex(16 * 1024);
+        let (client_read, mut client_write) = split(client);
+        let mut client_read = BufReader::new(client_read);
+        let (tx, mut rx) = unbounded_channel();
+
+        for message in [
+            json!({
+                "method": "error",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "error": {
+                        "message": "terminal transport failure",
+                        "codexErrorInfo": null,
+                        "additionalDetails": null,
+                        "misalignment": null
+                    },
+                    "willRetry": false
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-1",
+                        "items": [],
+                        "itemsView": "notLoaded",
+                        "status": "completed",
+                        "error": null,
+                        "startedAt": 1,
+                        "completedAt": 2,
+                        "durationMs": 1000
+                    }
+                }
+            }),
+            json!({
+                "id": TURN_START_ID,
+                "result": {"turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                    "status": "inProgress",
+                    "error": null,
+                    "startedAt": null,
+                    "completedAt": null,
+                    "durationMs": null
+                }}
+            }),
+        ] {
+            send_message(&mut server, &message)
+                .await
+                .expect("write pre-response frame");
+        }
+
+        let mut buffered = BufferedNotifications::default();
+        read_response_buffering(
+            &mut client_read,
+            &mut client_write,
+            TURN_START_ID,
+            &tx,
+            &mut buffered,
+        )
+        .await
+        .expect("read turn/start response");
+        consume_turn_with_pending(
+            &mut client_read,
+            &mut client_write,
+            "thread-1",
+            "turn-1",
+            buffered.messages,
+            &tx,
+        )
+        .await
+        .expect("consume terminal error");
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ChatEvent::Error(message)) if message == "terminal transport failure"
+        ));
+        assert!(rx.try_recv().is_err(), "must not also emit Completed");
     }
 
     #[test]
