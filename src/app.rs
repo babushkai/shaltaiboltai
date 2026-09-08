@@ -506,6 +506,9 @@ pub struct App {
     pub render_cache_total_lines: usize,
     pub render_cache_width: usize,
     pub render_cache_rev: u64,
+    /// Last transcript viewport height, used to keep a scrolled anchor stable
+    /// while the transient activity band appears or disappears.
+    pub render_cache_viewport_height: usize,
     /// Monotonic UI-only clock. Advancing the mascot never dirties transcript
     /// entries or changes persisted session state.
     animation_tick: u64,
@@ -619,6 +622,7 @@ impl App {
             render_cache_total_lines: 0,
             render_cache_width: 0,
             render_cache_rev: 0,
+            render_cache_viewport_height: 0,
             animation_tick: 0,
             gen: 0,
             streaming_text: String::new(),
@@ -3676,12 +3680,11 @@ fn forward_or_hold_chat_event(
 }
 
 fn make_textarea(theme: &Theme) -> TextArea<'static> {
-    // The block (border + surface background) is restyled every frame by
-    // ui::draw_input, since it doubles as the focus indicator.
+    // The borderless composer block is restyled every frame by ui::draw_input.
     let mut textarea = TextArea::default();
     textarea.set_style(Style::new().fg(theme.fg));
     textarea.set_cursor_line_style(Style::default());
-    textarea.set_placeholder_text("Describe a change or ask a question…");
+    textarea.set_placeholder_text("Ask Shaltaiboltai to do anything");
     textarea.set_placeholder_style(Style::new().fg(theme.dim));
     textarea
 }

@@ -200,7 +200,11 @@ pub const TERMINAL: Theme = Theme {
     code: Color::Yellow,
 };
 
-pub const DEFAULT: Theme = INK;
+/// Match Codex's terminal-native visual hierarchy by default. Authored color
+/// themes remain available through `/theme` for people who explicitly choose
+/// them, but a fresh install should inherit the terminal rather than painting
+/// an application-sized panel over it.
+pub const DEFAULT: Theme = TERMINAL;
 
 pub fn all() -> &'static [Theme] {
     &[
