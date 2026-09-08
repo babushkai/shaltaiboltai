@@ -8,7 +8,7 @@
 use super::{ChatEvent, Usage};
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
@@ -21,6 +21,40 @@ pub(super) const INTERRUPT_ID: i64 = 3;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_INSTRUCTION_SOURCES: usize = 128;
+const MAX_PRE_RESPONSE_NOTIFICATIONS: usize = 256;
+const MAX_PRE_RESPONSE_NOTIFICATION_BYTES: usize = 8 * MAX_FRAME_BYTES;
+
+#[derive(Default)]
+struct BufferedNotifications {
+    messages: VecDeque<Value>,
+    encoded_bytes: usize,
+}
+
+impl BufferedNotifications {
+    fn push(&mut self, message: Value) -> Result<()> {
+        if self.messages.len() >= MAX_PRE_RESPONSE_NOTIFICATIONS {
+            anyhow::bail!(
+                "Codex app-server emitted more than {MAX_PRE_RESPONSE_NOTIFICATIONS} notifications before a response"
+            );
+        }
+        let encoded_bytes = serde_json::to_vec(&message)
+            .context("measure buffered Codex app-server notification")?
+            .len()
+            .saturating_add(1);
+        let total = self
+            .encoded_bytes
+            .checked_add(encoded_bytes)
+            .context("Codex app-server notification buffer size overflowed")?;
+        if total > MAX_PRE_RESPONSE_NOTIFICATION_BYTES {
+            anyhow::bail!(
+                "Codex app-server notifications before a response exceeded {MAX_PRE_RESPONSE_NOTIFICATION_BYTES} bytes"
+            );
+        }
+        self.messages.push_back(message);
+        self.encoded_bytes = total;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct Contract {
@@ -107,7 +141,15 @@ where
         }),
     )
     .await?;
-    let turn_started = read_response(stdout, stdin, TURN_START_ID, tx).await?;
+    let mut buffered_notifications = BufferedNotifications::default();
+    let turn_started = read_response_buffering(
+        stdout,
+        stdin,
+        TURN_START_ID,
+        tx,
+        &mut buffered_notifications,
+    )
+    .await?;
     let turn = turn_started
         .get("turn")
         .and_then(Value::as_object)
@@ -122,7 +164,15 @@ where
         anyhow::bail!("Codex turn/start did not create an in-progress turn");
     }
 
-    consume_turn(stdout, stdin, &thread_id, &turn_id, tx).await
+    consume_turn_with_pending(
+        stdout,
+        stdin,
+        &thread_id,
+        &turn_id,
+        buffered_notifications.messages,
+        tx,
+    )
+    .await
 }
 
 pub(super) async fn send_message<W>(stdin: &mut W, message: &Value) -> Result<()>
@@ -206,11 +256,41 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    read_response_inner(stdout, stdin, expected_id, tx, None).await
+}
+
+async fn read_response_buffering<R, W>(
+    stdout: &mut BufReader<R>,
+    stdin: &mut W,
+    expected_id: i64,
+    tx: &UnboundedSender<ChatEvent>,
+    buffered_notifications: &mut BufferedNotifications,
+) -> Result<Value>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    read_response_inner(stdout, stdin, expected_id, tx, Some(buffered_notifications)).await
+}
+
+async fn read_response_inner<R, W>(
+    stdout: &mut BufReader<R>,
+    stdin: &mut W,
+    expected_id: i64,
+    tx: &UnboundedSender<ChatEvent>,
+    mut buffered_notifications: Option<&mut BufferedNotifications>,
+) -> Result<Value>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
         let message = read_message(stdout).await?;
         if message.get("method").is_some() {
             if message.get("id").is_some() {
                 reject_server_request(stdin, &message).await?;
+            } else if let Some(buffer) = buffered_notifications.as_deref_mut() {
+                buffer.push(message)?;
             } else {
                 emit_notice(&message, tx);
             }
@@ -411,11 +491,12 @@ fn attest_instruction_sources(result: &Value, contract: &Contract) -> Result<()>
     Ok(())
 }
 
-async fn consume_turn<R, W>(
+async fn consume_turn_with_pending<R, W>(
     stdout: &mut BufReader<R>,
     stdin: &mut W,
     thread_id: &str,
     turn_id: &str,
+    mut pending: VecDeque<Value>,
     tx: &UnboundedSender<ChatEvent>,
 ) -> Result<()>
 where
@@ -426,7 +507,10 @@ where
     let mut emitted_agent_items = HashSet::new();
     let mut terminal_error = None;
     loop {
-        let message = read_message(stdout).await?;
+        let message = match pending.pop_front() {
+            Some(message) => message,
+            None => read_message(stdout).await?,
+        };
         if message.get("method").is_some() && message.get("id").is_some() {
             reject_server_request(stdin, &message).await?;
             continue;
@@ -670,11 +754,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            consume_turn(
+            consume_turn_with_pending(
                 &mut client_read,
                 &mut client_write,
                 "thread-1",
                 "turn-1",
+                VecDeque::new(),
                 &tx,
             ),
         )
@@ -710,6 +795,243 @@ mod tests {
             missing_turn_id.contains("omitted turn.id"),
             "{missing_turn_id}"
         );
+    }
+
+    #[tokio::test]
+    async fn pre_response_turn_events_replay_in_order_and_finish_without_more_input() {
+        let (client, mut server) = duplex(64 * 1024);
+        let (client_read, mut client_write) = split(client);
+        let mut client_read = BufReader::new(client_read);
+        let (tx, mut rx) = unbounded_channel();
+
+        for message in [
+            json!({
+                "method": "error",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "error": {
+                        "message": "retrying request",
+                        "codexErrorInfo": null,
+                        "additionalDetails": null,
+                        "misalignment": null
+                    },
+                    "willRetry": true
+                }
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"type": "agentMessage", "id": "answer-1", "text": "pong"},
+                    "completedAtMs": 2
+                }
+            }),
+            json!({
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {
+                        "total": {
+                            "totalTokens": 14,
+                            "inputTokens": 9,
+                            "cachedInputTokens": 3,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 5,
+                            "reasoningOutputTokens": 0
+                        },
+                        "last": {
+                            "totalTokens": 14,
+                            "inputTokens": 9,
+                            "cachedInputTokens": 3,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 5,
+                            "reasoningOutputTokens": 0
+                        },
+                        "modelContextWindow": 128000
+                    }
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-1",
+                        "items": [
+                            {"type": "agentMessage", "id": "answer-1", "text": "pong"}
+                        ],
+                        "itemsView": "full",
+                        "status": "completed",
+                        "error": null,
+                        "startedAt": 1,
+                        "completedAt": 2,
+                        "durationMs": 1000
+                    }
+                }
+            }),
+            json!({
+                "id": TURN_START_ID,
+                "result": {"turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                    "status": "inProgress",
+                    "error": null,
+                    "startedAt": null,
+                    "completedAt": null,
+                    "durationMs": null
+                }}
+            }),
+        ] {
+            send_message(&mut server, &message)
+                .await
+                .expect("write pre-response frame");
+        }
+
+        let mut buffered = BufferedNotifications::default();
+        let response = read_response_buffering(
+            &mut client_read,
+            &mut client_write,
+            TURN_START_ID,
+            &tx,
+            &mut buffered,
+        )
+        .await
+        .expect("read turn/start response");
+        assert_eq!(response["turn"]["id"], "turn-1");
+        assert_eq!(buffered.messages.len(), 4);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            consume_turn_with_pending(
+                &mut client_read,
+                &mut client_write,
+                "thread-1",
+                "turn-1",
+                buffered.messages,
+                &tx,
+            ),
+        )
+        .await
+        .expect("buffered terminal must finish without another frame")
+        .expect("consume buffered turn");
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.len(), 3, "retry notice must be emitted exactly once");
+        assert!(matches!(&events[0], ChatEvent::Notice(message) if message == "retrying request"));
+        assert!(matches!(&events[1], ChatEvent::TextDelta(text) if text == "pong"));
+        match &events[2] {
+            ChatEvent::Completed {
+                usage: Some(usage), ..
+            } => {
+                assert_eq!(usage.input_tokens, 9);
+                assert_eq!(usage.output_tokens, 5);
+            }
+            other => panic!("expected completed usage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_response_model_reroute_is_replayed_and_interrupted() {
+        let (client, server) = duplex(16 * 1024);
+        let (client_read, mut client_write) = split(client);
+        let (server_read, mut server_write) = split(server);
+        let mut client_read = BufReader::new(client_read);
+        let mut server_read = BufReader::new(server_read);
+        let (tx, mut rx) = unbounded_channel();
+
+        send_message(
+            &mut server_write,
+            &json!({
+                "method": "model/rerouted",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "fromModel": "gpt-5.6-sol",
+                    "toModel": "gpt-5.5",
+                    "reason": "unavailable"
+                }
+            }),
+        )
+        .await
+        .expect("write reroute notification");
+        send_message(
+            &mut server_write,
+            &json!({
+                "id": TURN_START_ID,
+                "result": {"turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                    "status": "inProgress",
+                    "error": null,
+                    "startedAt": null,
+                    "completedAt": null,
+                    "durationMs": null
+                }}
+            }),
+        )
+        .await
+        .expect("write turn/start response");
+
+        let mut buffered = BufferedNotifications::default();
+        read_response_buffering(
+            &mut client_read,
+            &mut client_write,
+            TURN_START_ID,
+            &tx,
+            &mut buffered,
+        )
+        .await
+        .expect("read turn/start response");
+        let error = consume_turn_with_pending(
+            &mut client_read,
+            &mut client_write,
+            "thread-1",
+            "turn-1",
+            buffered.messages,
+            &tx,
+        )
+        .await
+        .expect_err("reroute must fail the exact-model contract");
+        assert!(error.to_string().contains("gpt-5.6-sol to gpt-5.5"));
+        assert!(rx.try_recv().is_err());
+
+        let interrupt =
+            tokio::time::timeout(Duration::from_secs(1), read_message(&mut server_read))
+                .await
+                .expect("reroute interrupt must not hang")
+                .expect("read reroute interrupt");
+        assert_eq!(interrupt["id"], INTERRUPT_ID);
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(interrupt["params"]["threadId"], "thread-1");
+        assert_eq!(interrupt["params"]["turnId"], "turn-1");
+    }
+
+    #[test]
+    fn pre_response_notification_buffer_is_count_and_size_bounded() {
+        let mut buffered = BufferedNotifications::default();
+        for _ in 0..MAX_PRE_RESPONSE_NOTIFICATIONS {
+            buffered
+                .push(json!({"method": "ignored", "params": {}}))
+                .expect("notification within count limit");
+        }
+        let error = buffered
+            .push(json!({"method": "ignored", "params": {}}))
+            .expect_err("notification count above limit must fail closed");
+        assert!(error.to_string().contains("more than"));
+
+        let mut buffered = BufferedNotifications {
+            encoded_bytes: MAX_PRE_RESPONSE_NOTIFICATION_BYTES,
+            ..Default::default()
+        };
+        let error = buffered
+            .push(json!({"method": "ignored", "params": {}}))
+            .expect_err("notification bytes above limit must fail closed");
+        assert!(error.to_string().contains("exceeded"));
     }
 }
 
