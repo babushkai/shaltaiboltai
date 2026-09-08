@@ -2456,7 +2456,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains("• agent 1 · inspect state"), "{rendered}");
-        assert!(rendered.contains("└ running · team-test · ollama"), "{rendered}");
+        assert!(
+            rendered.contains("└ running · team-test · ollama"),
+            "{rendered}"
+        );
         assert!(rendered.contains("• Coordinating team"), "{rendered}");
         assert!(!rendered.contains("REAL AGENT"), "{rendered}");
         assert!(!rendered.contains("DANCING"), "{rendered}");
