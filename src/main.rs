@@ -316,6 +316,7 @@ async fn run(
                 Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
                 Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 Event::Paste(text) => app.paste(&text),
+                Event::Resize(_, _) => app.invalidate_orchestration_confirm_layout(),
                 _ => {}
             },
             // A persistent clock keeps the mascot moving even during dense
@@ -418,7 +419,7 @@ fn handle_orchestration_confirm_key(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Tab => app.toggle_orchestration_confirm_focus(),
-        KeyCode::Enter | KeyCode::Char('y') if app.orchestration_confirm_focused => {
+        KeyCode::Enter | KeyCode::Char('y') if app.orchestration_confirm_can_start() => {
             app.confirm_orchestration();
         }
         _ => {}
@@ -697,6 +698,7 @@ fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
     use shaltaiboltai::orchestration::PlannedTask;
     use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
     use tokio::sync::mpsc::unbounded_channel;
@@ -852,6 +854,12 @@ mod tests {
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.orchestration_confirm_focused);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::OrchestrationConfirm);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert!(app.orchestration_confirm_can_start());
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Orchestrating);
 

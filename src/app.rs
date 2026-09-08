@@ -533,6 +533,9 @@ pub struct App {
     /// Ephemeral, untrusted worker evidence injected into coordinator requests.
     orchestration_context: Option<String>,
     pub orchestration_confirm_focused: bool,
+    /// Set only by the renderer after every required disclosure and task/model
+    /// row fits in the currently visible confirmation view.
+    orchestration_confirm_layout_ready: bool,
     orchestration_gen: u64,
     compaction_gen: u64,
     request_task: Option<JoinHandle<()>>,
@@ -637,6 +640,7 @@ impl App {
             orchestration_run: None,
             orchestration_context: None,
             orchestration_confirm_focused: false,
+            orchestration_confirm_layout_ready: false,
             orchestration_gen: 0,
             compaction_gen: 0,
             request_task: None,
@@ -863,13 +867,30 @@ impl App {
     pub fn focus_orchestration_confirm(&mut self) {
         if self.mode == Mode::OrchestrationConfirm {
             self.orchestration_confirm_focused = true;
+            self.orchestration_confirm_layout_ready = false;
         }
     }
 
     pub fn toggle_orchestration_confirm_focus(&mut self) {
         if self.mode == Mode::OrchestrationConfirm {
             self.orchestration_confirm_focused = !self.orchestration_confirm_focused;
+            self.orchestration_confirm_layout_ready = false;
         }
+    }
+
+    pub(crate) fn set_orchestration_confirm_layout_ready(&mut self, ready: bool) {
+        self.orchestration_confirm_layout_ready =
+            ready && self.mode == Mode::OrchestrationConfirm && self.orchestration_confirm_focused;
+    }
+
+    pub fn orchestration_confirm_can_start(&self) -> bool {
+        self.mode == Mode::OrchestrationConfirm
+            && self.orchestration_confirm_focused
+            && self.orchestration_confirm_layout_ready
+    }
+
+    pub fn invalidate_orchestration_confirm_layout(&mut self) {
+        self.orchestration_confirm_layout_ready = false;
     }
 
     pub fn queued_prompt_count(&self) -> usize {
@@ -1808,6 +1829,7 @@ impl App {
                 run.phase = OrchestrationPhase::Confirming;
                 self.mode = Mode::OrchestrationConfirm;
                 self.orchestration_confirm_focused = false;
+                self.orchestration_confirm_layout_ready = false;
             }
             Err(error) => {
                 let prompt = run.prompt.take();
@@ -1840,7 +1862,7 @@ impl App {
     }
 
     pub fn confirm_orchestration(&mut self) {
-        if self.mode != Mode::OrchestrationConfirm || !self.orchestration_confirm_focused {
+        if !self.orchestration_confirm_can_start() {
             return;
         }
         let Some(mut run) = self.orchestration_run.take() else {
@@ -1884,6 +1906,7 @@ impl App {
         self.orchestration_run = Some(run);
         self.mode = Mode::Orchestrating;
         self.orchestration_confirm_focused = false;
+        self.orchestration_confirm_layout_ready = false;
 
         let config = self.config.clone();
         let tx = self.tx.clone();
@@ -2106,6 +2129,7 @@ impl App {
         }
         self.orchestration_context = None;
         self.orchestration_confirm_focused = false;
+        self.orchestration_confirm_layout_ready = false;
         match run.phase {
             OrchestrationPhase::Planning | OrchestrationPhase::Confirming => {
                 self.mode = Mode::Input;
@@ -2977,6 +3001,7 @@ impl App {
         self.orchestration_run = None;
         self.orchestration_context = None;
         self.orchestration_confirm_focused = false;
+        self.orchestration_confirm_layout_ready = false;
     }
 
     pub fn cancel_compaction_request(&mut self) {
@@ -4387,6 +4412,7 @@ mod tests {
             result: Ok(vec![planned_task(1, lead), planned_task(2, lead)]),
         });
         app.focus_orchestration_confirm();
+        app.set_orchestration_confirm_layout_ready(true);
         app.confirm_orchestration();
         app.orchestration_task.take().unwrap().abort();
         run_id
@@ -4430,6 +4456,7 @@ mod tests {
             "discovery must not replace the pinned lead while a team plan is active"
         );
         app.focus_orchestration_confirm();
+        app.set_orchestration_confirm_layout_ready(true);
         app.confirm_orchestration();
         app.orchestration_task.take().unwrap().abort();
 
@@ -4596,6 +4623,7 @@ mod tests {
             result: Ok(vec![planned_task(1, &lead), planned_task(2, &lead)]),
         });
         app.focus_orchestration_confirm();
+        app.set_orchestration_confirm_layout_ready(true);
         app.confirm_orchestration();
         app.orchestration_task.take().unwrap().abort();
         for id in [1, 2] {

@@ -169,6 +169,54 @@ fn mixed_team_confirmation_app() -> App {
     app
 }
 
+fn max_worker_confirmation_app(workers: usize) -> App {
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "team-test".into(),
+    });
+    app.textarea.insert_str(format!("/team {workers}"));
+    app.submit_input();
+    app.textarea
+        .insert_str("coordinate the maximum worker review");
+    app.submit_input();
+    let run_id = app.orchestration_run_id().expect("orchestration run");
+    let titles = [
+        "inspect parser",
+        "review routing",
+        "audit cancellation",
+        "trace transport",
+    ];
+    let tasks = titles
+        .into_iter()
+        .take(workers)
+        .enumerate()
+        .map(|(index, title)| PlannedTask {
+            id: index + 1,
+            title: title.into(),
+            instructions: format!("inspect task {} completely", index + 1),
+            model: if index % 2 == 0 {
+                ModelEntry {
+                    provider: ProviderKind::Codex,
+                    id: "codex:gpt-5.6-sol".into(),
+                }
+            } else {
+                ModelEntry {
+                    provider: ProviderKind::OpenRouter,
+                    id: "openai/gpt-5.4".into(),
+                }
+            },
+        })
+        .collect();
+    app.on_event(AppEvent::OrchestrationPlanned {
+        run_id,
+        result: Ok(tasks),
+    });
+    app
+}
+
 fn golden_frame(selected_theme: theme::Theme, state: &str, width: u16, height: u16) -> u64 {
     let mut app = golden_app(selected_theme);
     match state {
@@ -323,47 +371,114 @@ async fn codex_style_idle_shell_matches_reviewed_text_snapshot() {
 }
 
 #[tokio::test]
-async fn mixed_team_confirmation_pages_match_reviewed_40x12_snapshots() {
+async fn mixed_team_confirmation_pages_match_reviewed_constrained_snapshots() {
+    isolate_data_dir();
+    for (width, height, review_snapshot, tasks_snapshot) in [
+        (
+            40,
+            12,
+            include_str!("codex_style_team_confirmation_40x12_review.snap"),
+            include_str!("codex_style_team_confirmation_40x12_tasks.snap"),
+        ),
+        (
+            40,
+            15,
+            include_str!("codex_style_team_confirmation_40x15_review.snap"),
+            include_str!("codex_style_team_confirmation_40x15_tasks.snap"),
+        ),
+        (
+            80,
+            12,
+            include_str!("codex_style_team_confirmation_80x12_review.snap"),
+            include_str!("codex_style_team_confirmation_80x12_tasks.snap"),
+        ),
+    ] {
+        let mut app = mixed_team_confirmation_app();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let review_screen = screen(&terminal);
+        assert_eq!(review_screen.lines().count(), height as usize);
+        assert!(
+            review_screen
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) == width as usize),
+            "{review_screen}"
+        );
+        assert_eq!(text_snapshot(&terminal), review_snapshot);
+        assert!(!app.orchestration_confirm_can_start());
+
+        app.confirm_orchestration();
+        assert_eq!(app.mode, Mode::OrchestrationConfirm);
+        assert!(!app.orchestration_confirm_focused);
+        app.toggle_orchestration_confirm_focus();
+        assert!(app.orchestration_confirm_focused);
+
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let tasks_screen = screen(&terminal);
+        assert_eq!(tasks_screen.lines().count(), height as usize);
+        assert!(
+            tasks_screen
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) == width as usize),
+            "{tasks_screen}"
+        );
+        assert_eq!(text_snapshot(&terminal), tasks_snapshot);
+        assert!(app.orchestration_confirm_can_start());
+
+        app.toggle_orchestration_confirm_focus();
+        assert!(!app.orchestration_confirm_focused);
+        assert!(!app.orchestration_confirm_can_start());
+    }
+}
+
+#[tokio::test]
+async fn clipped_team_confirmation_cannot_start() {
     isolate_data_dir();
     let mut app = mixed_team_confirmation_app();
-    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 11)).unwrap();
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    let review_screen = screen(&terminal);
-    assert_eq!(review_screen.lines().count(), 12);
-    assert!(
-        review_screen
-            .lines()
-            .all(|line| UnicodeWidthStr::width(line) == 40),
-        "{review_screen}"
-    );
-    assert_eq!(
-        text_snapshot(&terminal),
-        include_str!("codex_style_team_confirmation_40x12_review.snap")
-    );
+    assert!(text_snapshot(&terminal).contains("resize to review disclosures"));
+    app.toggle_orchestration_confirm_focus();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(text_snapshot(&terminal).contains("resize to review full plan"));
+    assert!(!app.orchestration_confirm_can_start());
 
     app.confirm_orchestration();
     assert_eq!(app.mode, Mode::OrchestrationConfirm);
-    assert!(!app.orchestration_confirm_focused);
-    app.toggle_orchestration_confirm_focus();
-    assert!(app.orchestration_confirm_focused);
+}
 
-    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-    let tasks_screen = screen(&terminal);
-    assert_eq!(tasks_screen.lines().count(), 12);
-    assert!(
-        tasks_screen
-            .lines()
-            .all(|line| UnicodeWidthStr::width(line) == 40),
-        "{tasks_screen}"
-    );
-    assert_eq!(
-        text_snapshot(&terminal),
-        include_str!("codex_style_team_confirmation_40x12_tasks.snap")
-    );
+#[tokio::test]
+async fn narrow_three_and_four_worker_pages_keep_titles_and_exact_models() {
+    isolate_data_dir();
+    let title_fragments = ["insp", "revi", "audi", "trac"];
+    for workers in [3, 4] {
+        let mut app = max_worker_confirmation_app(workers);
+        app.toggle_orchestration_confirm_focus();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
 
-    app.toggle_orchestration_confirm_focus();
-    assert!(!app.orchestration_confirm_focused);
+        for (index, title) in title_fragments.iter().take(workers).enumerate() {
+            let id = index + 1;
+            let row = rendered
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("{id} ")))
+                .unwrap_or_else(|| panic!("missing task {id} row:\n{rendered}"));
+            assert!(row.contains(title), "task {id} lost its title:\n{rendered}");
+            let exact_model = if index % 2 == 0 {
+                "gpt-5.6-sol · codex"
+            } else {
+                "openai/gpt-5.4 · openrouter"
+            };
+            assert!(
+                row.contains(exact_model),
+                "task {id} lost its exact model/provider:\n{rendered}"
+            );
+        }
+        assert!(app.orchestration_confirm_can_start(), "{rendered}");
+    }
 }
 
 #[tokio::test]
