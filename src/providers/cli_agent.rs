@@ -26,7 +26,7 @@ const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_CODEX_MODEL_CACHE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_MODELS: usize = 64;
 const MAX_CODEX_MODEL_ID_CHARS: usize = 256;
-const CODEX_APP_SERVER_VERSION: &str = "0.152.1";
+const CODEX_APP_SERVER_VERSION: &str = "0.153.4";
 const CODEX_APP_SERVER_INITIALIZE_ID: i64 = 0;
 const CODEX_APP_SERVER_THREAD_START_ID: i64 = 1;
 const CODEX_APP_SERVER_TURN_START_ID: i64 = 2;
@@ -38,6 +38,7 @@ const CLAUDE_READ_ONLY_TOOLS: &str = "Read,Glob,Grep";
 // the fallback when the installed CLI has not populated its local model cache.
 // Custom `codex:<id>` selectors remain accepted when Codex adds new models.
 const CODEX_CURATED_MODELS: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -1063,7 +1064,7 @@ async fn drive_codex_app_server(
     }
 
     let mut child = launch.command.spawn().context(
-        "failed to launch `codex app-server` — is Codex 0.152.1 installed and signed in?",
+        "failed to launch `codex app-server` — is Codex 0.153.4 installed and signed in?",
     )?;
     #[cfg(unix)]
     let mut process_group = ProcessGroupGuard::new(
@@ -1318,10 +1319,10 @@ fn emit_codex_app_server_notice(message: &Value, tx: &UnboundedSender<ChatEvent>
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let params = &message["params"];
     let text = match method {
-        "warning" | "configWarning" | "guardianWarning" | "authRecovery" => {
+        "warning" | "guardianWarning" | "authRecovery" => {
             params.get("message").and_then(Value::as_str)
         }
-        "deprecationNotice" => params.get("summary").and_then(Value::as_str),
+        "configWarning" | "deprecationNotice" => params.get("summary").and_then(Value::as_str),
         _ => None,
     };
     if let Some(text) = text.filter(|text| !text.is_empty()) {
@@ -1430,6 +1431,7 @@ fn attest_codex_app_server_thread(
         && thread.get("path").is_some_and(Value::is_null)
         && thread.get("historyMode").and_then(Value::as_str) == Some("legacy")
         && thread.get("modelProvider").and_then(Value::as_str) == Some("openai")
+        && thread.get("model").and_then(Value::as_str) == Some(contract.model.as_str())
         && thread.get("cwd").and_then(Value::as_str) == Some(cwd);
     if !matches_contract {
         anyhow::bail!(
@@ -2156,8 +2158,8 @@ fn codex_advisory_auth_deny_glob(auth: &Path) -> Result<String> {
         );
     }
     // The bracket expression matches the exact final character while making
-    // this a deny-glob. Codex 0.152.1 emits glob denies after its unconditional
-    // macOS minimal-runtime allowances, unlike a literal path deny.
+    // this a deny-glob. Audited Codex releases emit glob denies after their
+    // unconditional macOS minimal-runtime allowances, unlike a literal path deny.
     parent_path
         .join("auth.jso[n]")
         .to_str()
@@ -2572,6 +2574,7 @@ mod tests {
                 "path": null,
                 "historyMode": "legacy",
                 "modelProvider": "openai",
+                "model": contract.model,
                 "cwd": contract.cwd
             },
             "model": contract.model,
@@ -2741,6 +2744,14 @@ mod tests {
         assert!(models
             .iter()
             .all(|model| !model.contains(char::is_whitespace)));
+    }
+
+    #[test]
+    fn bundled_codex_fallback_tracks_the_current_default_model() {
+        assert_eq!(
+            curated_codex_model_ids().first().map(String::as_str),
+            Some("gpt-6-astra")
+        );
     }
 
     #[test]
@@ -3084,7 +3095,7 @@ mod tests {
     #[test]
     fn app_server_filesystem_override_is_one_parseable_table() {
         let profile = "shaltaiboltai-advisory-test";
-        let executable = Path::new("/opt/Codex 0.152.1/bin/codex");
+        let executable = Path::new("/opt/Codex 0.153.4/bin/codex");
         let isolated_home = Path::new("/private/tmp/isolated.home");
         let source_auth = Path::new("/var/tmp/source.home/auth.json");
         let override_value = codex_advisory_app_server_filesystem_config(
@@ -3642,7 +3653,7 @@ mod tests {
     #[test]
     fn codex_app_server_rejects_unsupported_versions_and_contract_drift() {
         let initialize = json!({
-            "userAgent": "shaltaiboltai/0.153.0 (test)",
+            "userAgent": "shaltaiboltai/0.153.3 (test)",
             "codexHome": "/tmp/fake-codex-home",
             "platformFamily": std::env::consts::FAMILY,
             "platformOs": std::env::consts::OS
@@ -3651,7 +3662,7 @@ mod tests {
         let contract = test_codex_app_server_contract(&fixture);
         let error = attest_codex_app_server_initialize(&initialize, &contract)
             .expect_err("unreviewed app-server versions must fail closed");
-        assert!(error.to_string().contains("expected exactly 0.152.1"));
+        assert!(error.to_string().contains("expected exactly 0.153.4"));
 
         let wrong_home = json!({
             "userAgent": format!("shaltaiboltai/{CODEX_APP_SERVER_VERSION} (test)"),
@@ -3672,8 +3683,32 @@ mod tests {
         result["model"] = json!("wrong-model");
         assert!(attest_codex_app_server_thread(&result, &contract).is_err());
         result["model"] = json!(contract.model);
+        result["thread"]["model"] = json!("wrong-model");
+        assert!(attest_codex_app_server_thread(&result, &contract).is_err());
+        result["thread"]["model"] = json!(contract.model);
         result["runtimeWorkspaceRoots"] = json!([contract.cwd]);
         assert!(attest_codex_app_server_thread(&result, &contract).is_err());
+    }
+
+    #[test]
+    fn codex_app_server_config_warnings_use_the_schema_summary() {
+        let (tx, mut rx) = unbounded_channel();
+        emit_codex_app_server_notice(
+            &json!({
+                "method": "configWarning",
+                "params": {
+                    "summary": "unsupported setting was ignored",
+                    "details": null
+                }
+            }),
+            &tx,
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ChatEvent::Notice(message)) if message == "unsupported setting was ignored"
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[cfg(unix)]
