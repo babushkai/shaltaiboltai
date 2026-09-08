@@ -258,9 +258,10 @@ pub(super) fn emit_notice(message: &Value, tx: &UnboundedSender<ChatEvent>) {
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let params = &message["params"];
     let text = match method {
-        "warning" | "guardianWarning" | "authRecovery" => {
-            params.get("message").and_then(Value::as_str)
-        }
+        "warning"
+        | "guardianWarning"
+        | "modelProvider/authRecoveryStarted"
+        | "modelProvider/authRecoveryCompleted" => params.get("message").and_then(Value::as_str),
         "configWarning" | "deprecationNotice" => params.get("summary").and_then(Value::as_str),
         _ => None,
     };
@@ -450,7 +451,17 @@ where
                     emit_notice(&message, tx);
                 }
             }
-            "configWarning" | "guardianWarning" | "authRecovery" | "deprecationNotice" => {
+            "guardianWarning"
+                if params.get("threadId").and_then(Value::as_str) == Some(thread_id) =>
+            {
+                emit_notice(&message, tx);
+            }
+            "modelProvider/authRecoveryStarted" | "modelProvider/authRecoveryCompleted"
+                if notification_matches(params, thread_id, turn_id) =>
+            {
+                emit_notice(&message, tx);
+            }
+            "configWarning" | "deprecationNotice" => {
                 emit_notice(&message, tx);
             }
             "error" if notification_matches(params, thread_id, turn_id) => {
@@ -483,12 +494,28 @@ where
                     "Codex rerouted the advisory turn from {from} to {to}; exact-model contract failed"
                 );
             }
-            "turn/completed" if notification_matches(params, thread_id, turn_id) => {
+            "turn/completed" => {
+                // In the pinned 0.153.4 protocol, turn/completed carries the
+                // turn id in params.turn.id (unlike item/usage/error events,
+                // which carry params.turnId). Parse a targeted terminal event
+                // strictly so malformed protocol cannot be ignored forever.
+                let completed_thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .context("Codex turn/completed omitted threadId")?;
+                if completed_thread_id != thread_id {
+                    continue;
+                }
                 let turn = params
                     .get("turn")
                     .and_then(Value::as_object)
                     .context("Codex turn/completed omitted turn")?;
-                if turn.get("id").and_then(Value::as_str) != Some(turn_id) {
+                let completed_turn_id = turn
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("Codex turn/completed omitted turn.id")?;
+                if completed_turn_id != turn_id {
                     continue;
                 }
                 if let Some(items) = turn.get("items").and_then(Value::as_array) {
@@ -618,6 +645,71 @@ fn first_line(value: &str) -> String {
         format!("{}…", line.chars().take(120).collect::<String>())
     } else {
         line.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::{duplex, split};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    async fn targeted_terminal_error(params: Value) -> String {
+        let (client, mut server) = duplex(4 * 1024);
+        let (client_read, mut client_write) = split(client);
+        let mut client_read = BufReader::new(client_read);
+        let (tx, _rx) = unbounded_channel();
+        send_message(
+            &mut server,
+            &json!({"method": "turn/completed", "params": params}),
+        )
+        .await
+        .expect("write malformed terminal notification");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            consume_turn(
+                &mut client_read,
+                &mut client_write,
+                "thread-1",
+                "turn-1",
+                &tx,
+            ),
+        )
+        .await
+        .expect("malformed targeted terminal must not hang")
+        .expect_err("malformed targeted terminal must fail closed")
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn malformed_targeted_turn_completion_fails_without_hanging() {
+        let missing_thread = targeted_terminal_error(json!({
+            "turn": {"id": "turn-1", "status": "completed"}
+        }))
+        .await;
+        assert!(
+            missing_thread.contains("omitted threadId"),
+            "{missing_thread}"
+        );
+
+        let missing_turn = targeted_terminal_error(json!({
+            "threadId": "thread-1"
+        }))
+        .await;
+        assert!(missing_turn.contains("omitted turn"), "{missing_turn}");
+
+        let missing_turn_id = targeted_terminal_error(json!({
+            "threadId": "thread-1",
+            "turn": {"status": "completed"}
+        }))
+        .await;
+        assert!(
+            missing_turn_id.contains("omitted turn.id"),
+            "{missing_turn_id}"
+        );
     }
 }
 

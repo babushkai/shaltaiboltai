@@ -2956,6 +2956,19 @@ mod tests {
             send_codex_app_server_message(
                 &mut server_write,
                 &json!({
+                    "method": "modelProvider/authRecoveryStarted",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "provider": "openai",
+                        "message": "recovering authentication"
+                    }
+                }),
+            )
+            .await?;
+            send_codex_app_server_message(
+                &mut server_write,
+                &json!({
                     "method": "item/completed",
                     "params": {
                         "threadId": "thread-1",
@@ -2989,8 +3002,41 @@ mod tests {
                 &json!({
                     "method": "turn/completed",
                     "params": {
+                        "threadId": "other-thread",
+                        "turn": {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "error": null,
+                            "items": []
+                        }
+                    }
+                }),
+            )
+            .await?;
+            send_codex_app_server_message(
+                &mut server_write,
+                &json!({
+                    "method": "turn/completed",
+                    "params": {
                         "threadId": "thread-1",
-                        "turnId": "turn-1",
+                        "turn": {
+                            "id": "other-turn",
+                            "status": "completed",
+                            "error": null,
+                            "items": [
+                                {"type": "agentMessage", "id": "wrong-terminal", "text": "leak"}
+                            ]
+                        }
+                    }
+                }),
+            )
+            .await?;
+            send_codex_app_server_message(
+                &mut server_write,
+                &json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
                         "turn": {
                             "id": "turn-1",
                             "status": "completed",
@@ -3026,7 +3072,10 @@ mod tests {
 
         let events = drain(&mut rx);
         assert!(matches!(&events[0], ChatEvent::Notice(message) if message == "safe warning"));
-        assert!(matches!(&events[1], ChatEvent::TextDelta(text) if text == "pong"));
+        assert!(
+            matches!(&events[1], ChatEvent::Notice(message) if message == "recovering authentication")
+        );
+        assert!(matches!(&events[2], ChatEvent::TextDelta(text) if text == "pong"));
         assert_eq!(
             events
                 .iter()
@@ -3035,7 +3084,7 @@ mod tests {
             1,
             "turn summary must not duplicate the completed item"
         );
-        match &events[2] {
+        match &events[3] {
             ChatEvent::Completed {
                 usage: Some(usage), ..
             } => {
@@ -3161,6 +3210,37 @@ mod tests {
             rx.try_recv(),
             Ok(ChatEvent::Notice(message)) if message == "unsupported setting was ignored"
         ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn codex_app_server_auth_recovery_uses_pinned_method_names() {
+        let (tx, mut rx) = unbounded_channel();
+        for method in [
+            "modelProvider/authRecoveryStarted",
+            "modelProvider/authRecoveryCompleted",
+        ] {
+            emit_codex_app_server_notice(
+                &json!({
+                    "method": method,
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "provider": "openai",
+                        "message": method
+                    }
+                }),
+                &tx,
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(ChatEvent::Notice(message)) if message == method
+            ));
+        }
+        emit_codex_app_server_notice(
+            &json!({"method": "authRecovery", "params": {"message": "legacy alias"}}),
+            &tx,
+        );
         assert!(rx.try_recv().is_err());
     }
 

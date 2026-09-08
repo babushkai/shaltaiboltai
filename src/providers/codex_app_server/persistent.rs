@@ -1059,7 +1059,6 @@ mod tests {
                         "method": "turn/completed",
                         "params": {
                             "threadId": "thread-1",
-                            "turnId": turn_id,
                             "turn": {"id": turn_id, "status": "completed", "items": []}
                         }
                     }),
@@ -1195,7 +1194,6 @@ mod tests {
                     "method": "turn/completed",
                     "params": {
                         "threadId": "thread-1",
-                        "turnId": "turn-cancel",
                         "turn": {"id": "turn-cancel", "status": "interrupted", "items": []}
                     }
                 }),
