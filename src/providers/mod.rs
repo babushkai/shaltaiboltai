@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod cli_agent;
+mod codex_app_server;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
