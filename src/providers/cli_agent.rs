@@ -60,6 +60,9 @@ const CODEX_CONSTRAINED_CONFIG: &[&str] = &[
     r#"chatgpt_base_url="https://chatgpt.com/backend-api/""#,
     "mcp_servers={}",
     r#"web_search="disabled""#,
+    // `notify` is the legacy process-spawning hook and is independent of the
+    // `features.hooks` gate, so clear it explicitly for advisory workers.
+    "notify=[]",
     "features.hooks=false",
     "features.plugins=false",
     "features.apps=false",
@@ -2499,6 +2502,7 @@ mod tests {
         for constraint in CODEX_CONSTRAINED_CONFIG {
             assert!(has_arg_pair(&codex_args, "-c", constraint));
         }
+        assert!(has_arg_pair(&codex_args, "-c", "notify=[]"));
         assert!(has_arg_pair(
             &codex_args,
             "-c",
