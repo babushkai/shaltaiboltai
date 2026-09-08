@@ -12,6 +12,39 @@ use crossterm::execute;
 use futures_util::StreamExt;
 use policy::{ApprovalPolicy, ExecutionPolicy, SandboxMode, Workspace};
 use std::path::{Path, PathBuf};
+use tokio::time::Instant;
+
+/// Coalesce provider, input, and animation updates without allowing a dense
+/// event stream to drive the terminal faster than 120 frames per second.
+const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(8_333_334);
+
+#[derive(Debug)]
+struct FrameLimiter {
+    next_draw_at: Instant,
+    redraw_pending: bool,
+}
+
+impl FrameLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_draw_at: now,
+            redraw_pending: true,
+        }
+    }
+
+    fn request_redraw(&mut self) {
+        self.redraw_pending = true;
+    }
+
+    fn is_ready(&self, now: Instant) -> bool {
+        self.redraw_pending && now >= self.next_draw_at
+    }
+
+    fn mark_drawn(&mut self, started_at: Instant) {
+        self.redraw_pending = false;
+        self.next_draw_at = started_at + MIN_FRAME_INTERVAL;
+    }
+}
 
 const HELP: &str = "\
 shaltaiboltai — a multi-provider agentic coding TUI
@@ -245,18 +278,28 @@ async fn run(
     // new working state starts at the first authored mascot pose.
     animation.tick().await;
     environment.tick().await;
+    let mut frames = FrameLimiter::new(Instant::now());
 
     while !app.should_quit {
         submit_initial_prompt_when_ready(&mut app, &mut pending_initial_prompt);
-        terminal.draw(|frame| {
-            if let Some(native_mascot) = native_mascot {
-                ui::draw_with_native_mascot(frame, &mut app, native_mascot);
-            } else {
-                ui::draw(frame, &mut app);
-            }
-        })?;
+        let now = Instant::now();
+        if frames.is_ready(now) {
+            terminal.draw(|frame| {
+                if let Some(native_mascot) = native_mascot {
+                    ui::draw_with_native_mascot(frame, &mut app, native_mascot);
+                } else {
+                    ui::draw(frame, &mut app);
+                }
+            })?;
+            frames.mark_drawn(now);
+        }
+
+        let redraw_deadline = frames.next_draw_at;
 
         tokio::select! {
+            // A pending draw that was coalesced during the frame interval gets
+            // one precise wake-up even when no further terminal event arrives.
+            _ = tokio::time::sleep_until(redraw_deadline), if frames.redraw_pending => {}
             Some(event) = rx.recv() => {
                 app.on_event(event);
                 // Coalesce a bounded burst into one redraw, then yield back to
@@ -284,6 +327,7 @@ async fn run(
                 app.refresh_environment();
             }
         }
+        frames.request_redraw();
     }
     app.save_session_for_exit()?;
     Ok(())
@@ -656,6 +700,21 @@ mod tests {
     use shaltaiboltai::orchestration::PlannedTask;
     use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn frame_limiter_coalesces_requests_at_120_fps() {
+        let started_at = Instant::now();
+        let mut frames = FrameLimiter::new(started_at);
+
+        assert!(frames.is_ready(started_at));
+        frames.mark_drawn(started_at);
+        assert!(!frames.is_ready(started_at + MIN_FRAME_INTERVAL));
+
+        frames.request_redraw();
+        frames.request_redraw();
+        assert!(!frames.is_ready(started_at + std::time::Duration::from_millis(8)));
+        assert!(frames.is_ready(started_at + MIN_FRAME_INTERVAL));
+    }
 
     fn test_app() -> App {
         let data_dir = std::env::temp_dir().join(format!("shaltai-main-{}", std::process::id()));
