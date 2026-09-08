@@ -3,7 +3,7 @@
 > [!NOTE]
 > This project is built along with Claude Fable, which is now regulated by US government. 
 
-A multi-provider agentic coding TUI in Rust with a Codex-style authority shell: typed startup policy, OS-enforced command sandboxing, scoped approvals, `/permissions`, `/status`, `/init`, and a polished Ink/Paper interface. Chat with Anthropic, OpenAI, OpenRouter, Ollama, Claude Code, or Codex and switch providers without changing the active safety contract.
+A multi-provider agentic coding TUI in Rust with a Codex-style authority shell: typed startup policy, OS-enforced command sandboxing, scoped approvals, `/permissions`, `/status`, `/init`, and a terminal-native interface with optional Ink/Paper palettes. Chat with Anthropic, OpenAI, OpenRouter, Ollama, Claude Code, or Codex and switch providers without changing the active safety contract.
 
 ## Install
 
@@ -103,7 +103,7 @@ The composer stays live while a response streams or a tool runs. Press `Enter` t
 
 ### Team orchestration
 
-`/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent. The mascot appears only on genuinely large, quiet canvases; common 120×36 and narrower layouts preserve transcript hierarchy instead of sacrificing half the viewport to decoration. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan.
+`/team [2-4]` arms the next prompt for one coordinated run (default: 3 workers); `/team off` returns it to a normal solo prompt. Shaltaiboltai is the lead agent. The mascot appears only on genuinely large, quiet canvases; common 120×36 and narrower layouts preserve transcript hierarchy instead of sacrificing half the viewport to decoration. Submitting the armed prompt immediately sends one read-only planning request; a CLI planner may inspect workspace files in its read-only mode before the confirmation appears. The overlay shows the exact planner, task summaries, and every exact worker model. Press `Tab` to focus the review, then `y` or `Enter` to start; `n` or `Esc` cancels the plan. At 40-column widths, the review and exact task/model list use two pages: `Tab` opens the task page, and start controls are available only there.
 
 After confirmation, workers run concurrently under a read-only policy and cannot use Shaltaiboltai's mutating tools. API workers whose models support tools get a bounded, app-owned read-only repository tool loop. Claude Code uses safe mode with `Read`, `Glob`, and `Grep`; explicit Codex models use the default-deny workspace-read permission profile described above. This makes Codex-only teams possible: select an exact row such as `codex:gpt-5.6-sol`, run `/team 3`, and submit the root task. A Codex lead pins that same Codex model for the planner, every worker, and synthesis even when other providers are installed. A local model without tool support instead reasons from the supplied conversation. Every selected advisory provider receives the text conversation; Codex may apply repository instructions found inside the scoped workspace but excludes ambient global instructions, OpenRouter sends text to provider endpoint(s) chosen under the account's routing/privacy settings, and metered APIs may bill every planner, worker, tool-loop, and synthesis request. Review the exact provider/model rows and scope disclosure before sharing it. Images are omitted from team fan-out; use `/team off` for a vision prompt. Shaltaiboltai waits for every worker request to finish, synthesizes their reports, and becomes the only agent allowed to edit through the normal approval or CLI sandbox rules. This prevents concurrent team edits; it cannot prevent an unrelated process or person from changing the workspace at the same time.
 
@@ -139,11 +139,11 @@ The trackpad / mouse wheel scrolls the transcript. Because the TUI captures mous
 
 Messages can include images for vision models: press `Ctrl+V` to stage the clipboard image (screenshots, copied images), or reference a `.png`/`.jpg`/`.gif`/`.webp` path in your message (drag-and-drop onto the terminal works — escaped and quoted paths are handled). Staged attachments show in the input border; `Ctrl+X` clears them at any editable composer, while `Esc` also clears them when no work is active. Images go out as Anthropic image blocks, OpenAI data-URLs, or Ollama's native `images` field, capped at 5MB each.
 
-The transcript uses a quiet activity rail with explicit `YOU`, `ASSISTANT`, and tool-state headers, so long agent runs remain scannable. Assistant responses render markdown (heading hierarchy, bold/italic, accent-bulleted lists, styled blockquotes, and fenced code as full-width surface cards).
+The transcript uses quiet `›` user and `•` assistant/activity markers, so long agent runs remain scannable without permanent chrome. Assistant responses render markdown (heading hierarchy, bold/italic, accent-bulleted lists, styled blockquotes, and fenced code as full-width surface cards).
 
 ## Themes
 
-`/theme` opens a live-preview picker (`Up`/`Down` to try, `Enter` to keep, `Esc` to revert), and the choice persists across runs. `ink` is the default; `paper` is its warm light companion. Their base, surface, elevated, hover, typography, border, accent, success, warning, error, code, and indigo tokens are transferred exactly from the original TypeScript Ink & Paper projects. Legacy palettes remain available: `mocha`, `tokyo-night`, `rose-pine`, `nord`, `gruvbox`, `latte`, and `terminal`. Set an initial theme with `theme = "paper"` in config.toml.
+`/theme` opens a live-preview picker (`Up`/`Down` to try, `Enter` to keep, `Esc` to revert), and the choice persists across runs. `terminal` is the default so the shell inherits the terminal's own foreground and background. `ink` and its warm light companion `paper` preserve the original TypeScript projects' base, surface, elevated, hover, typography, border, accent, success, warning, error, code, and indigo tokens. Legacy palettes remain available: `mocha`, `tokyo-night`, `rose-pine`, `nord`, `gruvbox`, and `latte`. Set an initial theme with `theme = "paper"` in config.toml.
 
 ## Sessions & compaction
 
@@ -186,7 +186,7 @@ default_model = "qwen3.5:latest"
 # openrouter_api_key = "sk-or-..."
 # openrouter_base_url = "https://openrouter.ai/api/v1"
 # ollama_host = "http://localhost:11434"
-# theme = "paper"                                  # default is ink
+# theme = "paper"                                  # default is terminal
 # reduced_motion = false                           # freeze the mascot pose while retaining status text
 ```
 
