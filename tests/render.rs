@@ -42,6 +42,16 @@ fn screen(terminal: &Terminal<TestBackend>) -> String {
         .collect()
 }
 
+fn text_snapshot(terminal: &Terminal<TestBackend>) -> String {
+    let rendered = screen(terminal);
+    let normalized = rendered
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}\n", normalized.trim_end())
+}
+
 fn require_write_approval(app: &mut App) {
     app.policy.apply_preset(PermissionPreset::ReadOnly);
 }
@@ -181,71 +191,92 @@ async fn ink_and_paper_visual_matrix_matches_reviewed_goldens() {
     let expected = [
         // Ink: idle, help, permissions, Full Access, approval; each at
         // 120×36, 80×24, 60×20, and 40×12.
-        18051856780018047632,
-        6793635348144853120,
-        17523623465100911483,
-        7399535153676875931,
-        7916747592767614418,
-        9766805106068794441,
-        7392134143799279625,
-        14127495065583846231,
-        4895029292874428120,
-        2503310590881834728,
-        16108201543158332212,
-        16535609583655917937,
-        17101991488478034557,
-        12566041740348679581,
-        10146448711041314622,
-        15870247430655268305,
-        17775131259198260367,
-        17104041888251279483,
-        8397692300777079118,
-        16600341820794276420,
+        3348015006484923,
+        12024189032936711251,
+        4388729607514531599,
+        14294489537661305186,
+        2085647477594766080,
+        9745224727161870363,
+        11515502223402573574,
+        2898003678456939483,
+        2515742686299789164,
+        13100490953919093788,
+        12147011935558173859,
+        5573434052843597489,
+        5517187324673907951,
+        14766322444691550503,
+        4926832981609429471,
+        4555747465753386445,
+        1047105537748782263,
+        16589025626155776648,
+        8613028221773701384,
+        18144154547426094172,
         // Paper: same state/size order.
-        8828966307763906173,
-        1243780950159226925,
-        12218775487749519745,
-        1869228612775065041,
-        6235617700968058889,
-        3478823323901343354,
-        15444914363686301305,
-        8298255705288041947,
-        3369525481403874887,
-        1106415762216010455,
-        12925748657151263656,
-        7986813052121011473,
-        13388693751731183036,
-        115114107704535180,
-        18203606322182210490,
-        2050690867392574069,
-        8821065850770950250,
-        9162302762075744110,
-        4056824799300614784,
-        57088319003368999,
+        4316156718468324755,
+        16142791368853085707,
+        13273896671187171639,
+        12446217909067660018,
+        8080167442885759772,
+        9949771883260030727,
+        1770891831117738462,
+        16796878176633149455,
+        4821614076735920258,
+        1664954947086217834,
+        16612475601840247525,
+        7860159394060057611,
+        16085965210434353401,
+        11705100019919180721,
+        11042988188256721429,
+        7371059050466926099,
+        13421733183625165314,
+        6483537325305901493,
+        15898835091230505349,
+        3477198577738328142,
     ];
     assert_eq!(actual, expected);
 }
 
 #[tokio::test]
-async fn renders_themed_frame() {
+async fn renders_codex_style_session_card_and_borderless_composer() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
-    let mut app = App::new(offline_config(), tx);
+    let workspace = Workspace::new("/").expect("root is a stable render workspace");
+    let mut app = App::with_policy(offline_config(), ExecutionPolicy::new(workspace), tx);
+    app.discovering = false;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::OpenAi,
+        id: "gpt-golden".into(),
+    });
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
+    let rendered = screen(&terminal);
+    assert!(rendered.starts_with("╭─"), "{rendered}");
+    assert!(rendered.contains(">_ Shaltaiboltai (v"), "{rendered}");
+    assert!(
+        rendered.contains("model:     gpt-golden   /model to change"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("directory: /"), "{rendered}");
+    assert!(
+        rendered.contains("› Ask Shaltaiboltai to do anything"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("? for shortcuts"), "{rendered}");
+    assert!(rendered.contains("100% context left"), "{rendered}");
+    assert!(!rendered.contains("SHALTAIBOLTAI"), "{rendered}");
+    assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+    assert_eq!(app.render_cache_width, 80);
+}
 
-    let top_row: String = (0..80)
-        .map(|x| buffer[(x, 0)].symbol().to_owned())
-        .collect();
-    assert!(top_row.contains("SB"), "{top_row}");
-    assert!(top_row.contains("SHALTAIBOLTAI"), "{top_row}");
-    assert!(!top_row.contains("REAL AGENT"), "{top_row}");
-    assert!(!top_row.contains("DANCING"), "{top_row}");
-    assert_eq!(buffer[(0, 0)].bg, theme::INK.accent);
-    assert_eq!(buffer[(4, 0)].bg, theme::INK.surface.unwrap());
-    assert_eq!(app.render_cache_width, 76);
+#[tokio::test]
+async fn codex_style_idle_shell_matches_reviewed_text_snapshot() {
+    let mut app = golden_app(theme::TERMINAL);
+    let mut terminal = Terminal::new(TestBackend::new(48, 11)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let actual = text_snapshot(&terminal);
+    assert_eq!(actual, include_str!("codex_style_idle_48x11.snap"));
 }
 
 #[tokio::test]
@@ -336,27 +367,16 @@ async fn model_picker_distinguishes_cli_defaults_aliases_and_exact_models() {
 }
 
 #[tokio::test]
-async fn statusline_shows_cwd_and_branch() {
+async fn session_card_shows_the_working_directory() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
-    // The test process runs inside the repo, so both should be present.
-    assert!(!app.cwd_display.is_empty());
+    app.cwd_display = "/workspace".into();
     let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let status_row: String = (0..120)
-        .map(|x| buffer[(x, 1)].symbol().to_owned())
-        .collect();
-    assert!(
-        status_row.contains(app.cwd_display.as_str()),
-        "{status_row}"
-    );
-    if let Some(branch) = &app.git_branch {
-        let visible_prefix = branch.chars().take(10).collect::<String>();
-        assert!(status_row.contains(&visible_prefix), "{status_row}");
-    }
+    let rendered = screen(&terminal);
+    assert!(rendered.contains("directory: /workspace"), "{rendered}");
 }
 
 #[tokio::test]
@@ -369,7 +389,7 @@ async fn terminal_theme_keeps_default_background() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    assert_eq!(buffer[(0, 0)].bg, Color::Cyan);
+    assert_eq!(buffer[(0, 0)].bg, Color::Reset);
     assert_eq!(buffer[(4, 0)].bg, Color::Reset);
     assert_eq!(buffer[(79, 10)].bg, Color::Reset);
 }
@@ -410,8 +430,7 @@ async fn help_height_boundary_keeps_the_queue_safe_quit_binding() {
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = screen(&terminal);
-    assert!(rendered.contains("SB"), "{rendered}");
-    assert!(rendered.contains("Ask for approval"), "{rendered}");
+    assert!(rendered.contains("keyboard guide"), "{rendered}");
     assert!(rendered.contains("queue-safe quit"), "{rendered}");
 }
 
@@ -544,13 +563,21 @@ async fn conversation_rail_labels_people_and_tool_state() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let rendered = screen(&terminal);
-    assert!(rendered.contains("YOU"), "{rendered}");
-    assert!(rendered.contains("SHALTAIBOLTAI"), "{rendered}");
     assert!(
-        rendered.contains("tool · done · 1 output line"),
+        rendered.contains("› Improve the interface hierarchy"),
         "{rendered}"
     );
-    assert!(!rendered.contains(" DONE "), "{rendered}");
+    assert!(
+        rendered.contains("• Done. The hierarchy is clearer."),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("• checked the rendered interface"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("└ all assertions passed"), "{rendered}");
+    assert!(!rendered.contains("YOU"), "{rendered}");
+    assert!(!rendered.contains("SHALTAIBOLTAI"), "{rendered}");
 }
 
 #[tokio::test]
@@ -562,9 +589,9 @@ async fn narrow_terminal_preserves_conversation_status_and_composer() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let rendered = screen(&terminal);
-    assert!(rendered.contains("SB"), "{rendered}");
-    assert!(rendered.contains("discovering"), "{rendered}");
-    assert!(rendered.contains('›'), "{rendered}");
+    assert!(rendered.contains(">_ Shaltaiboltai"), "{rendered}");
+    assert!(rendered.contains("model:     loading"), "{rendered}");
+    assert!(rendered.contains("› Ask Shaltaiboltai"), "{rendered}");
 }
 
 #[tokio::test]
@@ -652,7 +679,6 @@ async fn status_uses_grouped_product_chrome_without_stock_terminal_art() {
         if width >= 60 {
             assert!(rendered.contains("Network"), "{rendered}");
         }
-        assert!(!rendered.contains(">_"), "{rendered}");
         assert!(!rendered.contains("data not available yet"), "{rendered}");
     }
 }
@@ -689,19 +715,19 @@ async fn active_composer_explains_and_confirms_one_turn_lookahead() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let composing = screen(&terminal);
-    assert!(composing.contains("next message"), "{composing}");
+    assert!(composing.contains("• Working"), "{composing}");
     assert!(composing.contains("Enter queue"), "{composing}");
 
     app.queue_input();
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let queued = screen(&terminal);
-    assert!(queued.contains("next message queued"), "{queued}");
-    assert!(queued.contains("waiting for current"), "{queued}");
+    assert!(queued.contains("next message pending"), "{queued}");
+    assert!(queued.contains("Esc clear"), "{queued}");
 
     let mut narrow = Terminal::new(TestBackend::new(24, 8)).unwrap();
     narrow.draw(|f| ui::draw(f, &mut app)).unwrap();
     let narrow = screen(&narrow);
-    assert!(narrow.contains("queued"), "{narrow}");
+    assert!(narrow.contains("next pending"), "{narrow}");
 
     let (tx, _rx) = unbounded_channel();
     let mut with_images = App::new(offline_config(), tx);
@@ -812,8 +838,8 @@ async fn scrolled_transcript_exposes_a_jump_to_latest_affordance() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let rendered = screen(&terminal);
-    assert!(rendered.contains("lines from latest"), "{rendered}");
-    assert!(rendered.contains("Ctrl+End jump"), "{rendered}");
+    assert!(rendered.contains("↑ 59"), "{rendered}");
+    assert!(rendered.contains("ctrl+end to latest"), "{rendered}");
     assert_eq!(app.render_cache_starts.len(), app.transcript.len());
 }
 
@@ -836,9 +862,9 @@ async fn scrolled_transcript_stays_anchored_when_tail_reflows() {
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (2..21)
+        (0..20)
             .map(|y| {
-                (2..79)
+                (0..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect::<String>()
             })
@@ -865,9 +891,9 @@ async fn error_and_cancel_replacements_keep_scrolled_content_anchored() {
     isolate_data_dir();
     let transcript_rows = |terminal: &Terminal<TestBackend>| {
         let buffer = terminal.backend().buffer();
-        (2..21)
+        (0..17)
             .map(|y| {
-                (2..79)
+                (0..79)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect::<String>()
             })
@@ -1005,21 +1031,21 @@ async fn paper_theme_keeps_semantic_states_restrained_and_readable() {
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer();
-    let done_cell = (0..buffer.area.height)
+    let tool_cell = (0..buffer.area.height)
         .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
         .map(|position| &buffer[position])
-        .find(|cell| cell.symbol() == "✓")
-        .expect("tool completion glyph should be rendered");
-    assert_eq!(done_cell.fg, theme::PAPER.success);
-    assert_ne!(done_cell.bg, theme::PAPER.success);
+        .find(|cell| cell.symbol() == "•")
+        .expect("tool activity glyph should be rendered");
+    assert_eq!(tool_cell.fg, theme::PAPER.accent);
+    assert_ne!(tool_cell.bg, theme::PAPER.accent);
     let accent_fill_cells = (0..buffer.area.height)
         .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
         .map(|position| &buffer[position])
         .filter(|cell| cell.bg == theme::PAPER.accent)
         .count();
     assert_eq!(
-        accent_fill_cells, 4,
-        "only the four-cell seal may be filled"
+        accent_fill_cells, 0,
+        "the Codex-style shell should not need a filled brand seal"
     );
     assert!(
         (0..buffer.area.height)

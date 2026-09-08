@@ -17,7 +17,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
 const MAX_INPUT_LINES: u16 = 8;
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_frame(frame, app, None);
@@ -42,17 +41,17 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
         );
     }
 
-    let header_height = if frame.area().height >= 6 { 2 } else { 1 };
     let input_height = input_height(app, frame.area().height);
-    let [header_area, transcript_area, input_area] = Layout::vertical([
-        Constraint::Length(header_height),
+    let activity_height = u16::from(active_status(app).is_some()) * 3;
+    let [transcript_area, activity_area, input_area] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(activity_height),
         Constraint::Length(input_height),
     ])
     .areas(frame.area());
 
-    draw_header(frame, app, header_area);
     draw_transcript(frame, app, transcript_area);
+    draw_activity(frame, app, activity_area);
     let slash_menu_active = app.mode == Mode::Input && app.slash_menu_active();
     if frame.area().width >= 200
         && frame.area().height >= 70
@@ -91,6 +90,37 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
         Some(PermissionOverlay::FullAccessConfirm) => draw_full_access_confirmation(frame, app),
         None => {}
     }
+}
+
+fn active_status(app: &App) -> Option<&'static str> {
+    if app.compacting {
+        Some("Compacting context")
+    } else {
+        match app.mode {
+            Mode::Streaming => Some("Working"),
+            Mode::RunningTool => Some("Running tool"),
+            Mode::Orchestrating => Some("Coordinating team"),
+            _ => None,
+        }
+    }
+}
+
+fn draw_activity(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(status) = active_status(app) else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let y = area.y.saturating_add(area.height.saturating_sub(1) / 2);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("• ", Style::new().fg(app.theme.accent)),
+            Span::styled(status, Style::new().fg(app.theme.fg)),
+            Span::styled(" (esc to interrupt)", Style::new().fg(app.theme.dim)),
+        ])),
+        Rect::new(area.x, y, area.width, 1),
+    );
 }
 
 fn draw_inline_mascot(
@@ -228,21 +258,23 @@ fn terminal_mascot_color(red: u8, green: u8, blue: u8) -> Color {
 }
 
 fn input_height(app: &App, total_height: u16) -> u16 {
-    let desired = (app.textarea.lines().len() as u16).clamp(1, MAX_INPUT_LINES) + 2;
+    // Codex's composer is one input row, one blank row above and below, and a
+    // single contextual footer. Extra draft lines grow only the input region.
+    let desired = (app.textarea.lines().len() as u16).clamp(1, MAX_INPUT_LINES) + 3;
     // Composer-focused approvals reserve enough room for a visible review and
     // Tab affordance even when the draft itself is tall. At normal terminal
     // sizes the composer still keeps one visible inner row for safe editing.
     if app.mode == Mode::Approval && !app.approval_focused {
         let available = total_height.saturating_sub(5).max(1);
-        let minimum = if total_height >= 8 { 3 } else { 1 };
+        let minimum = if total_height >= 8 { 4 } else { 1 };
         desired.min(available).max(minimum)
     } else {
-        desired.min(total_height.saturating_sub(2).max(1))
+        desired.min(total_height.saturating_sub(1).max(1))
     }
 }
 
-/// The composer is an elevated band with one structural rule. It deliberately
-/// avoids another closed rounded box beneath the conversation surface.
+/// Borderless Codex-style composer: one prompt glyph, generous vertical
+/// breathing room, and a single quiet footer shared by hints and context.
 fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let focused = app.composer_accepts_input();
@@ -253,55 +285,22 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
             Mode::Streaming | Mode::RunningTool | Mode::Approval | Mode::Orchestrating
         );
     let team_workers = app.team_workers();
-    let border = if focused {
-        theme.accent
+    let prompt_color = if focused {
+        theme.fg
     } else if queued {
         theme.accent2
     } else {
-        theme.border
+        theme.dim
     };
     let compact = area.width < 48;
-    let title = if queued && !compact {
-        " › next message queued "
-    } else if queued {
-        " › queued "
-    } else if team_workers.is_some() {
-        " › team prompt "
-    } else if lookahead {
-        " › next message "
-    } else {
-        " › "
-    };
-    let mut block = Block::default()
-        .borders(Borders::TOP)
-        .border_type(BorderType::Plain)
-        .border_style(Style::new().fg(border))
-        .padding(Padding::horizontal(1))
-        .title(Line::styled(
-            title,
-            Style::new().fg(border).add_modifier(Modifier::BOLD),
-        ));
+    // tui-textarea reserves one cell internally; one explicit left inset puts
+    // editable text at x=2 beside the prompt glyph at x=0, matching Codex.
+    let mut block = Block::default().padding(Padding::new(1, 1, 1, 1));
     let image_count = if queued {
         app.queued_image_count()
     } else {
         app.pending_image_count()
     };
-    if image_count > 0 {
-        let mut metadata = Vec::new();
-        metadata.push(format!(
-            "{image_count} image{}",
-            if image_count == 1 { "" } else { "s" }
-        ));
-        if focused && lookahead {
-            metadata.push("Ctrl+X clear".into());
-        }
-        let budget = area.width.saturating_sub(title.width() as u16 + 4) as usize;
-        let metadata = truncate_width(&metadata.join(" · "), budget);
-        block = block.title(
-            Line::styled(format!(" {metadata} "), Style::new().fg(theme.accent2))
-                .alignment(Alignment::Right),
-        );
-    }
     let draft_empty = app
         .textarea
         .lines()
@@ -309,6 +308,15 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
         .all(|line| line.trim().is_empty());
     let footer = if let Some(notice) = app.composer_notice() {
         Some((notice.to_owned(), theme.warning))
+    } else if image_count > 0 {
+        let mut metadata = format!(
+            "{image_count} image{}",
+            if image_count == 1 { "" } else { "s" }
+        );
+        if focused && lookahead {
+            metadata.push_str(" · Ctrl+X clear");
+        }
+        Some((metadata, theme.accent2))
     } else if app.mode == Mode::Approval && !app.approval_focused && queued {
         Some(("Tab review tool · next message queued".into(), theme.dim))
     } else if app.mode == Mode::Approval && !app.approval_focused {
@@ -343,21 +351,14 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     } else if queued {
         Some((
             if compact {
-                "Esc cancel · waiting".into()
+                "next pending · Esc clear".into()
             } else {
-                "Esc cancel · waiting for current turn".into()
+                "next message pending · Esc clear".into()
             },
-            theme.dim,
+            theme.accent2,
         ))
     } else if focused && draft_empty {
-        Some((
-            if compact {
-                "Enter send · / commands".into()
-            } else {
-                "Enter send · Alt+Enter newline · / commands".into()
-            },
-            theme.dim,
-        ))
+        Some(("? for shortcuts".into(), theme.dim))
     } else {
         None
     };
@@ -367,11 +368,11 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let placeholder = if queued {
         "Waiting for the current turn to finish…"
     } else if team_workers.is_some() {
-        "Describe what Shaltaiboltai should coordinate…"
+        "Ask Shaltaiboltai to coordinate anything"
     } else if lookahead {
-        "Type the next request while this one runs…"
+        "Add a follow-up"
     } else {
-        "Describe a change or ask a question…"
+        "Ask Shaltaiboltai to do anything"
     };
     app.textarea.set_placeholder_text(placeholder);
     app.textarea.set_cursor_style(if focused {
@@ -387,6 +388,18 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .areas(area);
     frame.render_widget(&app.textarea, editor_area);
+    if editor_area.width > 0 && editor_area.height > 0 {
+        let prompt_y = editor_area
+            .y
+            .saturating_add(u16::from(editor_area.height > 1));
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "›",
+                Style::new().fg(prompt_color).add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(editor_area.x, prompt_y, 1, 1),
+        );
+    }
     if show_footer {
         if let Some(surface) = theme.surface {
             frame.render_widget(
@@ -394,15 +407,58 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
                 footer_area,
             );
         }
+        let context = if active_status(app).is_some() {
+            let mut parts = Vec::new();
+            if let Some(model) = &app.model {
+                parts.push(model.display_id().to_owned());
+                parts.push(model.provider.label().to_owned());
+            }
+            if footer_area.width >= 100 && !app.cwd_display.is_empty() {
+                parts.push(app.cwd_display.clone());
+            }
+            parts.join(" · ")
+        } else if app.scroll_from_bottom > 0 {
+            format!("↑ {} · ctrl+end to latest", app.scroll_from_bottom)
+        } else if let Some(usage) = app.last_usage {
+            format!(
+                "ctx {} · out {}",
+                fmt_count(usage.input_tokens as usize),
+                fmt_count(usage.output_tokens as usize)
+            )
+        } else if app.approx_tokens() > 0 {
+            format!("ctx ~{}", fmt_count(app.approx_tokens()))
+        } else {
+            "100% context left".into()
+        };
+        let mut right = truncate_width(&context, footer_area.width.saturating_sub(4) as usize);
+        let left_required = footer.as_ref().map_or(0, |(text, _)| {
+            UnicodeWidthStr::width(text.as_str()) as u16 + 2
+        });
+        let mut right_width = UnicodeWidthStr::width(right.as_str()) as u16;
+        if left_required.saturating_add(right_width).saturating_add(1)
+            > footer_area.width.saturating_sub(2)
+        {
+            right.clear();
+            right_width = 0;
+        }
+        let right_x = footer_area
+            .right()
+            .saturating_sub(right_width.saturating_add(2));
         if let Some((footer, color)) = footer {
-            let footer = truncate_width(&footer, footer_area.width.saturating_sub(3) as usize);
+            let left_width = right_x.saturating_sub(footer_area.x).saturating_sub(1);
+            let footer = truncate_width(&footer, left_width.saturating_sub(2) as usize);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("  ", Style::new().fg(border)),
+                    Span::raw("  "),
                     Span::styled(footer, Style::new().fg(color)),
-                ]))
-                .alignment(Alignment::Right),
-                footer_area,
+                ])),
+                Rect::new(footer_area.x, footer_area.y, left_width, 1),
+            );
+        }
+        if right_width > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::styled(right, Style::new().fg(theme.dim))),
+                Rect::new(right_x, footer_area.y, right_width, 1),
             );
         }
     }
@@ -413,9 +469,11 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
 /// binary search rather than a walk from the beginning of the conversation.
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
-    // Two cells of editorial breathing room on each side. There is no outer
-    // transcript frame: the HUD and composer rules provide the shell.
-    let width = area.width.saturating_sub(4).max(10) as usize;
+    // Codex history uses the terminal's full width; individual semantic cards
+    // choose their own compact width instead of wrapping the whole transcript.
+    let width = area.width.max(1) as usize;
+    let startup_lines = matches!(app.transcript.first(), Some(Entry::Banner { .. }))
+        .then(|| startup_session_card(app, width, &theme));
     let previous_total = app.render_cache_total_lines;
     let preserve_viewport = app.scroll_from_bottom > 0
         && !app.render_cache.is_empty()
@@ -451,7 +509,13 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     while app.render_cache.len() < app.transcript.len() {
         let i = app.render_cache.len();
         let last = i + 1 == app.transcript.len();
-        let lines = render_entry(&app.transcript[i], width, last && streaming, &theme);
+        let lines = if i == 0 {
+            startup_lines.as_ref().cloned().unwrap_or_else(|| {
+                render_entry(&app.transcript[i], width, last && streaming, &theme)
+            })
+        } else {
+            render_entry(&app.transcript[i], width, last && streaming, &theme)
+        };
         let start = if i == 0 {
             0
         } else {
@@ -461,8 +525,18 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         app.render_cache_total_lines = start + lines.len();
         app.render_cache.push(lines);
     }
+    // The startup card reflects live discovery/workspace state. It is always
+    // six rows, so repainting it cannot disturb cached offsets or scroll
+    // anchoring for the rest of the transcript.
+    if let Some(startup_lines) = startup_lines {
+        if let Some(cached) = app.render_cache.first_mut() {
+            debug_assert_eq!(cached.len(), startup_lines.len());
+            *cached = startup_lines;
+        }
+    }
 
     let total = app.render_cache_total_lines;
+    let visible = area.height as usize;
     // `scroll_from_bottom` normally follows the tail. Once the user scrolls,
     // adjust that distance with content growth or shrinkage so the same
     // transcript lines stay under the cursor while a response reflows.
@@ -476,8 +550,17 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
                 .scroll_from_bottom
                 .saturating_sub(previous_total - total);
         }
+        if app.render_cache_viewport_height > visible {
+            app.scroll_from_bottom = app
+                .scroll_from_bottom
+                .saturating_add(app.render_cache_viewport_height - visible);
+        } else {
+            app.scroll_from_bottom = app
+                .scroll_from_bottom
+                .saturating_sub(visible - app.render_cache_viewport_height);
+        }
     }
-    let visible = area.height as usize;
+    app.render_cache_viewport_height = visible;
     app.scroll_from_bottom = app.scroll_from_bottom.min(total.saturating_sub(visible));
     let start = total.saturating_sub(visible + app.scroll_from_bottom);
     let end = (start + visible).min(total);
@@ -507,11 +590,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let inner = area.inner(Margin {
-        vertical: 0,
-        horizontal: 2,
-    });
-    frame.render_widget(Paragraph::new(window), inner);
+    frame.render_widget(Paragraph::new(window), area);
 
     if total > visible {
         let mut state = ScrollbarState::new(total)
@@ -530,7 +609,115 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> Vec<Line<'static>> {
+/// The initial history item mirrors Codex's compact session card while
+/// retaining Shaltaiboltai's identity. The row count is deliberately fixed so
+/// model discovery can repaint it without invalidating transcript offsets.
+fn startup_session_card(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let available = width.saturating_sub(4).min(56);
+    if available == 0 {
+        return vec![Line::raw(""); 6];
+    }
+    let model = app
+        .model
+        .as_ref()
+        .map(|model| model.display_id().to_owned())
+        .unwrap_or_else(|| "loading".into());
+    let directory = if app.cwd_display.is_empty() {
+        "loading"
+    } else {
+        app.cwd_display.as_str()
+    };
+    let content = vec![
+        Line::from(vec![
+            Span::styled(">_ ", Style::new().fg(theme.dim)),
+            Span::styled(
+                "Shaltaiboltai",
+                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" (v{})", env!("CARGO_PKG_VERSION")),
+                Style::new().fg(theme.dim),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("model:     ", Style::new().fg(theme.dim)),
+            Span::styled(model, Style::new().fg(theme.fg)),
+            Span::raw("   "),
+            Span::styled("/model", Style::new().fg(theme.accent)),
+            Span::styled(" to change", Style::new().fg(theme.dim)),
+        ]),
+        Line::from(vec![
+            Span::styled("directory: ", Style::new().fg(theme.dim)),
+            Span::styled(directory.to_owned(), Style::new().fg(theme.fg)),
+        ]),
+    ];
+    bordered_card(content, available, theme)
+}
+
+fn bordered_card(
+    lines: Vec<Line<'static>>,
+    max_inner_width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let lines = lines
+        .into_iter()
+        .map(|line| truncate_styled_line(line, max_inner_width))
+        .collect::<Vec<_>>();
+    let content_width = lines.iter().map(Line::width).max().unwrap_or(0);
+    let border_style = Style::new().fg(theme.dim);
+    let mut bordered = Vec::with_capacity(lines.len() + 2);
+    bordered.push(Line::styled(
+        format!("╭{}╮", "─".repeat(content_width + 2)),
+        border_style,
+    ));
+    for line in lines {
+        let padding = content_width.saturating_sub(line.width());
+        let mut spans = Vec::with_capacity(line.spans.len() + 3);
+        spans.push(Span::styled("│ ", border_style));
+        spans.extend(line.spans);
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(Span::styled(" │", border_style));
+        bordered.push(Line::from(spans));
+    }
+    bordered.push(Line::styled(
+        format!("╰{}╯", "─".repeat(content_width + 2)),
+        border_style,
+    ));
+    bordered
+}
+
+fn truncate_styled_line(line: Line<'static>, max_width: usize) -> Line<'static> {
+    if line.width() <= max_width {
+        return line;
+    }
+    let mut remaining = max_width;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if remaining == 0 {
+            break;
+        }
+        let span_width = span.width();
+        if span_width <= remaining {
+            remaining -= span_width;
+            spans.push(span);
+            continue;
+        }
+        spans.push(Span::styled(
+            truncate_width(span.content.as_ref(), remaining),
+            span.style,
+        ));
+        break;
+    }
+    Line::from(spans)
+}
+
+fn render_entry(
+    entry: &Entry,
+    width: usize,
+    _streaming: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match entry {
         Entry::Banner { title, subtitle } => {
@@ -554,48 +741,29 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
             );
         }
         Entry::User(text) => {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "YOU",
-                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ·  prompt", Style::new().fg(theme.dim)),
-            ]));
             push_wrapped(
                 &mut lines,
-                "▎ ",
-                Style::new().fg(theme.accent),
+                "› ",
+                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
                 text,
                 width,
-                Style::new().fg(theme.secondary),
+                Style::new().fg(theme.fg),
             );
         }
         Entry::Assistant(text) => {
-            if !text.is_empty() || streaming {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "◆  ",
-                        Style::new().fg(theme.accent2).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "SHALTAIBOLTAI",
-                        Style::new()
-                            .fg(theme.secondary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                if text.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::raw("   "),
-                        Span::styled("thinking…", Style::new().fg(theme.dim)),
-                    ]));
-                } else {
-                    for line in markdown::render(text, width.saturating_sub(3), theme) {
-                        let mut spans = Vec::with_capacity(line.spans.len() + 1);
-                        spans.push(Span::raw("   "));
-                        spans.extend(line.spans);
-                        lines.push(Line::from(spans));
-                    }
+            if !text.is_empty() {
+                for (index, line) in markdown::render(text, width.saturating_sub(2), theme)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                    spans.push(if index == 0 {
+                        Span::styled("• ", Style::new().fg(theme.accent))
+                    } else {
+                        Span::raw("  ")
+                    });
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
                 }
             }
         }
@@ -604,51 +772,27 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
             result,
             is_error,
         } => {
-            let (state, glyph, color) = if *is_error {
-                ("failed", "✗", theme.error)
+            let (glyph, color) = if *is_error {
+                ("! ", theme.error)
             } else {
-                ("done", "✓", theme.success)
+                ("• ", theme.accent)
             };
             let result_lines = result.lines().count();
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{glyph}  "),
-                    Style::new()
-                        .fg(semantic_foreground(color, theme.bg, theme.fg))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "tool",
-                    Style::new()
-                        .fg(theme.secondary)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" · {state}"), Style::new().fg(color)),
-                Span::styled(
-                    if result_lines > 0 {
-                        format!(
-                            " · {result_lines} output line{}",
-                            if result_lines == 1 { "" } else { "s" }
-                        )
-                    } else {
-                        String::new()
-                    },
-                    Style::new().fg(theme.dim),
-                ),
-            ]));
             push_wrapped(
                 &mut lines,
-                "▎ ",
-                Style::new().fg(color),
+                glyph,
+                Style::new()
+                    .fg(semantic_foreground(color, theme.bg, theme.fg))
+                    .add_modifier(Modifier::BOLD),
                 summary,
                 width,
-                Style::new().fg(theme.secondary),
+                Style::new().fg(if *is_error { theme.error } else { theme.fg }),
             );
             let shown = result_lines.min(TOOL_RESULT_PREVIEW_LINES);
             for (i, line) in result.lines().take(shown).enumerate() {
                 push_wrapped(
                     &mut lines,
-                    "   ",
+                    if i == 0 { "  └ " } else { "    " },
                     Style::new().fg(theme.dim),
                     line,
                     width,
@@ -656,7 +800,7 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
                 );
                 if i + 1 == shown && result_lines > shown {
                     lines.push(Line::from(vec![
-                        Span::raw("   "),
+                        Span::raw("    "),
                         Span::styled(
                             format!("… {} more lines", result_lines - shown),
                             Style::new().fg(theme.dim).add_modifier(Modifier::ITALIC),
@@ -674,45 +818,34 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
         } => {
             let running = status == "RUNNING";
             let (glyph, color) = if *is_error {
-                ("✗", theme.error)
+                ("! ", theme.error)
             } else if running {
-                ("◆", theme.accent2)
+                ("• ", theme.accent2)
             } else {
-                ("✓", theme.success)
+                ("• ", theme.success)
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{glyph}  "),
+                    glyph,
                     Style::new()
                         .fg(semantic_foreground(color, theme.bg, theme.fg))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "agent",
-                    Style::new()
-                        .fg(theme.secondary)
-                        .add_modifier(Modifier::BOLD),
+                    name.clone(),
+                    Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!(" · {} · ", status.to_ascii_lowercase()),
-                    Style::new().fg(color),
-                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  └ ", Style::new().fg(color)),
+                Span::styled(status.to_ascii_lowercase(), Style::new().fg(color)),
+                Span::styled(" · ", Style::new().fg(theme.dim)),
                 Span::styled(model.clone(), Style::new().fg(theme.accent2)),
             ]));
-            push_wrapped(
-                &mut lines,
-                "▎ ",
-                Style::new().fg(color),
-                name,
-                width,
-                Style::new()
-                    .fg(theme.secondary)
-                    .add_modifier(Modifier::BOLD),
-            );
             if !summary.is_empty() {
                 push_wrapped(
                     &mut lines,
-                    "   ",
+                    "    ",
                     Style::new().fg(theme.dim),
                     summary,
                     width,
@@ -723,11 +856,11 @@ fn render_entry(entry: &Entry, width: usize, streaming: bool, theme: &Theme) -> 
         Entry::Info(text) => {
             push_wrapped(
                 &mut lines,
-                "· ",
-                Style::new().fg(theme.dim),
+                "• ",
+                Style::new().fg(theme.accent),
                 text,
                 width,
-                Style::new().fg(theme.dim).add_modifier(Modifier::ITALIC),
+                Style::new().fg(theme.dim),
             );
         }
         Entry::Status { title, fields } => {
@@ -910,194 +1043,6 @@ fn push_wrapped(
     }
 }
 
-fn spinner_frame(tick: u64) -> char {
-    SPINNER[tick as usize % SPINNER.len()]
-}
-
-/// Product HUD derived from the original TypeScript shell: one compact seal,
-/// one authored identity, quiet runtime metadata, and a single separator.
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme;
-    let surface_style = theme.surface.map_or_else(
-        || Style::new().fg(theme.fg),
-        |surface| Style::new().bg(surface).fg(theme.fg),
-    );
-    let mut shell = Block::default().style(surface_style);
-    if area.height >= 2 {
-        shell = shell
-            .borders(Borders::BOTTOM)
-            .border_type(BorderType::Plain)
-            .border_style(Style::new().fg(theme.border));
-
-        let mut workspace = app.cwd_display.clone();
-        if let Some(branch) = &app.git_branch {
-            if !workspace.is_empty() {
-                workspace.push_str(" · ");
-            }
-            workspace.push_str(branch);
-        }
-        if !workspace.is_empty() && area.width >= 44 {
-            shell = shell.title_bottom(Line::styled(
-                format!(
-                    " {} ",
-                    truncate_width(&workspace, (area.width / 2) as usize)
-                ),
-                Style::new().fg(theme.dim),
-            ));
-        }
-
-        let usage = if app.scroll_from_bottom > 0 {
-            if area.width >= 48 {
-                format!(
-                    " ↑ {} lines from latest · Ctrl+End jump ",
-                    app.scroll_from_bottom
-                )
-            } else {
-                format!(" ↑ {} · Ctrl+End ", app.scroll_from_bottom)
-            }
-        } else {
-            match app.last_usage {
-                Some(usage) => format!(
-                    " ctx {} · out {} ",
-                    fmt_count(usage.input_tokens as usize),
-                    fmt_count(usage.output_tokens as usize)
-                ),
-                None if app.approx_tokens() > 0 => {
-                    format!(" ctx ~{} ", fmt_count(app.approx_tokens()))
-                }
-                None => String::new(),
-            }
-        };
-        if !usage.is_empty() {
-            let color = if app.scroll_from_bottom > 0 {
-                semantic_foreground(theme.warning, theme.surface, theme.fg)
-            } else {
-                theme.dim
-            };
-            shell = shell.title_bottom(
-                Line::styled(usage, Style::new().fg(color)).alignment(Alignment::Right),
-            );
-        }
-    }
-    frame.render_widget(shell, area);
-
-    let wide = area.width >= 58;
-    let (state, state_color) = if let Some(status) = app.orchestration_status() {
-        (status, theme.accent2)
-    } else if app.compacting {
-        ("compacting context…".into(), theme.accent)
-    } else if app.discovering && app.mode == Mode::Input {
-        ("discovering models…".into(), theme.accent)
-    } else if let Some(workers) = app.team_workers().filter(|_| app.mode == Mode::Input) {
-        (format!("TEAM · {workers} workers armed"), theme.accent2)
-    } else {
-        match app.mode {
-            Mode::Input => ("ready".into(), theme.success),
-            Mode::Streaming => ("thinking".into(), theme.accent),
-            Mode::RunningTool => ("running tool".into(), theme.accent2),
-            Mode::Approval => ("approval needed".into(), theme.warning),
-            Mode::OrchestrationConfirm => ("team plan ready".into(), theme.warning),
-            Mode::Orchestrating => ("team working".into(), theme.accent2),
-            Mode::ModelPicker => ("selecting model".into(), theme.accent2),
-            Mode::SessionPicker => ("selecting session".into(), theme.accent2),
-            Mode::ThemePicker => (
-                if wide {
-                    "previewing theme — Enter keep · Esc revert".into()
-                } else {
-                    "previewing theme".into()
-                },
-                theme.accent2,
-            ),
-            Mode::Help => ("keyboard guide".into(), theme.accent2),
-        }
-    };
-    let state = if app.mode == Mode::Approval && !app.approval_focused {
-        if app.queued_prompt_count() > 0 {
-            format!("{state} · next queued · Tab review")
-        } else {
-            format!("{state} · Tab to review")
-        }
-    } else if app.queued_prompt_count() > 0 {
-        format!("{state} · next queued")
-    } else {
-        state
-    };
-
-    let mut left = vec![Span::styled(
-        " SB ",
-        Style::new()
-            .fg(theme.bg.unwrap_or_else(|| on_color(theme.accent)))
-            .bg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if area.width >= 18 {
-        left.push(Span::styled(
-            if area.width >= 34 {
-                "  SHALTAIBOLTAI"
-            } else {
-                "  SHALTAI"
-            },
-            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
-        ));
-    }
-    let left_width = left.iter().map(Span::width).sum::<usize>();
-    frame.render_widget(
-        Paragraph::new(Line::from(left)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-
-    let model = app
-        .model
-        .as_ref()
-        .map(|m| format!("{} · {}", m.display_id(), m.provider.label()));
-    let permission = app
-        .effective_execution_policy()
-        .matching_preset()
-        .map_or_else(
-            || app.effective_execution_policy().sandbox_mode().label(),
-            |preset| preset.label(),
-        );
-    let available = area.width as usize;
-    let state_width = UnicodeWidthStr::width(state.as_str()) + if app.is_busy() { 2 } else { 1 };
-    let mut right = Vec::new();
-    let room = available.saturating_sub(left_width + 2);
-    let model_width = model
-        .as_deref()
-        .map(UnicodeWidthStr::width)
-        .unwrap_or_default();
-    let permission_width = UnicodeWidthStr::width(permission);
-    if wide && room > state_width + permission_width + model_width + 6 {
-        if let Some(model) = model {
-            right.push(Span::styled(model, Style::new().fg(theme.accent2)));
-            right.push(Span::styled(" · ", Style::new().fg(theme.border)));
-        }
-    }
-    if room > state_width + permission_width + 3 {
-        right.push(Span::styled(permission, Style::new().fg(theme.secondary)));
-        right.push(Span::styled(" · ", Style::new().fg(theme.border)));
-    }
-    right.push(if app.is_busy() {
-        Span::styled(
-            format!("{} ", spinner_frame(app.animation_tick())),
-            Style::new().fg(theme.accent),
-        )
-    } else {
-        Span::styled("● ", Style::new().fg(state_color))
-    });
-    right.push(Span::styled(
-        state,
-        Style::new().fg(semantic_foreground(state_color, theme.surface, theme.fg)),
-    ));
-    let right_x = area
-        .x
-        .saturating_add((left_width + 1).min(area.width as usize) as u16);
-    let right_area = Rect::new(right_x, area.y, area.right().saturating_sub(right_x), 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
-        right_area,
-    );
-}
-
 fn truncate_width(text: &str, max: usize) -> String {
     if UnicodeWidthStr::width(text) <= max {
         return text.to_owned();
@@ -1117,22 +1062,6 @@ fn truncate_width(text: &str, max: usize) -> String {
     }
     out.push('…');
     out
-}
-
-/// Pick a legible foreground for filled badges independently of the theme's
-/// canvas color. A light theme's base is not necessarily readable on success
-/// green, just as a dark theme's base can disappear on a dark error red.
-fn on_color(color: Color) -> Color {
-    match relative_luminance(color) {
-        Some(luminance) if luminance > 0.179 => Color::Black,
-        Some(_) => Color::White,
-        None => match color {
-            Color::Black | Color::Red | Color::Blue | Color::Magenta | Color::DarkGray => {
-                Color::White
-            }
-            _ => Color::Black,
-        },
-    }
 }
 
 fn selection_style(theme: &Theme) -> Style {
@@ -1265,8 +1194,10 @@ fn draw_model_picker(frame: &mut Frame, app: &App) {
         .unwrap_or(0);
     let items: Vec<ListItem> = models
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(index, m)| {
             let mut spans = vec![
+                Span::styled(format!("{}. ", index + 1), Style::new().fg(theme.dim)),
                 Span::styled(
                     format!("{:<provider_width$}  ", m.provider.label()),
                     Style::new().fg(theme.accent2),
@@ -1284,17 +1215,63 @@ fn draw_model_picker(frame: &mut Frame, app: &App) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = format!(
-        " select model — type to filter: {}▏ ({} shown) ",
-        app.picker_filter,
-        models.len()
+    let preferred_height = (models.len() as u16).saturating_add(6).clamp(8, 16);
+    let height = preferred_height.min(frame.area().height);
+    let area = Rect::new(
+        frame.area().x,
+        frame.area().bottom().saturating_sub(height),
+        frame.area().width,
+        height,
     );
-    draw_overlay_list(
-        frame,
-        &theme,
-        title,
-        items,
-        app.picker_index.min(models.len().saturating_sub(1)),
+    frame.render_widget(Clear, area);
+    if let Some(surface) = theme.surface {
+        frame.render_widget(
+            Block::default().style(Style::new().bg(surface).fg(theme.fg)),
+            area,
+        );
+    }
+    let [top_pad, title_area, filter_area, gap_area, list_area, footer_gap, footer_area] =
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+    let _ = (top_pad, gap_area, footer_gap);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "  Select Model and Provider",
+            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+        )),
+        title_area,
+    );
+    let filter = if app.picker_filter.is_empty() {
+        format!("  Type to filter · {} models", models.len())
+    } else {
+        format!("  Filter: {}▏ · {} shown", app.picker_filter, models.len())
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(filter, Style::new().fg(theme.dim))),
+        filter_area,
+    );
+    let list = List::new(items)
+        .highlight_style(selection_style(&theme))
+        .highlight_symbol("› ");
+    let mut state = ListState::default();
+    state.select(
+        (!models.is_empty()).then_some(app.picker_index.min(models.len().saturating_sub(1))),
+    );
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "  Press enter to confirm or esc to go back",
+            Style::new().fg(theme.dim),
+        )),
+        footer_area,
     );
 }
 
@@ -2297,7 +2274,21 @@ fn draw_modal_scrim(frame: &mut Frame, _theme: &Theme, area: Rect) {
             let cell = &mut buffer[(x, y)];
             if !cell.symbol().is_empty()
                 && cell.symbol().chars().all(|symbol| {
-                    matches!(symbol, '─' | '│' | '┌' | '┐' | '└' | '┘' | '━' | '╾' | '▎')
+                    matches!(
+                        symbol,
+                        '─' | '│'
+                            | '┌'
+                            | '┐'
+                            | '└'
+                            | '┘'
+                            | '╭'
+                            | '╮'
+                            | '╰'
+                            | '╯'
+                            | '━'
+                            | '╾'
+                            | '▎'
+                    )
                 })
             {
                 cell.set_symbol(" ");
@@ -2448,7 +2439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_working_view_uses_the_seal_instead_of_floating_art() {
+    async fn standard_working_view_uses_sparse_codex_activity_instead_of_floating_art() {
         let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
         let mut app = test_app();
         app.mode = Mode::Orchestrating;
@@ -2464,15 +2455,12 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("SB"), "{rendered}");
-        assert!(rendered.contains("SHALTAIBOLTAI"), "{rendered}");
+        assert!(rendered.contains("• agent 1 · inspect state"), "{rendered}");
+        assert!(rendered.contains("└ running · team-test · ollama"), "{rendered}");
+        assert!(rendered.contains("• Coordinating team"), "{rendered}");
         assert!(!rendered.contains("REAL AGENT"), "{rendered}");
         assert!(!rendered.contains("DANCING"), "{rendered}");
         assert!(!has_inline_mascot(&terminal), "{rendered}");
-        assert!(
-            rendered.contains("agent · running · team-test · ollama"),
-            "{rendered}"
-        );
         assert!(rendered.contains("read-only sandbox"), "{rendered}");
     }
 
@@ -2485,10 +2473,10 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("SB"), "{rendered}");
+        assert!(rendered.contains("Shaltaiboltai"), "{rendered}");
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
         assert!(!has_inline_mascot(&terminal), "{rendered}");
-        assert!(rendered.contains("team working"), "{rendered}");
+        assert!(rendered.contains("Coordinating team"), "{rendered}");
     }
 
     #[tokio::test]
@@ -2536,7 +2524,7 @@ mod tests {
             .draw(|frame| draw_with_native_mascot(frame, &mut app, &native))
             .unwrap();
         assert!(!has_native_graphics(&terminal));
-        assert!(screen(&terminal).contains("SB"));
+        assert!(screen(&terminal).contains("Shaltaiboltai"));
     }
 
     #[tokio::test]
@@ -2645,12 +2633,11 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("SB"), "{rendered}");
+        assert!(rendered.contains("Shaltaiboltai"), "{rendered}");
         assert!(!rendered.contains("╭⌒▾⌒╮"), "{rendered}");
         assert!(!has_inline_mascot(&terminal), "{rendered}");
-        assert!(rendered.contains("Ready to build"), "{rendered}");
-        assert!(rendered.contains("team working"), "{rendered}");
-        assert!(rendered.contains("next message"), "{rendered}");
+        assert!(rendered.contains("Coordinating team"), "{rendered}");
+        assert!(rendered.contains("Add a follow-up"), "{rendered}");
     }
 
     #[test]
@@ -2699,7 +2686,7 @@ mod tests {
                     .buffer_mut()
                     .cell_mut((10, 2))
                     .expect("surface cell")
-                    .set_bg(theme::DEFAULT.surface.expect("surface theme"));
+                    .set_bg(theme::INK.surface.expect("surface theme"));
                 assert!(!mascot_region_is_clear(frame, area, None));
                 frame
                     .buffer_mut()
