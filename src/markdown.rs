@@ -4,12 +4,22 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod fences;
+mod table;
+
 /// Render markdown to styled, word-wrapped lines for the transcript pane.
 /// Tolerates incomplete input (e.g. an unclosed code fence mid-stream).
 pub fn render(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let mut r = Renderer::new(width.max(10), *theme);
-    for event in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH) {
-        r.event(event);
+    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
+    let normalized = fences::unwrap_table_markdown_fences(text);
+    for (event, range) in Parser::new_ext(normalized.as_ref(), options).into_offset_iter() {
+        let row_has_boundary_pipe = matches!(&event, Event::Start(Tag::TableRow))
+            && normalized
+                .get(range)
+                .map(str::trim)
+                .is_some_and(|row| row.starts_with('|') || row.ends_with('|'));
+        r.event(event, row_has_boundary_pipe);
     }
     r.finish()
 }
@@ -24,6 +34,7 @@ struct Renderer {
     first_prefix: String,
     cont_prefix: String,
     prefix_style: Style,
+    prefix_quote_depth: usize,
     first_line_of_block: bool,
     bold: u32,
     italic: u32,
@@ -34,6 +45,10 @@ struct Renderer {
     in_item: u32,
     quote_depth: usize,
     link: Option<(String, bool)>, // (url, text matched url i.e. autolink)
+    table: Option<table::TableState>,
+    table_first_prefix: String,
+    table_cont_prefix: String,
+    table_prefix_style: Style,
 }
 
 impl Renderer {
@@ -48,6 +63,7 @@ impl Renderer {
             first_prefix: String::new(),
             cont_prefix: String::new(),
             prefix_style: Style::new().fg(theme.dim),
+            prefix_quote_depth: 0,
             first_line_of_block: true,
             bold: 0,
             italic: 0,
@@ -58,12 +74,16 @@ impl Renderer {
             in_item: 0,
             quote_depth: 0,
             link: None,
+            table: None,
+            table_first_prefix: String::new(),
+            table_cont_prefix: String::new(),
+            table_prefix_style: Style::new().fg(theme.dim),
         }
     }
 
-    fn event(&mut self, event: Event) {
+    fn event(&mut self, event: Event, row_has_boundary_pipe: bool) {
         match event {
-            Event::Start(tag) => self.start(tag),
+            Event::Start(tag) => self.start(tag, row_has_boundary_pipe),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => {
                 if let Some(buf) = &mut self.code_block {
@@ -85,11 +105,24 @@ impl Renderer {
                 }
                 self.push_token(&t, style);
             }
+            Event::Html(t) | Event::InlineHtml(t) if self.table.is_some() => {
+                // pulldown-cmark can retain inline HTML inside table cells. Keep
+                // it visible here even though raw HTML is ignored elsewhere in
+                // the terminal transcript.
+                let style = self.inline_style();
+                self.push_words(&t, style);
+            }
             Event::SoftBreak => {
                 let style = self.inline_style();
                 self.push_words(" ", style);
             }
-            Event::HardBreak => self.flush_line(),
+            Event::HardBreak => {
+                if let Some(table) = &mut self.table {
+                    table.hard_break();
+                } else {
+                    self.flush_line();
+                }
+            }
             Event::Rule => {
                 self.gap();
                 self.lines.push(Line::styled(
@@ -109,8 +142,51 @@ impl Renderer {
         }
     }
 
-    fn start(&mut self, tag: Tag) {
+    fn start(&mut self, tag: Tag, row_has_boundary_pipe: bool) {
         match tag {
+            Tag::Table(alignments) => {
+                // A table can begin after inline text without an intervening
+                // paragraph boundary (for example, inside a list item). Emit
+                // that text before the table and let the table continue from
+                // the list indentation instead of stealing its bullet.
+                self.flush_line();
+                self.gap();
+                if self.in_item > 0 && !self.cont_prefix.is_empty() {
+                    let nested_quote =
+                        "▎ ".repeat(self.quote_depth.saturating_sub(self.prefix_quote_depth));
+                    self.table_first_prefix = if self.first_line_of_block {
+                        format!("{}{nested_quote}", self.first_prefix)
+                    } else {
+                        format!("{}{nested_quote}", self.cont_prefix)
+                    };
+                    self.table_cont_prefix = format!("{}{nested_quote}", self.cont_prefix);
+                } else {
+                    let quote = self.quote_prefix();
+                    self.table_first_prefix = quote.clone();
+                    self.table_cont_prefix = quote;
+                }
+                self.table_prefix_style = if self.quote_depth > 0 {
+                    Style::new().fg(self.theme.accent2)
+                } else {
+                    self.prefix_style
+                };
+                self.table = Some(table::TableState::new(alignments));
+            }
+            Tag::TableHead => {
+                if let Some(table) = &mut self.table {
+                    table.start_head();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.start_row(row_has_boundary_pipe);
+                }
+            }
+            Tag::TableCell => {
+                if let Some(table) = &mut self.table {
+                    table.start_cell();
+                }
+            }
             Tag::Paragraph => {
                 if self.in_item == 0 {
                     self.gap();
@@ -181,6 +257,39 @@ impl Renderer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    let first_prefix = std::mem::take(&mut self.table_first_prefix);
+                    let cont_prefix = std::mem::take(&mut self.table_cont_prefix);
+                    let rendered = table::render(
+                        table,
+                        self.width,
+                        &first_prefix,
+                        &cont_prefix,
+                        self.table_prefix_style,
+                        &self.theme,
+                    );
+                    if !rendered.is_empty() {
+                        self.first_line_of_block = false;
+                    }
+                    self.lines.extend(rendered);
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = &mut self.table {
+                    table.end_head();
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.end_row();
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(table) = &mut self.table {
+                    table.end_cell();
+                }
+            }
             TagEnd::Paragraph | TagEnd::Heading(_) => {
                 self.flush_line();
                 self.heading_level = None;
@@ -260,6 +369,7 @@ impl Renderer {
         self.first_prefix = first;
         self.cont_prefix = cont;
         self.prefix_style = prefix_style;
+        self.prefix_quote_depth = self.quote_depth;
         self.first_line_of_block = true;
     }
 
@@ -323,6 +433,10 @@ impl Renderer {
     /// Append one unbreakable token, wrapping (or hard-splitting) as needed.
     /// All measurements use display width, so CJK and emoji wrap correctly.
     fn push_token(&mut self, token: &str, style: Style) {
+        if let Some(table) = &mut self.table {
+            table.push_span(Span::styled(token.to_owned(), style));
+            return;
+        }
         let tw = UnicodeWidthStr::width(token);
         if self.cur_w + tw > self.avail() && self.cur_w > 0 {
             self.flush_line();
@@ -494,5 +608,400 @@ mod tests {
         let text = flat(&lines).join(" ");
         assert!(text.contains("cargo build"));
         assert!(text.contains("compile"));
+    }
+
+    #[test]
+    fn table_renders_as_a_borderless_grid() {
+        let lines = render("| A | B |\n|---|---|\n| 1 | 2 |\n", 80, &TERMINAL);
+        let text = flat(&lines);
+        assert_eq!(text, vec![" A      B", "━━━━━  ━━━━━", " 1      2"]);
+        assert_eq!(lines[0].style.fg, Some(TERMINAL.accent2));
+        assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(lines[0]
+            .spans
+            .iter()
+            .filter(|span| !span.content.trim().is_empty())
+            .all(|span| {
+                span.style.fg == Some(TERMINAL.accent2)
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            }));
+        assert!(lines[1].spans[0].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn table_honors_column_alignment() {
+        let lines = render(
+            "| Left | Center | Right |\n|:-----|:------:|------:|\n| a | b | c |\n",
+            80,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        assert_eq!(text[0], " Left    Center    Right");
+        assert_eq!(text[2], " a         b           c");
+    }
+
+    #[test]
+    fn cramped_table_transposes_to_stacked_records() {
+        let markdown = "| Key | Notes |\n| --- | --- |\n\
+                        | firstlongid | A readable explanatory sentence for this row. |\n\
+                        | secondlongid | Another readable explanatory sentence for this row. |\n\
+                        | short | A final readable explanatory sentence for this row. |\n";
+        let lines = render(markdown, 17, &TERMINAL);
+        let text = flat(&lines);
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.trim_start().starts_with("Key"))
+                .count(),
+            3
+        );
+        assert_eq!(text.iter().filter(|line| line.trim() == "Notes").count(), 3);
+        assert!(text.iter().any(|line| line == &"─".repeat(17)), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains('━')), "{text:?}");
+        assert!(text
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 17));
+    }
+
+    #[test]
+    fn one_compact_outlier_stays_in_the_grid() {
+        let markdown = "| Key | Date | State |\n| --- | --- | --- |\n\
+                        | short | 2025-01-01 | Ready |\n\
+                        | verylongidentifier | 2025-02-02 | Ready |\n\
+                        | final | 2025-03-03 | Done |\n";
+        let text = flat(&render(markdown, 40, &TERMINAL));
+        assert!(text.iter().any(|line| line.contains('━')), "{text:?}");
+        assert_eq!(text.iter().filter(|line| line.contains("Key")).count(), 1);
+        assert!(text
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 40));
+    }
+
+    #[test]
+    fn systemic_compact_fragmentation_crosses_the_record_threshold() {
+        let markdown = "| Key | Date | State |\n| --- | --- | --- |\n\
+                        | verylongidentifier | 2025-01-01 | Ready |\n\
+                        | secondlongidentifier | 2025-02-02 | Ready |\n\
+                        | final | 2025-03-03 | Done |\n";
+        let text = flat(&render(markdown, 40, &TERMINAL));
+        assert!(!text.iter().any(|line| line.contains('━')), "{text:?}");
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.trim_start().starts_with("Key"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn narrative_fragmentation_only_transposes_when_catastrophic() {
+        let moderate = "| Key | Description |\n| --- | --- |\n\
+                        | x | one two three four five six seven eight |\n";
+        let moderate = flat(&render(moderate, 19, &TERMINAL));
+        assert!(
+            moderate.iter().any(|line| line.contains('━')),
+            "{moderate:?}"
+        );
+
+        let catastrophic = format!(
+            "| Key | Description |\n| --- | --- |\n| x | {} |\n",
+            "one two three four five six seven eight nine ten ".repeat(3)
+        );
+        let catastrophic = flat(&render(&catastrophic, 19, &TERMINAL));
+        assert!(
+            !catastrophic.iter().any(|line| line.contains('━')),
+            "{catastrophic:?}"
+        );
+        assert!(catastrophic.iter().any(|line| line.trim() == "Description"));
+    }
+
+    #[test]
+    fn tables_preserve_unicode_escaped_pipes_and_inline_styles() {
+        let markdown = "| Key | Notes |\n| --- | --- |\n\
+                        | ｶﾞﾊﾟtail | 日本語 ✅ with an escaped \\| pipe |\n\
+                        | style | `cargo test` and **bold** |\n";
+        let lines = render(markdown, 34, &TERMINAL);
+        let text = flat(&lines);
+        let content = text.join("\n");
+        assert!(content.contains("ｶﾞﾊﾟtail"), "{text:?}");
+        assert!(content.contains("日本語"), "{text:?}");
+        assert!(content.contains('✅'), "{text:?}");
+        assert!(content.contains("escaped | pipe"), "{text:?}");
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("cargo test") && span.style.fg == Some(TERMINAL.code)
+        }));
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("bold") && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(text
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 34));
+    }
+
+    #[test]
+    fn table_header_accent_does_not_overwrite_inline_code_color() {
+        let lines = render(
+            "| Plain | `Command` |\n| --- | --- |\n| value | cargo |\n",
+            40,
+            &TERMINAL,
+        );
+        let plain = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Plain"))
+            .unwrap();
+        let code = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Command"))
+            .unwrap();
+        assert_eq!(plain.style.fg, Some(TERMINAL.accent2));
+        assert_eq!(code.style.fg, Some(TERMINAL.code));
+        assert!(plain.style.add_modifier.contains(Modifier::BOLD));
+        assert!(code.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn table_in_blockquote_keeps_the_quote_gutter() {
+        let lines = render("> | A | B |\n> |---|---|\n> | 1 | 2 |\n", 40, &TERMINAL);
+        let text = flat(&lines);
+        assert!(text.iter().all(|line| line.starts_with("▎ ")), "{text:?}");
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.style.fg == Some(TERMINAL.accent2))
+        }));
+    }
+
+    #[test]
+    fn table_nested_in_a_list_uses_the_continuation_indent() {
+        let lines = render(
+            "- item\n\n  | A | B |\n  |---|---|\n  | 1 | 2 |\n",
+            40,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        let table_lines = text
+            .iter()
+            .filter(|line| line.contains('━') || line.contains(" A") || line.contains(" 1"))
+            .collect::<Vec<_>>();
+        assert!(!table_lines.is_empty(), "{text:?}");
+        assert!(
+            table_lines.iter().all(|line| line.starts_with("  ")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_table_after_list_text_preserves_order_and_nested_prefix() {
+        let lines = render(
+            "- item\n  > | A | B |\n  > |---|---|\n  > | 1 | 2 |\n",
+            40,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        assert_eq!(text.first().map(String::as_str), Some("• item"), "{text:?}");
+
+        let table = text
+            .iter()
+            .filter(|line| line.contains('━') || line.contains(" A") || line.contains(" 1"))
+            .collect::<Vec<_>>();
+        assert_eq!(table.len(), 3, "{text:?}");
+        assert!(
+            table.iter().all(|line| line.starts_with("  ▎ ")),
+            "{text:?}"
+        );
+        assert!(!table.iter().any(|line| line.starts_with('•')), "{text:?}");
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .filter(|line| !line.spans.is_empty())
+                .all(|line| line.spans.first().is_some_and(|span| {
+                    span.content == "  ▎ " && span.style.fg == Some(TERMINAL.accent2)
+                })),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn table_only_list_item_keeps_its_bullet_then_indents() {
+        let lines = render("- | A | B |\n  |---|---|\n  | 1 | 2 |\n", 32, &TERMINAL);
+        let text = flat(&lines);
+        assert_eq!(text[0], "•  A      B", "{text:?}");
+        assert!(text[1].starts_with("  ━"), "{text:?}");
+        assert!(text[2].starts_with("   1"), "{text:?}");
+    }
+
+    #[test]
+    fn complete_markdown_fence_around_table_renders_as_table() {
+        let lines = render(
+            "```markdown\n| Name | State |\n| --- | --- |\n| build | ready |\n```\n",
+            40,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        assert!(text.iter().any(|line| line.contains('━')), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("build")), "{text:?}");
+        assert!(!text.iter().any(|line| line.starts_with("▏ ")), "{text:?}");
+    }
+
+    #[test]
+    fn table_does_not_swallow_following_prose_as_a_sparse_row() {
+        let lines = render(
+            "| A | B |\n| --- | --- |\n| 1 | 2 |\nFollowing prose remains outside the table.\n",
+            40,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        assert_eq!(text.iter().filter(|line| line.contains('━')).count(), 1);
+        assert!(!text.iter().any(|line| line.contains('─')), "{text:?}");
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Following prose remains")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn spillover_between_table_rows_keeps_source_order() {
+        let lines = render(
+            "| A | B |\n| --- | --- |\n| first | one |\nintervening prose\n| last | two |\n",
+            40,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        let first = text.iter().position(|line| line.contains("first")).unwrap();
+        let prose = text
+            .iter()
+            .position(|line| line.contains("intervening prose"))
+            .unwrap();
+        let last = text.iter().position(|line| line.contains("last")).unwrap();
+        assert!(first < prose && prose < last, "{text:?}");
+    }
+
+    #[test]
+    fn explicit_sparse_row_with_boundary_pipes_stays_in_table() {
+        let lines = render(
+            "| A | B |\n| --- | --- |\n| 1 | 2 |\n| total |\n",
+            40,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        assert!(text.iter().any(|line| line.contains('─')), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("total")), "{text:?}");
+    }
+
+    #[test]
+    fn table_rendering_is_stable_while_markdown_streams() {
+        let header_only = flat(&render("| Feature | State |\n", 40, &TERMINAL));
+        let partial_schema = flat(&render("| Feature | State |\n| --- | ---", 40, &TERMINAL));
+        let complete = flat(&render(
+            "| Feature | State |\n| --- | --- |\n| tables | ready |\n",
+            40,
+            &TERMINAL,
+        ));
+
+        assert!(header_only.len() <= 1, "{header_only:?}");
+        assert!(partial_schema.len() <= 2, "{partial_schema:?}");
+        assert_eq!(complete.iter().filter(|line| line.contains('━')).count(), 1);
+        assert_eq!(
+            complete
+                .iter()
+                .filter(|line| line.contains("Feature"))
+                .count(),
+            1
+        );
+        assert!(complete.iter().any(|line| line.contains("tables")));
+    }
+
+    #[test]
+    fn markdown_fences_without_tables_and_unclosed_fences_stay_code() {
+        for markdown in [
+            "```markdown\n**bold prose**\n```\n",
+            "```markdown\n| A | B |\n| --- | --- |\n",
+        ] {
+            let text = flat(&render(markdown, 40, &TERMINAL));
+            assert!(text.iter().any(|line| line.starts_with("▏ ")), "{text:?}");
+            assert!(!text.iter().any(|line| line.contains('━')), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn fenced_table_keeps_following_pipe_prose_outside_the_grid() {
+        let lines = render(
+            "```markdown\n| Name | State |\n| --- | --- |\n| build | ready |\n```\nFollow-up | prose\n",
+            40,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        assert_eq!(text.iter().filter(|line| line.contains('━')).count(), 1);
+        assert!(!text.iter().any(|line| line.contains('─')), "{text:?}");
+        assert!(
+            text.iter().any(|line| line == "Follow-up | prose"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn rerendering_after_width_changes_is_deterministic() {
+        let markdown = "| Key | Notes |\n| --- | --- |\n\
+                        | alpha | A sentence that wraps when the terminal narrows. |\n\
+                        | beta | Another sentence with stable content. |\n";
+        let wide = flat(&render(markdown, 48, &TERMINAL));
+        let narrow = flat(&render(markdown, 17, &TERMINAL));
+        let restored = flat(&render(markdown, 48, &TERMINAL));
+        assert_eq!(restored, wide);
+        assert_ne!(narrow, wide);
+        assert!(narrow
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 17));
+    }
+
+    #[test]
+    fn narrow_header_only_table_preserves_schema() {
+        let lines = render(
+            "| Alpha | Beta | Gamma |\n| :--- | :---: | ---: |\n",
+            10,
+            &TERMINAL,
+        );
+        let text = flat(&lines);
+        let content = text.join(" ");
+        assert!(content.contains("Alpha"), "{text:?}");
+        assert!(content.contains("Beta"), "{text:?}");
+        assert!(content.contains("Gamma"), "{text:?}");
+        assert!(content.contains(":---"), "{text:?}");
+        assert!(content.contains(":---:"), "{text:?}");
+        assert!(content.contains("---:"), "{text:?}");
+        assert!(text
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 10));
+    }
+
+    #[test]
+    fn large_table_has_bounded_width_and_complete_output() {
+        use std::fmt::Write;
+
+        let mut markdown = String::new();
+        for column in 0..10 {
+            let _ = write!(markdown, "| C{column} ");
+        }
+        markdown.push_str("|\n");
+        markdown.push_str("| --- ".repeat(10).as_str());
+        markdown.push_str("|\n");
+        for row in 0..1_000 {
+            for column in 0..10 {
+                let _ = write!(markdown, "| R{row}C{column} ");
+            }
+            markdown.push_str("|\n");
+        }
+
+        let lines = render(&markdown, 120, &TERMINAL);
+        let text = flat(&lines);
+        assert!(text.iter().any(|line| line.contains("R999C9")));
+        assert_eq!(text.iter().filter(|line| line.contains('━')).count(), 1);
+        assert_eq!(text.iter().filter(|line| line.contains('─')).count(), 999);
+        assert!(text
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 120));
     }
 }
