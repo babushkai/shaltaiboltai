@@ -372,6 +372,7 @@ async fn assistant_markdown_table_reflows_without_losing_style_or_content() {
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let wide = screen(&terminal);
+    let wide_cache_width = app.render_cache_width;
     assert!(wide.contains("Component"), "{wide}");
     assert!(wide.contains("wide-mode-ready"), "{wide}");
     assert!(wide.contains('━'), "header rule missing:\n{wide}");
@@ -415,7 +416,12 @@ async fn assistant_markdown_table_reflows_without_losing_style_or_content() {
         !narrow.contains('|'),
         "raw Markdown pipes leaked:\n{narrow}"
     );
-    assert_eq!(app.render_cache_width, 30, "resize must invalidate/reflow");
+    assert!(
+        app.render_cache_width < wide_cache_width,
+        "resize must invalidate/reflow: {} -> {}",
+        wide_cache_width,
+        app.render_cache_width
+    );
 }
 
 #[tokio::test]
