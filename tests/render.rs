@@ -1,5 +1,5 @@
 use ratatui::backend::TestBackend;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use shaltaiboltai::app::{App, AppEvent, Entry, Mode};
 use shaltaiboltai::config::Config;
@@ -156,13 +156,14 @@ async fn statusline_shows_cwd_and_branch() {
     let mut app = App::new(offline_config(), tx);
     // The test process runs inside the repo, so both should be present.
     assert!(!app.cwd_display.is_empty());
-    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    // Leave enough room for both values even on descriptive feature branches.
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
 
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     // Layout bottom-up: input is 3 rows (1 line + borders), status is the
     // single row above it: 24 - 3 - 1 = 20.
-    let status_row: String = (0..120)
+    let status_row: String = (0..180)
         .map(|x| buffer[(x, 20)].symbol().to_owned())
         .collect();
     assert!(
@@ -350,6 +351,77 @@ async fn conversation_rail_labels_people_and_tool_state() {
     assert!(rendered.contains("ASSISTANT"), "{rendered}");
     assert!(rendered.contains("DONE"), "{rendered}");
     assert!(rendered.contains("TOOL · 1 output line"), "{rendered}");
+}
+
+#[tokio::test]
+async fn assistant_markdown_table_reflows_without_losing_style_or_content() {
+    isolate_data_dir();
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.theme = theme::NORD;
+    app.transcript = vec![Entry::Assistant(
+        "| Component | Status | Notes |\n\
+         | :--- | :---: | ---: |\n\
+         | renderer | Ready | wide-mode-ready |\n\
+         | cache | Stable | narrow-mode-safe |\n"
+            .into(),
+    )];
+    app.transcript_rev += 1;
+    let mut terminal = Terminal::new(TestBackend::new(96, 40)).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let wide = screen(&terminal);
+    let wide_cache_width = app.render_cache_width;
+    assert!(wide.contains("Component"), "{wide}");
+    assert!(wide.contains("wide-mode-ready"), "{wide}");
+    assert!(wide.contains('━'), "header rule missing:\n{wide}");
+    assert!(!wide.contains('|'), "raw Markdown pipes leaked:\n{wide}");
+
+    let buffer = terminal.backend().buffer();
+    let header = "Component";
+    let header_start = (0..buffer.area.height)
+        .find_map(|y| {
+            (0..=buffer.area.width.saturating_sub(header.len() as u16)).find_map(|x| {
+                header
+                    .chars()
+                    .enumerate()
+                    .all(|(offset, expected)| {
+                        buffer[(x + offset as u16, y)].symbol() == expected.to_string()
+                    })
+                    .then_some((x, y))
+            })
+        })
+        .expect("rendered table header");
+    for x in header_start.0..header_start.0 + header.len() as u16 {
+        let cell = &buffer[(x, header_start.1)];
+        assert_eq!(cell.fg, app.theme.accent2);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    terminal.backend_mut().resize(34, 40);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let narrow = screen(&terminal);
+    for expected in [
+        "renderer",
+        "Ready",
+        "wide-mode-ready",
+        "cache",
+        "Stable",
+        "narrow-mode-safe",
+    ] {
+        assert!(narrow.contains(expected), "missing {expected:?}:\n{narrow}");
+    }
+    assert!(
+        !narrow.contains('|'),
+        "raw Markdown pipes leaked:\n{narrow}"
+    );
+    assert!(
+        app.render_cache_width < wide_cache_width,
+        "resize must invalidate/reflow: {} -> {}",
+        wide_cache_width,
+        app.render_cache_width
+    );
 }
 
 #[tokio::test]
