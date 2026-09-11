@@ -198,6 +198,7 @@ pub fn planner_request(
 
     Ok(ChatRequest {
         model: coordinator.clone(),
+        continuity_id: None,
         system: format!(
             "You are a read-only task planner. Decompose the root task into exactly {count} \
              independent advisory subtasks. Return only a JSON array, with no commentary, \
@@ -381,6 +382,7 @@ pub fn worker_request(
 
     Ok(ChatRequest {
         model: spec.model.clone(),
+        continuity_id: None,
         system: format!(
             "You are an advisory worker operating under a strict READ-ONLY contract. \
              Do not create, edit, rename, or delete files; do not change repository, process, \
@@ -494,6 +496,7 @@ fn is_read_only_tool_name(name: &str) -> bool {
 async fn collect_read_only_worker_request(config: Config, request: ChatRequest) -> Result<String> {
     let ChatRequest {
         model,
+        continuity_id: _,
         system,
         mut messages,
         tools: _,
@@ -507,6 +510,7 @@ async fn collect_read_only_worker_request(config: Config, request: ChatRequest) 
     loop {
         let round_request = ChatRequest {
             model: model.clone(),
+            continuity_id: None,
             system: system.clone(),
             messages: messages.clone(),
             tools: read_only_tool_definitions(),

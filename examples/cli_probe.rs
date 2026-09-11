@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
             provider,
             id: model_id,
         },
+        continuity_id: None,
         system: String::new(),
         messages: vec![Message::User(
             "Reply with exactly the word: pong. Do not use any tools.".into(),

@@ -371,6 +371,7 @@ mod tests {
                 provider: ProviderKind::OpenRouter,
                 id: "anthropic/claude-sonnet-4.6".into(),
             },
+            continuity_id: None,
             system: "system".into(),
             messages: vec![Message::User("inspect".into())],
             tools: vec![ToolDef {

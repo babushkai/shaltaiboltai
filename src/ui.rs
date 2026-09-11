@@ -1285,7 +1285,13 @@ fn draw_model_picker(frame: &mut Frame, app: &App) {
                     Style::new().fg(theme.fg),
                 ),
             ];
-            let detail = if m.provider.is_sub_agent() {
+            let detail = if m.provider == ProviderKind::Codex {
+                Some(if providers::is_cli_default_model(m) {
+                    "unpinned · stateless · solo-only"
+                } else {
+                    "persistent solo · stateless team"
+                })
+            } else if m.provider == ProviderKind::ClaudeCode {
                 Some(if providers::is_cli_default_model(m) {
                     "unpinned · solo-only · subscription sub-agent"
                 } else if m.is_claude_alias() {

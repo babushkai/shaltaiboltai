@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::ContractSandbox;
 use super::{
     attest_initialize, read_message, reject_server_request, send_message, BufferedNotifications,
     Contract, MAX_FRAME_BYTES,
@@ -18,6 +20,10 @@ use tokio::time::Instant;
 
 const INITIALIZE_REQUEST_ID: i64 = 0;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const RPC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const RPC_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -32,30 +38,30 @@ const MAX_PENDING_THREAD_RPCS: usize = 8;
 const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const MAX_COMMAND_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - 16 * 1024;
 
-pub(super) type BoxReader = Pin<Box<dyn AsyncRead + Send>>;
-pub(super) type BoxWriter = Pin<Box<dyn AsyncWrite + Send>>;
+pub(in crate::providers) type BoxReader = Pin<Box<dyn AsyncRead + Send>>;
+pub(in crate::providers) type BoxWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
 /// Process-specific cleanup owned by a spawned connection. Production
 /// implementations must reap the child and terminate its process group on
 /// timeout; dropping the implementation must retain kill-on-drop safety.
-pub(super) trait ChildControl: Send {
+pub(in crate::providers) trait ChildControl: Send {
     fn shutdown(&mut self) -> BoxFuture<'_, Result<()>>;
 }
 
-pub(super) struct SpawnedAppServer {
-    pub(super) reader: BoxReader,
-    pub(super) writer: BoxWriter,
-    pub(super) child: Box<dyn ChildControl>,
+pub(in crate::providers) struct SpawnedAppServer {
+    pub(in crate::providers) reader: BoxReader,
+    pub(in crate::providers) writer: BoxWriter,
+    pub(in crate::providers) child: Box<dyn ChildControl>,
 }
 
 /// A factory instance represents one immutable executable/auth/authority
 /// identity. Reconnects must launch that same identity, never ambient state.
-pub(super) trait AppServerSpawner: Send + Sync {
+pub(in crate::providers) trait AppServerSpawner: Send + Sync {
     fn spawn(&self) -> BoxFuture<'static, Result<SpawnedAppServer>>;
 }
 
 #[derive(Debug)]
-pub(super) enum SubmissionEvent {
+pub(in crate::providers) enum SubmissionEvent {
     Started { turn_id: String },
     Notification(Value),
     Terminal { status: String },
@@ -63,7 +69,7 @@ pub(super) enum SubmissionEvent {
     DeliveryUncertain(String),
 }
 
-pub(super) struct Submission {
+pub(in crate::providers) struct Submission {
     id: String,
     events: mpsc::Receiver<SubmissionEvent>,
     handle: AppServerHandle,
@@ -76,7 +82,7 @@ impl Submission {
         &self.id
     }
 
-    pub(super) async fn next_event(&mut self) -> Option<SubmissionEvent> {
+    pub(in crate::providers) async fn next_event(&mut self) -> Option<SubmissionEvent> {
         let event = self.events.recv().await;
         if matches!(
             event,
@@ -108,7 +114,7 @@ impl Drop for Submission {
 }
 
 #[derive(Clone)]
-pub(super) struct AppServerHandle {
+pub(in crate::providers) struct AppServerHandle {
     command_tx: mpsc::Sender<Command>,
     cancel_notify: Arc<Notify>,
     steer_admission: Arc<AtomicBool>,
@@ -151,7 +157,7 @@ impl AppServerHandle {
             })
     }
 
-    pub(super) async fn start_thread(&self, params: Value) -> Result<Value> {
+    pub(in crate::providers) async fn start_thread(&self, params: Value) -> Result<Value> {
         self.thread_rpc(ThreadRpcKind::Start, params).await
     }
 
@@ -176,7 +182,11 @@ impl AppServerHandle {
     /// Queue a model-bearing request and immediately return its cancellation
     /// lease. The lease exists before the actor attempts `turn/start`, so
     /// dropping a caller during the response race still requests interrupt.
-    pub(super) fn start_turn(&self, thread_id: String, input: Vec<Value>) -> Result<Submission> {
+    pub(in crate::providers) fn start_turn(
+        &self,
+        thread_id: String,
+        input: Vec<Value>,
+    ) -> Result<Submission> {
         if thread_id.is_empty() {
             anyhow::bail!("Codex thread id must not be empty");
         }
@@ -242,10 +252,10 @@ impl AppServerHandle {
             .map_err(anyhow::Error::msg)
     }
 
-    /// Wait until an acknowledged cancellation reaches a terminal event. New
-    /// turns use this barrier so an immediately retried prompt cannot overlap
-    /// the still-running turn it replaced.
-    pub(super) async fn wait_idle(&self) -> Result<()> {
+    /// Wait until every admitted protocol request and active turn has reached
+    /// a terminal state. New turns use this barrier so aborting a caller cannot
+    /// overlap an RPC or turn whose response is still in flight.
+    pub(in crate::providers) async fn wait_idle(&self) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.try_send_command(Command::WaitIdle { reply: reply_tx })?;
         reply_rx
@@ -255,14 +265,14 @@ impl AppServerHandle {
     }
 }
 
-pub(super) struct PersistentAppServer {
+pub(in crate::providers) struct PersistentAppServer {
     handle: AppServerHandle,
     shutdown_tx: mpsc::Sender<ShutdownCommand>,
     task: Option<JoinHandle<Result<()>>>,
 }
 
 impl PersistentAppServer {
-    pub(super) async fn connect(
+    pub(in crate::providers) async fn connect(
         spawner: Arc<dyn AppServerSpawner>,
         contract: Contract,
     ) -> Result<Self> {
@@ -296,11 +306,11 @@ impl PersistentAppServer {
         })
     }
 
-    pub(super) fn handle(&self) -> AppServerHandle {
+    pub(in crate::providers) fn handle(&self) -> AppServerHandle {
         self.handle.clone()
     }
 
-    pub(super) async fn shutdown(mut self) -> Result<()> {
+    pub(in crate::providers) async fn shutdown(mut self) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request_result = self
             .shutdown_tx
@@ -404,14 +414,19 @@ struct Connection {
 }
 
 enum PendingRequest {
-    ThreadRpc(oneshot::Sender<std::result::Result<Value, String>>),
+    ThreadRpc {
+        reply: oneshot::Sender<std::result::Result<Value, String>>,
+        deadline: Instant,
+    },
     TurnStart {
         submission_id: String,
+        deadline: Instant,
     },
     Steer {
         submission_id: String,
         _admission: SteerAdmission,
         reply: oneshot::Sender<std::result::Result<String, String>>,
+        deadline: Instant,
     },
     Interrupt {
         submission_id: String,
@@ -457,6 +472,7 @@ struct ActiveSubmission {
 struct ShutdownState {
     reply: Option<oneshot::Sender<std::result::Result<(), String>>>,
     deadline: Instant,
+    failure: Option<String>,
 }
 
 struct Actor {
@@ -477,6 +493,7 @@ enum ActorInput {
     Command(Option<Command>),
     ChannelsClosed,
     Frame(Result<Value>),
+    RpcDeadline,
     CancelDeadline,
     ShutdownDeadline,
 }
@@ -496,9 +513,22 @@ impl Actor {
                 .active
                 .as_ref()
                 .and_then(|active| active.cancel_deadline);
+            let rpc_deadline = self
+                .pending
+                .values()
+                .filter_map(|pending| match pending {
+                    PendingRequest::ThreadRpc { deadline, .. }
+                    | PendingRequest::TurnStart { deadline, .. }
+                    | PendingRequest::Steer { deadline, .. } => Some(*deadline),
+                    _ => None,
+                })
+                .min();
+            let has_rpc_deadline = rpc_deadline.is_some();
             let shutdown_deadline = self.shutdown.as_ref().map(|shutdown| shutdown.deadline);
             let expired_deadline = if cancel_deadline.is_some_and(|deadline| deadline <= now) {
                 Some(ActorInput::CancelDeadline)
+            } else if rpc_deadline.is_some_and(|deadline| deadline <= now) {
+                Some(ActorInput::RpcDeadline)
             } else if shutdown_deadline.is_some_and(|deadline| deadline <= now) {
                 Some(ActorInput::ShutdownDeadline)
             } else {
@@ -529,6 +559,7 @@ impl Actor {
                     ActorInput::CancellationNotice
                 } else if let Some(connection) = self.connection.as_mut() {
                     let cancel_deadline = cancel_deadline.unwrap_or(now);
+                    let rpc_deadline = rpc_deadline.unwrap_or(now);
                     let shutdown_deadline = shutdown_deadline.unwrap_or(now);
                     tokio::select! {
                         shutdown = shutdowns.recv(), if shutdowns_open => ActorInput::Shutdown(shutdown),
@@ -542,6 +573,10 @@ impl Actor {
                         _ = tokio::time::sleep_until(cancel_deadline),
                             if self.active.as_ref().is_some_and(|active| active.cancel_deadline.is_some()) => {
                             ActorInput::CancelDeadline
+                        }
+                        _ = tokio::time::sleep_until(rpc_deadline),
+                            if has_rpc_deadline => {
+                            ActorInput::RpcDeadline
                         }
                         _ = tokio::time::sleep_until(shutdown_deadline), if self.shutdown.is_some() => {
                             ActorInput::ShutdownDeadline
@@ -591,6 +626,13 @@ impl Actor {
                 ActorInput::Frame(Err(error)) => {
                     self.connection_lost(format!("Codex app-server connection failed: {error:#}"))
                         .await;
+                }
+                ActorInput::RpcDeadline => {
+                    self.connection_lost(
+                        "Codex app-server RPC acknowledgement timed out; delivery is uncertain"
+                            .into(),
+                    )
+                    .await;
                 }
                 ActorInput::CancelDeadline => {
                     self.connection_lost(
@@ -653,7 +695,7 @@ impl Actor {
             Command::Reconnect { reply } => {
                 if self.connection.is_some() {
                     let _ = reply.send(Ok(()));
-                } else if self.active.is_some() {
+                } else if !self.is_quiescent() {
                     let _ = reply.send(Err(
                         "cannot reconnect while a Codex delivery is uncertain".into()
                     ));
@@ -673,7 +715,7 @@ impl Actor {
             Command::WaitIdle { reply } => {
                 if self.shutdown.is_some() {
                     let _ = reply.send(Err("Codex app-server transport is shutting down".into()));
-                } else if self.active.is_some() {
+                } else if !self.is_quiescent() {
                     if self.idle_waiters.len() >= MAX_IDLE_WAITERS {
                         let _ = reply.send(Err("too many Codex idle waiters".into()));
                     } else {
@@ -705,7 +747,7 @@ impl Actor {
         if self
             .pending
             .values()
-            .filter(|pending| matches!(pending, PendingRequest::ThreadRpc(_)))
+            .filter(|pending| matches!(pending, PendingRequest::ThreadRpc { .. }))
             .count()
             >= MAX_PENDING_THREAD_RPCS
         {
@@ -731,8 +773,13 @@ impl Actor {
             self.connection_lost(detail).await;
             return;
         }
-        self.pending
-            .insert(request_id, PendingRequest::ThreadRpc(reply));
+        self.pending.insert(
+            request_id,
+            PendingRequest::ThreadRpc {
+                reply,
+                deadline: Instant::now() + RPC_ACK_TIMEOUT,
+            },
+        );
     }
 
     async fn start_turn(
@@ -802,8 +849,13 @@ impl Actor {
             .await;
             return;
         }
-        self.pending
-            .insert(request_id, PendingRequest::TurnStart { submission_id });
+        self.pending.insert(
+            request_id,
+            PendingRequest::TurnStart {
+                submission_id,
+                deadline: Instant::now() + RPC_ACK_TIMEOUT,
+            },
+        );
     }
 
     async fn steer_turn(
@@ -902,6 +954,7 @@ impl Actor {
                 submission_id: active.submission_id.clone(),
                 _admission: steer.admission,
                 reply: steer.reply,
+                deadline: Instant::now() + RPC_ACK_TIMEOUT,
             },
         );
         None
@@ -1026,11 +1079,11 @@ impl Actor {
             return;
         };
         match pending {
-            PendingRequest::ThreadRpc(reply) => {
+            PendingRequest::ThreadRpc { reply, .. } => {
                 self.handle_thread_rpc_response(reply, &frame, request_id)
                     .await;
             }
-            PendingRequest::TurnStart { submission_id } => {
+            PendingRequest::TurnStart { submission_id, .. } => {
                 self.handle_turn_start_response(&submission_id, &frame, request_id)
                     .await;
             }
@@ -1038,6 +1091,7 @@ impl Actor {
                 submission_id,
                 _admission: admission,
                 reply,
+                ..
             } => {
                 // Make the next steer admissible before waking this caller. On
                 // the multi-thread runtime, a reply receiver can otherwise win
@@ -1051,6 +1105,7 @@ impl Actor {
                     .await;
             }
         }
+        self.resolve_idle_waiters_if_quiescent();
     }
 
     async fn handle_thread_rpc_response(
@@ -1153,9 +1208,6 @@ impl Actor {
                     let _ = queued.reply.send(Err(error.clone()));
                 }
                 let _ = active.events.try_send(SubmissionEvent::Failed(error));
-                for waiter in self.idle_waiters.drain(..) {
-                    let _ = waiter.send(Ok(()));
-                }
             }
             TurnStartResponse::ProtocolViolation(detail) => {
                 self.active = Some(active);
@@ -1330,8 +1382,26 @@ impl Actor {
             .terminal_status
             .expect("terminal status checked above");
         let _ = active.events.try_send(SubmissionEvent::Terminal { status });
+        self.resolve_idle_waiters_if_quiescent();
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.active.is_none() && self.pending.is_empty()
+    }
+
+    fn resolve_idle_waiters_if_quiescent(&mut self) {
+        if !self.is_quiescent() {
+            return;
+        }
+        let result = if self.shutdown.is_some() {
+            Err("Codex app-server transport is shutting down".into())
+        } else if self.connection.is_some() {
+            Ok(())
+        } else {
+            Err("Codex app-server transport is disconnected".into())
+        };
         for waiter in self.idle_waiters.drain(..) {
-            let _ = waiter.send(Ok(()));
+            let _ = waiter.send(result.clone());
         }
     }
 
@@ -1350,6 +1420,7 @@ impl Actor {
         self.shutdown = Some(ShutdownState {
             reply,
             deadline: Instant::now() + SHUTDOWN_TIMEOUT,
+            failure: None,
         });
         if let Some(submission_id) = self
             .active
@@ -1361,14 +1432,28 @@ impl Actor {
     }
 
     async fn finish_shutdown(&mut self) {
-        if let Some(connection) = self.connection.take() {
-            close_connection(connection).await;
+        let mut failures = Vec::new();
+        if let Some(failure) = self
+            .shutdown
+            .as_ref()
+            .and_then(|shutdown| shutdown.failure.clone())
+        {
+            failures.push(failure);
         }
-        let result = if self.pending.is_empty() {
-            Ok(())
-        } else {
-            Err("Codex app-server stopped with pending protocol requests".into())
-        };
+        if let Some(connection) = self.connection.take() {
+            if let Err(error) = close_connection(connection).await {
+                failures.push(format!(
+                    "failed to close Codex app-server connection: {error:#}"
+                ));
+            }
+        }
+        if !self.pending.is_empty() {
+            failures.push("Codex app-server stopped with pending protocol requests".into());
+        }
+        let result = failures
+            .is_empty()
+            .then_some(())
+            .ok_or_else(|| failures.join("; additionally, "));
         self.fail_pending("Codex app-server transport shut down");
         self.fail_idle_waiters("Codex app-server transport shut down");
         if let Some(shutdown) = self.shutdown.take() {
@@ -1378,8 +1463,19 @@ impl Actor {
         }
     }
 
-    async fn connection_lost(&mut self, detail: String) {
-        if let Some(mut active) = self.active.take() {
+    async fn connection_lost(&mut self, mut detail: String) {
+        let active = self.active.take();
+        if let Some(connection) = self.connection.take() {
+            if let Err(error) = close_connection(connection).await {
+                detail.push_str(&format!(
+                    "; additionally, app-server cleanup failed: {error:#}"
+                ));
+            }
+        }
+        if let Some(shutdown) = self.shutdown.as_mut() {
+            shutdown.failure = Some(detail.clone());
+        }
+        if let Some(mut active) = active {
             for queued in active.queued_steers.drain(..) {
                 let _ = queued.reply.send(Err(detail.clone()));
             }
@@ -1389,15 +1485,12 @@ impl Actor {
         }
         self.fail_pending(&detail);
         self.fail_idle_waiters(&detail);
-        if let Some(connection) = self.connection.take() {
-            close_connection(connection).await;
-        }
     }
 
     fn fail_pending(&mut self, detail: &str) {
         for (_, pending) in self.pending.drain() {
             match pending {
-                PendingRequest::ThreadRpc(reply) => {
+                PendingRequest::ThreadRpc { reply, .. } => {
                     let _ = reply.send(Err(detail.to_owned()));
                 }
                 PendingRequest::Steer { reply, .. } => {
@@ -1621,8 +1714,12 @@ async fn connect_once(
     .context("timed out initializing Codex app-server")
     .and_then(|result| result);
     if let Err(error) = initialized {
-        close_initializing_connection(connection).await;
-        return Err(error);
+        return match close_initializing_connection(connection).await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error).context(format!(
+                "additionally failed to close rejected Codex app-server: {cleanup_error:#}"
+            )),
+        };
     }
     let InitializingConnection {
         reader,
@@ -1702,16 +1799,37 @@ async fn send_message_bounded(writer: &mut BoxWriter, message: &Value) -> Result
         .context("timed out writing to Codex app-server")?
 }
 
-async fn close_initializing_connection(mut connection: InitializingConnection) {
-    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.writer.shutdown()).await;
-    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.child.shutdown()).await;
+async fn close_initializing_connection(mut connection: InitializingConnection) -> Result<()> {
+    close_writer_and_child(&mut connection.writer, connection.child.as_mut()).await
 }
 
-async fn close_connection(mut connection: Connection) {
+async fn close_connection(mut connection: Connection) -> Result<()> {
     connection.reader_task.abort();
     let _ = connection.reader_task.await;
-    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.writer.shutdown()).await;
-    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.child.shutdown()).await;
+    close_writer_and_child(&mut connection.writer, connection.child.as_mut()).await
+}
+
+async fn close_writer_and_child(
+    writer: &mut BoxWriter,
+    child: &mut dyn ChildControl,
+) -> Result<()> {
+    // Always attempt both halves. Closing stdin gives app-server its graceful
+    // EOF, while ChildControl is the authoritative process-group reap path.
+    let writer_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, writer.shutdown())
+        .await
+        .context("timed out closing Codex app-server stdin")
+        .and_then(|result| result.context("failed to close Codex app-server stdin"));
+    let child_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.shutdown())
+        .await
+        .context("timed out reaping Codex app-server")
+        .and_then(|result| result.context("failed to reap Codex app-server"));
+    match (writer_result, child_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(writer_error), Err(child_error)) => Err(writer_error).context(format!(
+            "additionally failed to reap Codex app-server: {child_error:#}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1727,12 +1845,20 @@ mod tests {
 
     struct FakeChild {
         shutdowns: Arc<AtomicUsize>,
+        failure: Option<&'static str>,
     }
 
     impl ChildControl for FakeChild {
         fn shutdown(&mut self) -> BoxFuture<'_, Result<()>> {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
-            async { Ok(()) }.boxed()
+            let failure = self.failure;
+            async move {
+                match failure {
+                    Some(failure) => anyhow::bail!(failure),
+                    None => Ok(()),
+                }
+            }
+            .boxed()
         }
     }
 
@@ -1740,6 +1866,7 @@ mod tests {
         streams: Mutex<VecDeque<DuplexStream>>,
         spawns: Arc<AtomicUsize>,
         shutdowns: Arc<AtomicUsize>,
+        shutdown_failure: Option<&'static str>,
     }
 
     impl AppServerSpawner for FakeSpawner {
@@ -1747,6 +1874,7 @@ mod tests {
             let stream = self.streams.lock().expect("fake spawner lock").pop_front();
             let spawns = Arc::clone(&self.spawns);
             let shutdowns = Arc::clone(&self.shutdowns);
+            let failure = self.shutdown_failure;
             async move {
                 let stream = stream.context("fake app-server has no connection")?;
                 spawns.fetch_add(1, Ordering::SeqCst);
@@ -1754,7 +1882,7 @@ mod tests {
                 Ok(SpawnedAppServer {
                     reader: Box::pin(reader),
                     writer: Box::pin(writer),
-                    child: Box::new(FakeChild { shutdowns }),
+                    child: Box::new(FakeChild { shutdowns, failure }),
                 })
             }
             .boxed()
@@ -1769,19 +1897,35 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
     ) {
+        fixture_with_shutdown_failure(client_streams, None)
+    }
+
+    fn fixture_with_shutdown_failure(
+        client_streams: Vec<DuplexStream>,
+        shutdown_failure: Option<&'static str>,
+    ) -> (
+        Arc<FakeSpawner>,
+        Contract,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
         let spawns = Arc::new(AtomicUsize::new(0));
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let spawner = Arc::new(FakeSpawner {
             streams: Mutex::new(client_streams.into()),
             spawns: Arc::clone(&spawns),
             shutdowns: Arc::clone(&shutdowns),
+            shutdown_failure,
         });
         let contract = Contract {
-            profile: "unused-by-transport".into(),
             model: "unused-by-transport".into(),
             cwd: std::env::current_dir().expect("test cwd"),
             workspace_roots: Vec::new(),
             codex_home: "/tmp/fake-persistent-codex-home".into(),
+            sandbox: ContractSandbox::AdvisoryProfile {
+                profile: "unused-by-transport".into(),
+            },
+            developer_instructions: None,
         };
         (spawner, contract, spawns, shutdowns)
     }
@@ -2043,6 +2187,7 @@ mod tests {
                 submission_id: "submission-1".into(),
                 _admission: admission,
                 reply: steer_reply,
+                deadline: Instant::now() + RPC_ACK_TIMEOUT,
             },
         );
         let cancel_notify = Arc::new(Notify::new());
@@ -2117,6 +2262,244 @@ mod tests {
             .expect("actor task")
             .expect("actor completed cleanly");
         assert!(!steer_occupied.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn idle_barrier_waits_for_an_abandoned_thread_rpc() {
+        let (client, mut server) = duplex(64 * 1024);
+        let (spawner, contract, _, _) = fixture(vec![client]);
+        let (request_seen_tx, request_seen_rx) = test_oneshot::channel();
+        let (release_response_tx, release_response_rx) = test_oneshot::channel();
+        let (release_server_tx, release_server_rx) = test_oneshot::channel();
+        let fake = tokio::spawn(async move {
+            serve_initialize(&mut server, "/tmp/fake-persistent-codex-home").await;
+            let mut reader = BufReader::new(&mut server);
+            let thread = next_request(&mut reader, "thread/start").await;
+            request_seen_tx.send(()).expect("signal thread request");
+            release_response_rx.await.expect("release thread response");
+            send_message(
+                reader.get_mut(),
+                &json!({"id": thread["id"], "result": {"thread": {"id": "thread-1"}}}),
+            )
+            .await
+            .expect("thread response");
+            release_server_rx.await.expect("hold fake server open");
+        });
+
+        let runtime = PersistentAppServer::connect(spawner, contract)
+            .await
+            .expect("connect transport");
+        let handle = runtime.handle();
+        let rpc_handle = handle.clone();
+        let rpc = tokio::spawn(async move { rpc_handle.start_thread(json!({})).await });
+        request_seen_rx.await.expect("thread request observed");
+        rpc.abort();
+        assert!(rpc
+            .await
+            .expect_err("abandoned RPC task must be cancelled")
+            .is_cancelled());
+
+        let idle_handle = handle.clone();
+        let idle = tokio::spawn(async move { idle_handle.wait_idle().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !idle.is_finished(),
+            "idle barrier released while abandoned thread RPC remained pending"
+        );
+        release_response_tx
+            .send(())
+            .expect("release abandoned RPC response");
+        idle.await
+            .expect("idle barrier task")
+            .expect("response makes transport quiescent");
+
+        runtime.shutdown().await.expect("shutdown transport");
+        release_server_tx.send(()).expect("release fake server");
+        fake.await.expect("fake app-server");
+    }
+
+    #[tokio::test]
+    async fn stalled_thread_rpc_times_out_and_releases_idle_waiters() {
+        let (client, mut server) = duplex(64 * 1024);
+        let (spawner, contract, _, _) = fixture(vec![client]);
+        let (request_seen_tx, request_seen_rx) = test_oneshot::channel();
+        let (release_server_tx, release_server_rx) = test_oneshot::channel();
+        let fake = tokio::spawn(async move {
+            serve_initialize(&mut server, "/tmp/fake-persistent-codex-home").await;
+            let mut reader = BufReader::new(&mut server);
+            let _thread = next_request(&mut reader, "thread/start").await;
+            request_seen_tx.send(()).expect("signal thread request");
+            release_server_rx.await.expect("hold fake server open");
+        });
+
+        let runtime = PersistentAppServer::connect(spawner, contract)
+            .await
+            .expect("connect transport");
+        let handle = runtime.handle();
+        let rpc_handle = handle.clone();
+        let rpc = tokio::spawn(async move { rpc_handle.start_thread(json!({})).await });
+        request_seen_rx.await.expect("thread request observed");
+        let idle_handle = handle.clone();
+        let idle = tokio::spawn(async move { idle_handle.wait_idle().await });
+
+        let rpc_error = tokio::time::timeout(Duration::from_secs(2), rpc)
+            .await
+            .expect("thread RPC timeout stayed bounded")
+            .expect("thread RPC task")
+            .expect_err("stalled thread RPC must fail")
+            .to_string();
+        assert!(
+            rpc_error.contains("RPC acknowledgement timed out"),
+            "{rpc_error}"
+        );
+        let idle_error = tokio::time::timeout(Duration::from_secs(2), idle)
+            .await
+            .expect("idle barrier timeout stayed bounded")
+            .expect("idle barrier task")
+            .expect_err("stalled RPC must fail idle barrier")
+            .to_string();
+        assert!(
+            idle_error.contains("RPC acknowledgement timed out"),
+            "{idle_error}"
+        );
+
+        runtime.shutdown().await.expect("shutdown transport");
+        release_server_tx.send(()).expect("release fake server");
+        fake.await.expect("fake app-server");
+    }
+
+    #[tokio::test]
+    async fn stalled_turn_start_acknowledgement_becomes_delivery_uncertain() {
+        let (client, mut server) = duplex(64 * 1024);
+        let (spawner, contract, _, _) = fixture(vec![client]);
+        let (request_seen_tx, request_seen_rx) = test_oneshot::channel();
+        let (release_server_tx, release_server_rx) = test_oneshot::channel();
+        let fake = tokio::spawn(async move {
+            serve_initialize(&mut server, "/tmp/fake-persistent-codex-home").await;
+            let mut reader = BufReader::new(&mut server);
+            let _turn = next_request(&mut reader, "turn/start").await;
+            request_seen_tx.send(()).expect("signal turn request");
+            release_server_rx.await.expect("hold fake server open");
+        });
+
+        let runtime = PersistentAppServer::connect(spawner, contract)
+            .await
+            .expect("connect transport");
+        let handle = runtime.handle();
+        let mut submission = handle
+            .start_turn(
+                "thread-1".into(),
+                vec![json!({"type": "text", "text": "go"})],
+            )
+            .expect("admit turn");
+        request_seen_rx.await.expect("turn request observed");
+        let event = tokio::time::timeout(Duration::from_secs(2), submission.next_event())
+            .await
+            .expect("turn acknowledgement timeout stayed bounded")
+            .expect("delivery uncertainty event");
+        assert!(
+            matches!(&event, SubmissionEvent::DeliveryUncertain(detail) if detail.contains("RPC acknowledgement timed out")),
+            "unexpected event: {event:?}"
+        );
+
+        runtime.shutdown().await.expect("shutdown transport");
+        release_server_tx.send(()).expect("release fake server");
+        fake.await.expect("fake app-server");
+    }
+
+    #[tokio::test]
+    async fn stalled_steer_acknowledgement_becomes_delivery_uncertain() {
+        let (client, mut server) = duplex(64 * 1024);
+        let (spawner, contract, _, _) = fixture(vec![client]);
+        let (steer_seen_tx, steer_seen_rx) = test_oneshot::channel();
+        let (release_server_tx, release_server_rx) = test_oneshot::channel();
+        let fake = tokio::spawn(async move {
+            serve_initialize(&mut server, "/tmp/fake-persistent-codex-home").await;
+            let mut reader = BufReader::new(&mut server);
+            let turn = next_request(&mut reader, "turn/start").await;
+            send_message(
+                reader.get_mut(),
+                &json!({
+                    "id": turn["id"],
+                    "result": {"turn": {"id": "turn-1", "status": "inProgress"}}
+                }),
+            )
+            .await
+            .expect("turn response");
+            let _steer = next_request(&mut reader, "turn/steer").await;
+            steer_seen_tx.send(()).expect("signal steer request");
+            release_server_rx.await.expect("hold fake server open");
+        });
+
+        let runtime = PersistentAppServer::connect(spawner, contract)
+            .await
+            .expect("connect transport");
+        let handle = runtime.handle();
+        let mut submission = handle
+            .start_turn(
+                "thread-1".into(),
+                vec![json!({"type": "text", "text": "go"})],
+            )
+            .expect("admit turn");
+        let started = submission.next_event().await.expect("turn started event");
+        assert!(matches!(started, SubmissionEvent::Started { ref turn_id } if turn_id == "turn-1"));
+        let submission_id = submission.id().to_owned();
+        let steer_handle = handle.clone();
+        let steer = tokio::spawn(async move {
+            steer_handle
+                .steer_turn(submission_id, vec![json!({"type": "text", "text": "more"})])
+                .await
+        });
+        steer_seen_rx.await.expect("steer request observed");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), submission.next_event())
+            .await
+            .expect("steer acknowledgement timeout stayed bounded")
+            .expect("delivery uncertainty event");
+        assert!(
+            matches!(&event, SubmissionEvent::DeliveryUncertain(detail) if detail.contains("RPC acknowledgement timed out")),
+            "unexpected event: {event:?}"
+        );
+        let steer_error = steer
+            .await
+            .expect("steer task")
+            .expect_err("stalled steer must fail")
+            .to_string();
+        assert!(
+            steer_error.contains("RPC acknowledgement timed out"),
+            "{steer_error}"
+        );
+
+        runtime.shutdown().await.expect("shutdown transport");
+        release_server_tx.send(()).expect("release fake server");
+        fake.await.expect("fake app-server");
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_reports_child_reaping_failure() {
+        let (client, mut server) = duplex(64 * 1024);
+        let (spawner, contract, _, shutdowns) =
+            fixture_with_shutdown_failure(vec![client], Some("synthetic child reap failure"));
+        let fake = tokio::spawn(async move {
+            serve_initialize(&mut server, "/tmp/fake-persistent-codex-home").await;
+            let mut reader = BufReader::new(&mut server);
+            assert!(
+                read_message(&mut reader).await.is_err(),
+                "shutdown must close app-server stdin"
+            );
+        });
+
+        let runtime = PersistentAppServer::connect(spawner, contract)
+            .await
+            .expect("connect transport");
+        let error = runtime
+            .shutdown()
+            .await
+            .expect_err("child reap failure must reach the owner")
+            .to_string();
+        assert!(error.contains("synthetic child reap failure"), "{error}");
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        fake.await.expect("fake app-server");
     }
 
     #[tokio::test]

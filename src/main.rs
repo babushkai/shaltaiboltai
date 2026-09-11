@@ -68,8 +68,10 @@ OPTIONS:
 
 With no options it launches the interactive TUI. Configure providers via
 ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / a running Ollama,
-or a logged-in `claude` / `codex` CLI for subscription use on Unix. See the
-README for details.";
+or a logged-in `claude` / `codex` CLI for subscription use on Unix.
+Persistent Codex chat requires CLI 0.153.4, a file-backed login, and an exact
+`--model codex:<model>` selector. Bare `codex` remains stateless. See the README
+for details.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalDecision {
@@ -280,58 +282,97 @@ async fn run(
     environment.tick().await;
     let mut frames = FrameLimiter::new(Instant::now());
 
-    while !app.should_quit {
-        submit_initial_prompt_when_ready(&mut app, &mut pending_initial_prompt);
-        let now = Instant::now();
-        if frames.is_ready(now) {
-            terminal.draw(|frame| {
-                if let Some(native_mascot) = native_mascot {
-                    ui::draw_with_native_mascot(frame, &mut app, native_mascot);
-                } else {
-                    ui::draw(frame, &mut app);
-                }
-            })?;
-            frames.mark_drawn(now);
-        }
+    let loop_result: anyhow::Result<()> = async {
+        while !app.should_quit {
+            submit_initial_prompt_when_ready(&mut app, &mut pending_initial_prompt);
+            let now = Instant::now();
+            if frames.is_ready(now) {
+                terminal.draw(|frame| {
+                    if let Some(native_mascot) = native_mascot {
+                        ui::draw_with_native_mascot(frame, &mut app, native_mascot);
+                    } else {
+                        ui::draw(frame, &mut app);
+                    }
+                })?;
+                frames.mark_drawn(now);
+            }
 
-        let redraw_deadline = frames.next_draw_at;
+            let redraw_deadline = frames.next_draw_at;
 
-        tokio::select! {
-            // A pending draw that was coalesced during the frame interval gets
-            // one precise wake-up even when no further terminal event arrives.
-            _ = tokio::time::sleep_until(redraw_deadline), if frames.redraw_pending => {}
-            Some(event) = rx.recv() => {
-                app.on_event(event);
-                // Coalesce a bounded burst into one redraw, then yield back to
-                // terminal input. An unbounded high-rate stream must not starve
-                // Esc/Ctrl+C or type-ahead key handling.
-                for _ in 0..255 {
-                    let Ok(event) = rx.try_recv() else {
-                        break;
-                    };
+            tokio::select! {
+                // A pending draw that was coalesced during the frame interval gets
+                // one precise wake-up even when no further terminal event arrives.
+                _ = tokio::time::sleep_until(redraw_deadline), if frames.redraw_pending => {}
+                Some(event) = rx.recv() => {
                     app.on_event(event);
+                    // Coalesce a bounded burst into one redraw, then yield back to
+                    // terminal input. An unbounded high-rate stream must not starve
+                    // Esc/Ctrl+C or type-ahead key handling.
+                    for _ in 0..255 {
+                        let Ok(event) = rx.try_recv() else {
+                            break;
+                        };
+                        app.on_event(event);
+                    }
+                }
+                event = term_events.next() => match event {
+                    Some(Ok(event)) => match event {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
+                        Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
+                        Event::Paste(text) => app.paste(&text),
+                        Event::Resize(_, _) => app.invalidate_orchestration_confirm_layout(),
+                        _ => {}
+                    },
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err(anyhow::anyhow!("terminal event stream ended unexpectedly")),
+                },
+                // A persistent clock keeps the mascot moving even during dense
+                // provider streams; recreating sleeps on every event can starve it.
+                _ = animation.tick(), if app.needs_animation() => app.advance_animation(),
+                // Idle: pick up external changes (e.g. a branch switch in another
+                // terminal) for the statusline.
+                _ = environment.tick(), if !app.is_busy() => {
+                    app.refresh_environment();
                 }
             }
-            Some(Ok(event)) = term_events.next() => match event {
-                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
-                Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
-                Event::Paste(text) => app.paste(&text),
-                Event::Resize(_, _) => app.invalidate_orchestration_confirm_layout(),
-                _ => {}
-            },
-            // A persistent clock keeps the mascot moving even during dense
-            // provider streams; recreating sleeps on every event can starve it.
-            _ = animation.tick(), if app.needs_animation() => app.advance_animation(),
-            // Idle: pick up external changes (e.g. a branch switch in another
-            // terminal) for the statusline.
-            _ = environment.tick(), if !app.is_busy() => {
-                app.refresh_environment();
-            }
+            frames.request_redraw();
         }
-        frames.request_redraw();
+        Ok(())
     }
-    app.save_session_for_exit()?;
-    Ok(())
+    .await;
+
+    // Finalization is unconditional: terminal I/O failures must cancel owned
+    // tasks and still save/reap before the error is returned to the restored
+    // shell.
+    app.prepare_for_exit();
+    let save_result = app.save_session_for_exit();
+    let shutdown_result = app.shutdown_provider_runtime().await;
+    combine_exit_results(loop_result, save_result, shutdown_result)
+}
+
+fn combine_exit_results(
+    loop_result: anyhow::Result<()>,
+    save_result: anyhow::Result<()>,
+    shutdown_result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = loop_result {
+        failures.push(format!("terminal event loop failed: {error:#}"));
+    }
+    if let Err(error) = save_result {
+        failures.push(format!("failed to save session: {error:#}"));
+    }
+    if let Err(error) = shutdown_result {
+        failures.push(format!("provider runtime shutdown failed: {error:#}"));
+    }
+    match failures.split_first() {
+        None => Ok(()),
+        Some((primary, [])) => Err(anyhow::anyhow!(primary.clone())),
+        Some((primary, additional)) => Err(anyhow::anyhow!(
+            "{primary}; additionally, {}",
+            additional.join("; additionally, ")
+        )),
+    }
 }
 
 fn submit_initial_prompt_when_ready(app: &mut App, pending: &mut Option<String>) {
@@ -702,6 +743,40 @@ mod tests {
     use shaltaiboltai::orchestration::PlannedTask;
     use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn exit_error_preserves_save_and_provider_shutdown_failures() {
+        let error = combine_exit_results(
+            Ok(()),
+            Err(anyhow::anyhow!("session storage unavailable")),
+            Err(anyhow::anyhow!("Codex process did not stop")),
+        )
+        .expect_err("both exit failures must be reported")
+        .to_string();
+
+        assert!(error.contains("session storage unavailable"));
+        assert!(error.contains("Codex process did not stop"));
+        assert!(
+            error.find("session storage unavailable").unwrap()
+                < error.find("Codex process did not stop").unwrap(),
+            "the possible session data loss must remain the primary failure"
+        );
+    }
+
+    #[test]
+    fn exit_error_preserves_event_loop_and_all_finalizer_failures() {
+        let error = combine_exit_results(
+            Err(anyhow::anyhow!("terminal disconnected")),
+            Err(anyhow::anyhow!("session storage unavailable")),
+            Err(anyhow::anyhow!("Codex process did not stop")),
+        )
+        .expect_err("every lifecycle failure must be reported")
+        .to_string();
+
+        assert!(error.starts_with("terminal event loop failed: terminal disconnected"));
+        assert!(error.contains("failed to save session: session storage unavailable"));
+        assert!(error.contains("provider runtime shutdown failed: Codex process did not stop"));
+    }
 
     #[test]
     fn frame_limiter_coalesces_requests_at_120_fps() {
