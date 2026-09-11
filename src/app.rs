@@ -4,8 +4,8 @@ use crate::mascot::MascotState;
 use crate::orchestration::{self, PlannedTask, WorkerOutcome};
 use crate::policy::{ApprovalPolicy, ExecutionPolicy, PermissionPreset, SandboxMode, Workspace};
 use crate::providers::{
-    self, ChatEvent, ChatRequest, ImageData, Message, ModelEntry, ProviderKind, RequestPolicy,
-    ToolCall, Usage, UserContent,
+    self, ChatEvent, ChatRequest, ImageData, Message, ModelEntry, ProviderKind, ProviderRuntime,
+    RequestPolicy, ToolCall, Usage, UserContent,
 };
 use crate::session;
 use crate::theme::{self, Theme};
@@ -419,6 +419,9 @@ pub enum Entry {
 
 pub struct App {
     pub config: Config,
+    /// Provider processes and native conversation state owned by this app.
+    /// Clones handed to request tasks share the same underlying runtime.
+    provider_runtime: ProviderRuntime,
     /// Single effective authority used by status, tools, and provider launches.
     pub policy: ExecutionPolicy,
     pub mode: Mode,
@@ -575,6 +578,7 @@ impl App {
         let discovery_models = models.clone();
         let mut app = App {
             config,
+            provider_runtime: ProviderRuntime::default(),
             policy,
             mode: Mode::Input,
             should_quit: false,
@@ -1802,15 +1806,21 @@ impl App {
         )));
 
         let config = self.config.clone();
+        let provider_runtime = self.provider_runtime.clone();
         let tx = self.tx.clone();
         self.orchestration_task = Some(tokio::spawn(async move {
-            let result = orchestration::collect_planner_request(config, request)
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|text| {
-                    orchestration::parse_plan(&text, &worker_models, worker_count)
-                        .map_err(|error| error.to_string())
-                });
+            let result = match provider_runtime.prepare_stateless_boundary().await {
+                Ok(()) => orchestration::collect_planner_request(config, request)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(format!(
+                    "could not finish the previous Codex session before team planning: {error:#}"
+                )),
+            }
+            .and_then(|text| {
+                orchestration::parse_plan(&text, &worker_models, worker_count)
+                    .map_err(|error| error.to_string())
+            });
             let _ = tx.send(AppEvent::OrchestrationPlanned { run_id, result });
         }));
     }
@@ -1909,19 +1919,34 @@ impl App {
         self.orchestration_confirm_layout_ready = false;
 
         let config = self.config.clone();
+        let provider_runtime = self.provider_runtime.clone();
         let tx = self.tx.clone();
         self.orchestration_task = Some(tokio::spawn(async move {
+            let boundary_error = provider_runtime
+                .prepare_stateless_boundary()
+                .await
+                .err()
+                .map(|error| {
+                    format!(
+                        "could not finish the previous Codex session before team workers: {error:#}"
+                    )
+                });
             let mut workers = FuturesUnordered::new();
             for task in tasks {
                 let config = config.clone();
+                let boundary_error = boundary_error.clone();
                 let request =
                     orchestration::worker_request(&history, &task_text, &task, &execution_policy);
                 workers.push(async move {
-                    let result = match request {
-                        Ok(request) => orchestration::collect_worker_request(config, request)
-                            .await
-                            .map_err(|error| error.to_string()),
-                        Err(error) => Err(error),
+                    let result = if let Some(error) = boundary_error {
+                        Err(error)
+                    } else {
+                        match request {
+                            Ok(request) => orchestration::collect_worker_request(config, request)
+                                .await
+                                .map_err(|error| error.to_string()),
+                            Err(error) => Err(error),
+                        }
                     };
                     WorkerOutcome {
                         id: task.id,
@@ -2848,13 +2873,14 @@ impl App {
         self.gen += 1;
         let gen = self.gen;
         let config = self.config.clone();
+        let provider_runtime = self.provider_runtime.clone();
         let tx = self.tx.clone();
         self.request_task = Some(tokio::spawn(async move {
             let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
             // Keep the provider future inside this task. Aborting the task now
             // drops HTTP streams and kill-on-drop CLI children as well as the
             // event forwarder, instead of detaching provider work.
-            let stream = providers::stream_chat(config, request, chat_tx);
+            let stream = provider_runtime.stream_chat(config, request, chat_tx);
             forward_chat_stream(gen, stream, chat_rx, tx).await;
         }));
     }
@@ -2867,12 +2893,15 @@ impl App {
             tools::definitions()
         };
         let has_team_context = self.orchestration_context.is_some();
+        let continuity_id = (model.provider == ProviderKind::Codex && !has_team_context)
+            .then(|| self.session_id.clone());
         let execution_policy = self
             .active_execution_policy
             .clone()
             .unwrap_or_else(|| self.policy.clone());
         let request = ChatRequest {
             model,
+            continuity_id,
             system: match self.orchestration_context.as_deref() {
                 Some(context) => format!("{}\n\n{context}", system_prompt(&execution_policy)),
                 None => system_prompt(&execution_policy),
@@ -3169,6 +3198,48 @@ impl App {
     /// the last frame was already drawn.
     pub fn save_session_for_exit(&self) -> anyhow::Result<()> {
         self.persist_session()
+    }
+
+    /// Stop provider processes after the final session snapshot has been
+    /// attempted. The runtime itself is shared by in-flight request clones,
+    /// so its shutdown barrier is the authoritative end of provider work.
+    pub async fn shutdown_provider_runtime(&self) -> anyhow::Result<()> {
+        self.provider_runtime.shutdown().await
+    }
+
+    /// Abort every owned task before final persistence/runtime shutdown. This
+    /// is unconditional (unlike the two-step interactive quit UX), so an
+    /// unexpected terminal I/O failure cannot detach provider work. Any text
+    /// already rendered from an interrupted assistant turn is retained in the
+    /// final session snapshot.
+    pub fn prepare_for_exit(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        self.compaction_gen = self.compaction_gen.wrapping_add(1);
+        self.orchestration_gen = self.orchestration_gen.wrapping_add(1);
+        if let Some(task) = self.request_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.tool_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.compaction_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.orchestration_task.take() {
+            task.abort();
+        }
+        self.pending_calls.clear();
+        // Close an interrupted tool round before appending a partially
+        // streamed follow-up assistant turn. `repair_dangling_tool_calls`
+        // deliberately examines the latest assistant message only.
+        self.repair_dangling_tool_calls();
+        let partial = std::mem::take(&mut self.streaming_text);
+        if !partial.is_empty() {
+            self.history.push(Message::Assistant {
+                text: partial,
+                tool_calls: Vec::new(),
+            });
+        }
     }
 
     fn persist_session(&self) -> anyhow::Result<()> {
@@ -3484,6 +3555,7 @@ impl App {
         );
         let request = ChatRequest {
             model,
+            continuity_id: None,
             system: "You compress coding-assistant conversations into handoff summaries.".into(),
             messages: vec![Message::User(UserContent::Text(format!(
                 "Summarize the conversation below so a successor agent can continue seamlessly. \
@@ -3498,13 +3570,14 @@ impl App {
         };
         let session_id = self.session_id.clone();
         let config = self.config.clone();
+        let provider_runtime = self.provider_runtime.clone();
         let tx = self.tx.clone();
         self.compaction_task = Some(tokio::spawn(async move {
             let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel();
             // Keep the provider future inside the owned task. Aborting this
             // handle on /new, /resume, or quit now drops HTTP streams and
             // kill-on-drop CLI children instead of leaving billed work behind.
-            let stream = providers::stream_chat(config, request, chat_tx);
+            let stream = provider_runtime.stream_chat(config, request, chat_tx);
             let result = collect_compaction_stream(stream, &mut chat_rx).await;
             let _ = tx.send(AppEvent::CompactionDone {
                 session_id,
@@ -4100,6 +4173,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exit_finalization_aborts_owned_tasks_and_preserves_valid_history() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(offline_config(), tx);
+        let dangling = ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        };
+        app.history.push(Message::Assistant {
+            text: "checking".into(),
+            tool_calls: vec![dangling.clone()],
+        });
+        app.pending_calls.push_back(dangling);
+        app.streaming_text = "partial answer".into();
+
+        let mut abort_handles = Vec::new();
+        for slot in [
+            &mut app.request_task,
+            &mut app.tool_task,
+            &mut app.compaction_task,
+            &mut app.orchestration_task,
+        ] {
+            let task = tokio::spawn(std::future::pending::<()>());
+            abort_handles.push(task.abort_handle());
+            *slot = Some(task);
+        }
+        tokio::task::yield_now().await;
+
+        app.prepare_for_exit();
+        tokio::task::yield_now().await;
+
+        assert!(abort_handles
+            .iter()
+            .all(tokio::task::AbortHandle::is_finished));
+        assert!(app.request_task.is_none());
+        assert!(app.tool_task.is_none());
+        assert!(app.compaction_task.is_none());
+        assert!(app.orchestration_task.is_none());
+        assert!(app.pending_calls.is_empty());
+        assert!(app.streaming_text.is_empty());
+        assert!(matches!(
+            app.history.as_slice(),
+            [
+                Message::Assistant { tool_calls, .. },
+                Message::ToolResult {
+                    call_id,
+                    is_error: true,
+                    ..
+                },
+                Message::Assistant {
+                    text,
+                    tool_calls: partial_calls,
+                }
+            ] if tool_calls.len() == 1
+                && call_id == "call-1"
+                && text == "partial answer"
+                && partial_calls.is_empty()
+        ));
+    }
+
+    #[tokio::test]
     async fn team_command_arms_one_shot_and_validates_bounds() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(offline_config(), tx);
@@ -4504,12 +4638,33 @@ mod tests {
 
         let ordinary = app.active_chat_request(lead.clone());
         assert!(!ordinary.force_full_handoff);
+        assert_eq!(
+            ordinary.continuity_id.as_deref(),
+            Some(app.session_id.as_str()),
+            "ordinary Codex turns must reuse the saved UI conversation identity"
+        );
 
         app.orchestration_context = Some("UNTRUSTED WORKER EVIDENCE".into());
         let synthesis = app.active_chat_request(lead);
         assert!(synthesis.force_full_handoff);
+        assert_eq!(
+            synthesis.continuity_id, None,
+            "team synthesis must remain isolated from persistent Codex state"
+        );
         assert!(synthesis.system.contains("UNTRUSTED WORKER EVIDENCE"));
         assert_eq!(synthesis.policy, RequestPolicy::Interactive);
+    }
+
+    #[tokio::test]
+    async fn non_codex_requests_do_not_claim_native_continuity() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(offline_config(), tx);
+        let request = app.active_chat_request(ModelEntry {
+            provider: ProviderKind::OpenAi,
+            id: "gpt-test".into(),
+        });
+
+        assert_eq!(request.continuity_id, None);
     }
 
     #[tokio::test]

@@ -5,6 +5,14 @@
 //! tool definitions and approval UI do not apply inside the child. Every child
 //! therefore receives an explicit, fail-closed snapshot of app authority.
 
+mod codex_runtime;
+
+pub(super) use codex_runtime::CodexRuntime;
+
+use super::codex_app_server::persistent::{
+    AppServerSpawner, BoxReader as CodexAppServerReader, BoxWriter as CodexAppServerWriter,
+    ChildControl as CodexAppServerChildControl, SpawnedAppServer,
+};
 #[cfg(test)]
 use super::codex_app_server::{
     attest_initialize as attest_codex_app_server_initialize,
@@ -16,17 +24,21 @@ use super::codex_app_server::{
 };
 use super::codex_app_server::{
     run_one_turn as run_codex_app_server_protocol, Contract as CodexAppServerContract,
+    ContractSandbox as CodexContractSandbox,
 };
 use super::{ChatEvent, ChatRequest, Config, Message, RequestPolicy, Usage};
-use crate::policy::{ApprovalPolicy, ExecutionPolicy, SandboxMode};
+use crate::policy::{
+    protected_metadata_paths_for_roots, ApprovalPolicy, ExecutionPolicy, SandboxMode,
+};
 use anyhow::{Context, Result};
+use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -35,6 +47,7 @@ use std::os::unix::process::CommandExt;
 
 const STDERR_CAPTURE_BYTES: usize = 16_000;
 const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
+const APP_SERVER_GRACEFUL_SHUTDOWN: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_CODEX_MODEL_CACHE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_MODELS: usize = 64;
 const MAX_CODEX_MODEL_ID_CHARS: usize = 256;
@@ -93,6 +106,8 @@ const CODEX_CONSTRAINED_CONFIG: &[&str] = &[
     "features.skill_mcp_dependency_install=false",
 ];
 const CODEX_ADVISORY_PROFILE_PREFIX: &str = "shaltaiboltai-advisory-";
+const CODEX_WORKSPACE_PROFILE_PREFIX: &str = "shaltaiboltai-workspace-";
+const PROTECTED_METADATA_NAMES: [&str; 3] = [".git", ".agents", ".codex"];
 const CODEX_ADVISORY_FILESYSTEM: &str =
     r#"filesystem={":root"="deny",":minimal"="read",":workspace_roots"={"."="read"}}"#;
 
@@ -160,6 +175,26 @@ struct CodexAppServerLaunch {
     candidate: &'static ResolvedCliCandidate,
     contract: CodexAppServerContract,
     _isolated_home: IsolatedCodexHome,
+}
+
+/// Immutable production launch identity for the persistent Codex
+/// transport. Reconnects reuse the same executable snapshot, isolated home,
+/// authentication identity, and execution-policy generation.
+pub(super) struct CodexAppServerSpawner {
+    candidate: ResolvedCliCandidate,
+    execution_policy: ExecutionPolicy,
+    sandbox: CodexContractSandbox,
+    isolated_home: Arc<IsolatedCodexHome>,
+}
+
+struct CodexAppServerChild {
+    child: Option<tokio::process::Child>,
+    #[cfg(unix)]
+    process_group: Option<ProcessGroupGuard>,
+    stderr_task: Option<tokio::task::JoinHandle<String>>,
+    // Keep the private home and its auth symlink alive until the last child
+    // using them has been terminated, even if the factory is dropped first.
+    _isolated_home: Arc<IsolatedCodexHome>,
 }
 
 struct IsolatedCodexHome {
@@ -273,6 +308,110 @@ impl ProcessGroupGuard {
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         let _ = self.terminate();
+    }
+}
+
+impl CodexAppServerChild {
+    async fn finish_stderr(&mut self) -> String {
+        match self.stderr_task.take() {
+            Some(task) => finish_stderr_drain(task).await,
+            None => String::new(),
+        }
+    }
+
+    async fn shutdown_inner(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            let _ = self.finish_stderr().await;
+            return Ok(());
+        };
+
+        #[cfg(unix)]
+        let mut process_group = self
+            .process_group
+            .take()
+            .context("Codex app-server process group was already released")?;
+
+        // The persistent transport closes stdin before asking the child to
+        // stop. Give app-server a short opportunity to observe EOF and exit,
+        // then terminate the complete owned process group so descendants
+        // cannot retain pipes or outlive the connection.
+        let process_result: Result<()> =
+            match tokio::time::timeout(APP_SERVER_GRACEFUL_SHUTDOWN, child.wait()).await {
+                Ok(status) => {
+                    status.context("failed to reap Codex app-server")?;
+                    #[cfg(unix)]
+                    process_group
+                        .terminate()
+                        .context("failed to terminate Codex app-server descendants")?;
+                    Ok(())
+                }
+                Err(_) => {
+                    #[cfg(unix)]
+                    {
+                        if let Err(group_error) = process_group.terminate() {
+                            child
+                                .kill()
+                                .await
+                                .context("failed to terminate Codex app-server")?;
+                            child
+                                .wait()
+                                .await
+                                .context("failed to reap Codex app-server")?;
+                            return Err(group_error)
+                                .context("failed to terminate Codex app-server descendants");
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    child
+                        .kill()
+                        .await
+                        .context("failed to terminate Codex app-server")?;
+                    child
+                        .wait()
+                        .await
+                        .context("failed to reap Codex app-server")?;
+                    Ok(())
+                }
+            };
+
+        let stderr = self.finish_stderr().await;
+        if let Err(error) = process_result {
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                Err(error)
+            } else {
+                Err(error).with_context(|| format!("Codex app-server: {detail}"))
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CodexAppServerChildControl for CodexAppServerChild {
+    fn shutdown(&mut self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { self.shutdown_inner().await })
+    }
+}
+
+impl Drop for CodexAppServerChild {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let group_stopped = self
+            .process_group
+            .as_mut()
+            .is_some_and(|group| group.terminate().is_ok());
+        #[cfg(not(unix))]
+        let group_stopped = false;
+
+        if !group_stopped {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.start_kill();
+            }
+        }
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -391,7 +530,7 @@ fn configured_codex_home() -> Result<PathBuf> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .context("cannot locate Codex home for subscription authentication")?;
     if !codex_home.is_absolute() {
-        anyhow::bail!("CODEX_HOME must be absolute for read-only Codex advisory runs");
+        anyhow::bail!("CODEX_HOME must be absolute for Codex app-server authentication");
     }
     Ok(codex_home)
 }
@@ -536,7 +675,7 @@ fn create_isolated_codex_home_in(
             .any(|root| candidate.starts_with(root))
         {
             anyhow::bail!(
-                "temporary Codex home would be visible inside an advisory workspace: {}",
+                "temporary Codex home would be visible inside a reviewed workspace: {}",
                 candidate.display()
             );
         }
@@ -611,7 +750,7 @@ fn create_isolated_codex_home(execution_policy: &ExecutionPolicy) -> Result<Isol
 
 #[cfg(not(unix))]
 fn create_isolated_codex_home(_execution_policy: &ExecutionPolicy) -> Result<IsolatedCodexHome> {
-    anyhow::bail!("read-only Codex advisory transport requires Unix auth-file isolation")
+    anyhow::bail!("Codex app-server transport requires Unix auth-file isolation")
 }
 
 fn add_cli_trust_root(roots: &mut Vec<PathBuf>, path: &Path) -> Result<()> {
@@ -1222,11 +1361,29 @@ fn first_line(s: &str) -> String {
 /// turn stays as terse as the user wrote it; later requests carry the complete
 /// provider-agnostic history because no cwd-global CLI session is resumed.
 fn prompt_for_request(req: &ChatRequest) -> Option<String> {
-    if !req.force_full_handoff {
+    prompt_for_request_with_handoff(req, req.force_full_handoff)
+}
+
+/// Build the fresh-thread handoff for app-server. The native
+/// `developerInstructions` field already carries `req.system`, so the user
+/// message contains only role-labelled conversation history.
+fn persistent_handoff_prompt_for_request(req: &ChatRequest) -> Option<String> {
+    role_labelled_handoff_prompt(req, false)
+}
+
+fn prompt_for_request_with_handoff(req: &ChatRequest, force_full_handoff: bool) -> Option<String> {
+    if !force_full_handoff {
         if let [Message::User(content)] = req.messages.as_slice() {
             return Some(content.text().to_owned());
         }
     }
+    role_labelled_handoff_prompt(req, true)
+}
+
+fn role_labelled_handoff_prompt(
+    req: &ChatRequest,
+    include_system_in_prompt: bool,
+) -> Option<String> {
     if !req
         .messages
         .iter()
@@ -1239,9 +1396,12 @@ fn prompt_for_request(req: &ChatRequest) -> Option<String> {
         "Continue the coding-assistant conversation below. This is a complete handoff from a \
 fresh process; use the supplied history instead of assuming access to an earlier CLI session.\n\n",
     );
-    prompt.push_str("## System instructions\n");
-    prompt.push_str(&req.system);
-    prompt.push_str("\n\n## Conversation history\n");
+    if include_system_in_prompt {
+        prompt.push_str("## System instructions\n");
+        prompt.push_str(&req.system);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("## Conversation history\n");
 
     for message in &req.messages {
         match message {
@@ -1396,24 +1556,181 @@ pub async fn stream_chat_codex(
     }
 }
 
+/// Prepare a production persistent Codex app-server transport. The returned
+/// factory is bound to one validated executable, authentication file, isolated
+/// home, and execution-policy snapshot.
+pub(super) fn persistent_codex_app_server(
+    model: &str,
+    execution_policy: &ExecutionPolicy,
+    developer_instructions: Option<String>,
+) -> Result<(Arc<dyn AppServerSpawner>, CodexAppServerContract)> {
+    reject_unmediated_untrusted_writes(RequestPolicy::Interactive, execution_policy, "Codex")?;
+    validate_codex_workspace_roots(execution_policy)?;
+    let candidate = cli_candidate_for_policy(CliExecutable::Codex, execution_policy)?.clone();
+    let sandbox = codex_app_server_sandbox(execution_policy);
+    let isolated_home = Arc::new(create_isolated_codex_home(execution_policy)?);
+    let contract = codex_app_server_contract(
+        model,
+        execution_policy,
+        sandbox.clone(),
+        isolated_home.path(),
+        developer_instructions,
+    )?;
+    let spawner: Arc<dyn AppServerSpawner> = Arc::new(CodexAppServerSpawner {
+        candidate,
+        execution_policy: execution_policy.clone(),
+        sandbox,
+        isolated_home,
+    });
+    Ok((spawner, contract))
+}
+
+fn codex_app_server_sandbox(execution_policy: &ExecutionPolicy) -> CodexContractSandbox {
+    match execution_policy.sandbox_mode() {
+        SandboxMode::ReadOnly => CodexContractSandbox::AdvisoryProfile {
+            profile: fresh_codex_advisory_profile(),
+        },
+        SandboxMode::WorkspaceWrite => CodexContractSandbox::WorkspaceWrite {
+            profile: fresh_codex_workspace_profile(),
+            // Codex grants the cwd implicitly in workspace-write mode. Only
+            // the other canonical runtime roots belong in writable_roots.
+            writable_roots: additional_workspace_roots(execution_policy)
+                .map(Path::to_path_buf)
+                .collect(),
+        },
+        SandboxMode::DangerFullAccess => CodexContractSandbox::DangerFullAccess,
+    }
+}
+
+fn codex_app_server_contract(
+    model: &str,
+    execution_policy: &ExecutionPolicy,
+    sandbox: CodexContractSandbox,
+    isolated_home: &Path,
+    developer_instructions: Option<String>,
+) -> Result<CodexAppServerContract> {
+    let cwd = execution_policy.workspace().cwd().to_path_buf();
+    let workspace_roots = execution_policy.effective_user_visible_roots().to_vec();
+    if cwd.to_str().is_none()
+        || workspace_roots.iter().any(|root| root.to_str().is_none())
+        || isolated_home.to_str().is_none()
+    {
+        anyhow::bail!("Codex app-server paths must be valid UTF-8");
+    }
+    Ok(CodexAppServerContract {
+        model: model.to_owned(),
+        cwd,
+        workspace_roots,
+        codex_home: isolated_home.to_path_buf(),
+        sandbox,
+        developer_instructions,
+    })
+}
+
+impl AppServerSpawner for CodexAppServerSpawner {
+    fn spawn(&self) -> BoxFuture<'static, Result<SpawnedAppServer>> {
+        let candidate = self.candidate.clone();
+        let execution_policy = self.execution_policy.clone();
+        let sandbox = self.sandbox.clone();
+        let isolated_home = Arc::clone(&self.isolated_home);
+        Box::pin(async move {
+            spawn_persistent_codex_app_server(candidate, execution_policy, sandbox, isolated_home)
+                .await
+        })
+    }
+}
+
+async fn spawn_persistent_codex_app_server(
+    candidate: ResolvedCliCandidate,
+    execution_policy: ExecutionPolicy,
+    sandbox: CodexContractSandbox,
+    isolated_home: Arc<IsolatedCodexHome>,
+) -> Result<SpawnedAppServer> {
+    if !candidate_is_unchanged(&candidate) {
+        anyhow::bail!("refusing to launch `codex` because it changed after discovery");
+    }
+    if !isolated_home.auth_is_unchanged() {
+        anyhow::bail!(
+            "refusing to launch `codex` because subscription authentication changed after validation"
+        );
+    }
+
+    let mut command = build_codex_app_server_command(
+        &candidate.canonical,
+        &sandbox,
+        &execution_policy,
+        isolated_home.path(),
+        isolated_home.source_auth(),
+    )?;
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    // Recheck after command construction so a replacement racing preparation
+    // is rejected before the only operation that executes external code.
+    if !candidate_is_unchanged(&candidate) || !isolated_home.auth_is_unchanged() {
+        anyhow::bail!("refusing to launch `codex` because its trusted identity changed");
+    }
+
+    let mut child = command.spawn().context(
+        "failed to launch `codex app-server` — is Codex 0.153.4 installed and signed in?",
+    )?;
+    #[cfg(unix)]
+    let process_group = ProcessGroupGuard::new(
+        child
+            .id()
+            .context("spawned Codex app-server did not expose a process id")?,
+    )?;
+    let reader = child
+        .stdout
+        .take()
+        .context("Codex app-server has no stdout")?;
+    let writer = child
+        .stdin
+        .take()
+        .context("Codex app-server has no stdin")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Codex app-server has no stderr")?;
+    let stderr_task = tokio::spawn(drain_stderr_bounded(stderr));
+    let reader: CodexAppServerReader = Box::pin(reader);
+    let writer: CodexAppServerWriter = Box::pin(writer);
+    Ok(SpawnedAppServer {
+        reader,
+        writer,
+        child: Box::new(CodexAppServerChild {
+            child: Some(child),
+            #[cfg(unix)]
+            process_group: Some(process_group),
+            stderr_task: Some(stderr_task),
+            _isolated_home: isolated_home,
+        }),
+    })
+}
+
 fn fresh_codex_app_server_launch(
     model: &str,
     execution_policy: &ExecutionPolicy,
 ) -> Result<CodexAppServerLaunch> {
     let candidate = cli_candidate_for_policy(CliExecutable::Codex, execution_policy)?;
     let profile = fresh_codex_advisory_profile();
-    let cwd = execution_policy.workspace().cwd().to_path_buf();
-    let workspace_roots = execution_policy.effective_user_visible_roots().to_vec();
-    if cwd.to_str().is_none() || workspace_roots.iter().any(|root| root.to_str().is_none()) {
-        anyhow::bail!("Codex app-server workspace paths must be valid UTF-8");
-    }
+    let sandbox = CodexContractSandbox::AdvisoryProfile { profile };
     let isolated_home = create_isolated_codex_home(execution_policy)?;
-    if isolated_home.path().to_str().is_none() {
-        anyhow::bail!("isolated Codex home path must be valid UTF-8");
-    }
+    let contract = codex_app_server_contract(
+        model,
+        execution_policy,
+        sandbox.clone(),
+        isolated_home.path(),
+        None,
+    )?;
     let command = build_codex_app_server_command(
         &candidate.canonical,
-        &profile,
+        &sandbox,
         execution_policy,
         isolated_home.path(),
         isolated_home.source_auth(),
@@ -1421,13 +1738,7 @@ fn fresh_codex_app_server_launch(
     Ok(CodexAppServerLaunch {
         command,
         candidate,
-        contract: CodexAppServerContract {
-            profile,
-            model: model.to_owned(),
-            cwd,
-            workspace_roots,
-            codex_home: isolated_home.path().to_path_buf(),
-        },
+        contract,
         _isolated_home: isolated_home,
     })
 }
@@ -1456,8 +1767,9 @@ fn build_codex_command(
     request_policy: RequestPolicy,
     execution_policy: &ExecutionPolicy,
 ) -> Result<tokio::process::Command> {
-    // Every request starts in a fresh, explicitly sandboxed process. Context is
-    // carried in `prompt`, never inferred from another cwd-global CLI session.
+    // Every `codex exec` request starts in a fresh, explicitly sandboxed
+    // process. Context is carried in `prompt`, never inferred from another
+    // cwd-global CLI session.
     let sandbox = effective_sandbox(request_policy, execution_policy);
     let mut cmd = tokio::process::Command::new(executable);
     cmd.current_dir(execution_policy.workspace().cwd());
@@ -1528,7 +1840,7 @@ fn build_codex_command(
 
 fn build_codex_app_server_command(
     executable: &Path,
-    profile: &str,
+    sandbox: &CodexContractSandbox,
     execution_policy: &ExecutionPolicy,
     isolated_codex_home: &Path,
     source_auth: &Path,
@@ -1545,24 +1857,74 @@ fn build_codex_app_server_command(
     // and OAuth token refreshes persist to the user's original file.
     cmd.arg("-c").arg(r#"cli_auth_credentials_store="file""#);
     cmd.arg("-c").arg(r#"approval_policy="never""#);
-    cmd.arg("-c")
-        .arg(format!(r#"default_permissions="{profile}""#));
-    // Keep both authentication files unreadable to model tools even on
-    // platforms whose minimal runtime allowance includes a broad scratch
-    // directory. Denying the whole isolated home would also hide Codex's
-    // CODEX_HOME/tmp/arg0 runtime helper on Linux.
-    cmd.arg("-c")
-        .arg(codex_advisory_app_server_filesystem_config(
+    match sandbox {
+        CodexContractSandbox::AdvisoryProfile { profile } => {
+            cmd.arg("-c")
+                .arg(format!(r#"default_permissions="{profile}""#));
+            // Keep both authentication files unreadable to model tools even
+            // when a minimal runtime allowance includes a broad scratch
+            // directory. Denying the whole isolated home would also hide
+            // Codex's CODEX_HOME/tmp/arg0 runtime helper on Linux.
+            cmd.arg("-c")
+                .arg(codex_advisory_app_server_filesystem_config(
+                    profile,
+                    executable,
+                    isolated_codex_home,
+                    source_auth,
+                )?);
+            cmd.arg("-c")
+                .arg(format!("permissions.{profile}.network={{enabled=false}}"));
+            cmd.arg("-c")
+                .arg(codex_advisory_roots_config(profile, execution_policy)?);
+        }
+        CodexContractSandbox::WorkspaceWrite {
             profile,
-            executable,
-            isolated_codex_home,
-            source_auth,
-        )?);
-    cmd.arg("-c")
-        .arg(format!("permissions.{profile}.network={{enabled=false}}"));
-    cmd.arg("-c")
-        .arg(codex_advisory_roots_config(profile, execution_policy)?);
+            writable_roots,
+        } => {
+            cmd.arg("-c")
+                .arg(format!(r#"default_permissions="{profile}""#));
+            // Workspace mode needs broad code reads and writes only in the
+            // captured runtime roots. Exact auth-file denies remain later in
+            // the table so neither the isolated link nor its source can enter
+            // model-visible shell output.
+            cmd.arg("-c")
+                .arg(codex_workspace_app_server_filesystem_config(
+                    profile,
+                    isolated_codex_home,
+                    source_auth,
+                    execution_policy,
+                )?);
+            cmd.arg("-c")
+                .arg(format!("permissions.{profile}.network={{enabled=false}}"));
+            cmd.arg("-c")
+                .arg(codex_advisory_roots_config(profile, execution_policy)?);
+            for constraint in [
+                "sandbox_workspace_write.network_access=false".to_owned(),
+                codex_workspace_write_roots_config(writable_roots)?,
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true".to_owned(),
+                "sandbox_workspace_write.exclude_slash_tmp=true".to_owned(),
+            ] {
+                cmd.arg("-c").arg(constraint);
+            }
+        }
+        CodexContractSandbox::DangerFullAccess => {}
+    }
     Ok(cmd)
+}
+
+fn codex_workspace_write_roots_config(writable_roots: &[PathBuf]) -> Result<String> {
+    let writable_roots = writable_roots
+        .iter()
+        .map(|root| {
+            root.to_str()
+                .map(|root| toml::Value::String(root.to_owned()))
+                .with_context(|| format!("Codex workspace root is not valid UTF-8: {root:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!(
+        "sandbox_workspace_write.writable_roots={}",
+        toml::Value::Array(writable_roots)
+    ))
 }
 
 fn fresh_codex_advisory_profile() -> String {
@@ -1570,6 +1932,116 @@ fn fresh_codex_advisory_profile() -> String {
         "{CODEX_ADVISORY_PROFILE_PREFIX}{:032x}",
         rand::random::<u128>()
     )
+}
+
+fn fresh_codex_workspace_profile() -> String {
+    format!(
+        "{CODEX_WORKSPACE_PROFILE_PREFIX}{:032x}",
+        rand::random::<u128>()
+    )
+}
+
+fn codex_workspace_app_server_filesystem_config(
+    profile: &str,
+    isolated_codex_home: &Path,
+    source_auth: &Path,
+    execution_policy: &ExecutionPolicy,
+) -> Result<String> {
+    validate_codex_workspace_roots(execution_policy)?;
+    let isolated_auth = isolated_codex_home.join("auth.json");
+    let isolated_auth_glob = codex_advisory_auth_deny_glob(&isolated_auth)?;
+    let source_auth_glob = codex_advisory_auth_deny_glob(source_auth)?;
+    let isolated_auth = isolated_auth
+        .to_str()
+        .with_context(|| format!("Codex auth path is not valid UTF-8: {isolated_auth:?}"))?;
+    let source_auth = source_auth
+        .to_str()
+        .with_context(|| format!("Codex auth path is not valid UTF-8: {source_auth:?}"))?;
+    let workspace_protections = protected_metadata_name_variants()
+        .into_iter()
+        .map(|name| format!("{}=\"read\"", toml::Value::String(name)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let exact_protections =
+        protected_metadata_paths_for_roots(execution_policy.effective_user_visible_roots())
+            .into_iter()
+            .map(|path| {
+                path.to_str()
+                    .map(|path| format!("{}=\"read\"", toml::Value::String(path.to_owned())))
+                    .with_context(|| {
+                        format!("Codex protected metadata path is not valid UTF-8: {path:?}")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(",");
+    let exact_protections = if exact_protections.is_empty() {
+        String::new()
+    } else {
+        format!(",{exact_protections}")
+    };
+    Ok(format!(
+        "permissions.{profile}.filesystem={{glob_scan_max_depth=2,\":root\"=\"read\",\":workspace_roots\"={{\".\"=\"write\",{workspace_protections}}},{}=\"deny\",{}=\"deny\",{}=\"deny\",{}=\"deny\"{exact_protections}}}",
+        toml::Value::String(isolated_auth.to_owned()),
+        toml::Value::String(source_auth.to_owned()),
+        toml::Value::String(isolated_auth_glob),
+        toml::Value::String(source_auth_glob)
+    ))
+}
+
+fn validate_codex_workspace_roots(execution_policy: &ExecutionPolicy) -> Result<()> {
+    if execution_policy.sandbox_mode() != SandboxMode::WorkspaceWrite {
+        return Ok(());
+    }
+    for root in execution_policy.effective_user_visible_roots() {
+        if execution_policy
+            .is_protected_metadata(root)
+            .with_context(|| format!("classify Codex workspace root {}", root.display()))?
+        {
+            anyhow::bail!(
+                "Codex workspace-write cannot grant a root inside protected project metadata: {}",
+                root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn protected_metadata_name_variants() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut variants = Vec::new();
+        for name in PROTECTED_METADATA_NAMES {
+            let mut current = vec![String::new()];
+            for character in name.chars() {
+                if character.is_ascii_alphabetic() {
+                    let mut alternate = current.clone();
+                    for value in &mut current {
+                        value.push(character.to_ascii_lowercase());
+                    }
+                    for value in &mut alternate {
+                        value.push(character.to_ascii_uppercase());
+                    }
+                    current.extend(alternate);
+                } else {
+                    for value in &mut current {
+                        value.push(character);
+                    }
+                }
+            }
+            variants.extend(current);
+        }
+        variants.sort();
+        variants.dedup();
+        variants
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        PROTECTED_METADATA_NAMES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect()
+    }
 }
 
 fn codex_advisory_app_server_filesystem_config(
@@ -1864,32 +2336,52 @@ mod tests {
         execution_policy: &ExecutionPolicy,
     ) -> Result<(tokio::process::Command, String)> {
         let profile = fresh_codex_advisory_profile();
+        let sandbox = CodexContractSandbox::AdvisoryProfile {
+            profile: profile.clone(),
+        };
+        let command = test_codex_app_server_command_for_sandbox(execution_policy, &sandbox)?;
+        Ok((command, profile))
+    }
+
+    fn test_codex_app_server_command_for_sandbox(
+        execution_policy: &ExecutionPolicy,
+        sandbox: &CodexContractSandbox,
+    ) -> Result<tokio::process::Command> {
         let isolated_home = test_cli_executable("isolated-codex-home");
         let source_auth = test_cli_executable("source-codex-home").join("auth.json");
-        let command = build_codex_app_server_command(
+        build_codex_app_server_command(
             &test_cli_executable("codex"),
-            &profile,
+            sandbox,
             execution_policy,
             &isolated_home,
             &source_auth,
-        )?;
-        Ok((command, profile))
+        )
     }
 
     fn test_codex_app_server_contract(fixture: &PolicyFixture) -> CodexAppServerContract {
         CodexAppServerContract {
-            profile: fresh_codex_advisory_profile(),
             model: "gpt-5.6-sol".into(),
             cwd: fixture.cwd().to_path_buf(),
             workspace_roots: fixture.policy.effective_user_visible_roots().to_vec(),
             codex_home: PathBuf::from("/tmp/fake-codex-home"),
+            sandbox: CodexContractSandbox::AdvisoryProfile {
+                profile: fresh_codex_advisory_profile(),
+            },
+            developer_instructions: None,
         }
     }
 
-    fn create_fake_executable(path: &Path) {
+    fn test_advisory_profile(contract: &CodexAppServerContract) -> &str {
+        match &contract.sandbox {
+            CodexContractSandbox::AdvisoryProfile { profile } => profile,
+            _ => panic!("test contract must use an advisory permission profile"),
+        }
+    }
+
+    fn create_fake_executable_with_script(path: &Path, script: &str) {
         std::fs::create_dir_all(path.parent().expect("fake executable parent"))
             .expect("create fake executable directory");
-        std::fs::write(path, b"#!/bin/sh\nexit 99\n").expect("write fake executable");
+        std::fs::write(path, script).expect("write fake executable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1898,12 +2390,17 @@ mod tests {
         }
     }
 
+    fn create_fake_executable(path: &Path) {
+        create_fake_executable_with_script(path, "#!/bin/sh\nexit 99\n");
+    }
+
     fn request(system: &str, messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
             model: ModelEntry {
                 provider: ProviderKind::Codex,
                 id: "codex".into(),
             },
+            continuity_id: None,
             system: system.into(),
             messages,
             tools: Vec::new(),
@@ -2022,6 +2519,7 @@ mod tests {
     }
 
     fn fake_attested_thread_result(contract: &CodexAppServerContract, thread_id: &str) -> Value {
+        let profile = test_advisory_profile(contract);
         json!({
             "thread": {
                 "id": thread_id,
@@ -2031,7 +2529,8 @@ mod tests {
                 "historyMode": "legacy",
                 "modelProvider": "openai",
                 "model": contract.model,
-                "cwd": contract.cwd
+                "cwd": contract.cwd,
+                "canAcceptDirectInput": true
             },
             "model": contract.model,
             "modelProvider": "openai",
@@ -2041,7 +2540,7 @@ mod tests {
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
             "sandbox": {"type": "readOnly", "networkAccess": false},
-            "activePermissionProfile": {"id": contract.profile, "extends": null}
+            "activePermissionProfile": {"id": profile, "extends": null}
         })
     }
 
@@ -2550,6 +3049,192 @@ mod tests {
     }
 
     #[test]
+    fn persistent_app_server_maps_each_execution_sandbox_exactly() {
+        let read_only = PolicyFixture::new(SandboxMode::ReadOnly, ApprovalPolicy::OnRequest);
+        assert!(matches!(
+            codex_app_server_sandbox(&read_only.policy),
+            CodexContractSandbox::AdvisoryProfile { profile }
+                if profile.starts_with(CODEX_ADVISORY_PROFILE_PREFIX)
+        ));
+
+        let workspace = PolicyFixture::new(SandboxMode::WorkspaceWrite, ApprovalPolicy::OnRequest);
+        assert!(matches!(
+            codex_app_server_sandbox(&workspace.policy),
+            CodexContractSandbox::WorkspaceWrite { profile, writable_roots }
+                if profile.starts_with(CODEX_WORKSPACE_PROFILE_PREFIX)
+                    && writable_roots == vec![workspace.extra.clone()]
+        ));
+
+        let full = PolicyFixture::new(SandboxMode::DangerFullAccess, ApprovalPolicy::Never);
+        assert_eq!(
+            codex_app_server_sandbox(&full.policy),
+            CodexContractSandbox::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn app_server_workspace_launch_resets_authority_to_exact_additional_roots() {
+        let fixture = PolicyFixture::new(SandboxMode::WorkspaceWrite, ApprovalPolicy::OnRequest);
+        let sandbox = codex_app_server_sandbox(&fixture.policy);
+        let profile = match &sandbox {
+            CodexContractSandbox::WorkspaceWrite { profile, .. } => profile.clone(),
+            _ => panic!("workspace policy must create a workspace profile"),
+        };
+        let command = test_codex_app_server_command_for_sandbox(&fixture.policy, &sandbox)
+            .expect("workspace-write app-server command");
+        let args = command_args(&command);
+        assert_eq!(advisory_profile_from_args(&args), profile);
+        let filesystem = codex_workspace_app_server_filesystem_config(
+            &profile,
+            &test_cli_executable("isolated-codex-home"),
+            &test_cli_executable("source-codex-home").join("auth.json"),
+            &fixture.policy,
+        )
+        .unwrap();
+        assert!(has_arg_pair(&args, "-c", &filesystem));
+        assert!(has_arg_pair(
+            &args,
+            "-c",
+            &format!("permissions.{profile}.network={{enabled=false}}")
+        ));
+        assert!(has_arg_pair(
+            &args,
+            "-c",
+            &codex_advisory_roots_config(&profile, &fixture.policy).unwrap()
+        ));
+        assert!(has_arg_pair(
+            &args,
+            "-c",
+            "sandbox_workspace_write.network_access=false"
+        ));
+        assert!(has_arg_pair(
+            &args,
+            "-c",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true"
+        ));
+        assert!(has_arg_pair(
+            &args,
+            "-c",
+            "sandbox_workspace_write.exclude_slash_tmp=true"
+        ));
+        assert!(has_arg_pair(
+            &args,
+            "-c",
+            &codex_workspace_write_roots_config(&[fixture.extra.clone()]).unwrap()
+        ));
+        assert!(values_for(&args, "--sandbox").is_empty());
+    }
+
+    #[test]
+    fn workspace_app_server_profile_is_parseable_and_denies_both_auth_paths() {
+        let fixture = PolicyFixture::new(SandboxMode::WorkspaceWrite, ApprovalPolicy::OnRequest);
+        let profile = "shaltaiboltai-workspace-test";
+        let isolated_home = Path::new("/private/tmp/isolated.home");
+        let source_auth = Path::new("/var/tmp/source.home/auth.json");
+        let override_value = codex_workspace_app_server_filesystem_config(
+            profile,
+            isolated_home,
+            source_auth,
+            &fixture.policy,
+        )
+        .expect("workspace filesystem override");
+
+        let prefix = format!("permissions.{profile}.filesystem=");
+        let inline_table = override_value
+            .strip_prefix(&prefix)
+            .expect("one filesystem-table override");
+        let parsed: toml::Value = toml::from_str(&format!("value={inline_table}"))
+            .expect("valid TOML inline filesystem table");
+        let table = parsed["value"].as_table().expect("filesystem table");
+        assert_eq!(table[":root"].as_str(), Some("read"));
+        assert_eq!(table[":workspace_roots"]["."].as_str(), Some("write"));
+        for name in PROTECTED_METADATA_NAMES {
+            assert_eq!(
+                table[":workspace_roots"][name].as_str(),
+                Some("read"),
+                "missing protected workspace rule for {name}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        for name in [".GIT", ".Agents", ".CODEX"] {
+            assert_eq!(
+                table[":workspace_roots"][name].as_str(),
+                Some("read"),
+                "missing case-folded macOS workspace rule for {name}"
+            );
+        }
+        for path in
+            protected_metadata_paths_for_roots(fixture.policy.effective_user_visible_roots())
+        {
+            assert_eq!(
+                table[path.to_str().unwrap()].as_str(),
+                Some("read"),
+                "missing exact protected metadata rule for {}",
+                path.display()
+            );
+        }
+        let isolated_auth = isolated_home.join("auth.json");
+        for auth in [&isolated_auth, source_auth] {
+            assert_eq!(table[auth.to_str().unwrap()].as_str(), Some("deny"));
+            assert_eq!(
+                table[&codex_advisory_auth_deny_glob(auth).unwrap()].as_str(),
+                Some("deny")
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_app_server_rejects_roots_inside_protected_metadata() {
+        let fixture = PolicyFixture::new(SandboxMode::WorkspaceWrite, ApprovalPolicy::OnRequest);
+        let nested = fixture.cwd().join(".git/hooks");
+        std::fs::create_dir_all(&nested).expect("create protected nested root");
+        let workspace = Workspace::from_roots(fixture.cwd(), [&nested])
+            .expect("canonical workspace with unsafe extra root");
+        let policy = ExecutionPolicy::from_parts(
+            workspace,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+        );
+
+        let error = validate_codex_workspace_roots(&policy)
+            .expect_err("nested protected roots must fail closed");
+        assert!(error
+            .to_string()
+            .contains("inside protected project metadata"));
+    }
+
+    #[test]
+    fn workspace_app_server_rejects_a_bare_repository_root() {
+        let fixture = PolicyFixture::new(SandboxMode::WorkspaceWrite, ApprovalPolicy::OnRequest);
+        let bare = fixture.base.join("bare.git");
+        std::fs::create_dir_all(bare.join("objects")).expect("create bare objects");
+        std::fs::create_dir_all(bare.join("refs")).expect("create bare refs");
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").expect("write bare HEAD");
+        let policy = ExecutionPolicy::from_parts(
+            Workspace::new(&bare).expect("canonical bare repository"),
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+        );
+
+        assert!(validate_codex_workspace_roots(&policy).is_err());
+    }
+
+    #[test]
+    fn app_server_full_access_launch_does_not_apply_a_narrower_sandbox() {
+        let fixture = PolicyFixture::new(SandboxMode::DangerFullAccess, ApprovalPolicy::Never);
+        let sandbox = codex_app_server_sandbox(&fixture.policy);
+        let command = test_codex_app_server_command_for_sandbox(&fixture.policy, &sandbox)
+            .expect("full-access app-server command");
+        let args = command_args(&command);
+        assert!(values_for(&args, "--sandbox").is_empty());
+        assert!(!values_for(&args, "-c").iter().any(|value| {
+            value.starts_with("default_permissions=")
+                || value.starts_with("permissions.")
+                || value.starts_with("sandbox_workspace_write.")
+        }));
+    }
+
+    #[test]
     fn app_server_filesystem_override_is_one_parseable_table() {
         let profile = "shaltaiboltai-advisory-test";
         let executable = Path::new("/opt/Codex 0.153.4/bin/codex");
@@ -2704,6 +3389,16 @@ mod tests {
         let codex = test_codex_command(None, RequestPolicy::Interactive, &workspace.policy)
             .expect_err("Codex must not silently accept untrusted writes");
         assert!(codex.to_string().contains("cannot surface inner approval"));
+        let persistent = persistent_codex_app_server(
+            "gpt-5.6-sol",
+            &workspace.policy,
+            Some("test system".into()),
+        )
+        .err()
+        .expect("persistent Codex must not silently accept untrusted writes");
+        assert!(persistent
+            .to_string()
+            .contains("cannot surface inner approval"));
 
         let full = PolicyFixture::new(SandboxMode::DangerFullAccess, ApprovalPolicy::Untrusted);
         let claude = test_claude_command(None, RequestPolicy::Interactive, &full.policy)
@@ -2712,6 +3407,13 @@ mod tests {
         let codex = test_codex_command(None, RequestPolicy::Interactive, &full.policy)
             .expect_err("Codex must not silently accept untrusted Full Access");
         assert!(codex.to_string().contains("cannot surface inner approval"));
+        let persistent =
+            persistent_codex_app_server("gpt-5.6-sol", &full.policy, Some("test system".into()))
+                .err()
+                .expect("persistent Codex must not silently accept untrusted Full Access");
+        assert!(persistent
+            .to_string()
+            .contains("cannot surface inner approval"));
     }
 
     #[test]
@@ -2759,6 +3461,40 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn test_persistent_app_server_spawner(
+        fixture: &PolicyFixture,
+        script: &str,
+    ) -> (Arc<CodexAppServerSpawner>, PathBuf, PathBuf, PathBuf) {
+        let executable = fixture.base.join("trusted-bin/codex");
+        create_fake_executable_with_script(&executable, script);
+        let canonical = std::fs::canonicalize(&executable).expect("canonical fake Codex");
+        let candidate = ResolvedCliCandidate {
+            lexical: canonical.clone(),
+            identity: executable_identity(&canonical).expect("fake Codex identity"),
+            canonical,
+        };
+        let source_home = fixture.base.join("source-codex-home");
+        let source_auth = create_test_codex_auth(&source_home);
+        let temp_root = fixture.base.join("private-temp");
+        std::fs::create_dir_all(&temp_root).expect("create private temp root");
+        let isolated_home = create_isolated_codex_home_in(
+            &source_home,
+            &temp_root,
+            &[],
+            fixture.policy.effective_user_visible_roots(),
+        )
+        .expect("create isolated Codex home");
+        let isolated_path = isolated_home.path().to_path_buf();
+        let spawner = Arc::new(CodexAppServerSpawner {
+            candidate,
+            execution_policy: fixture.policy.clone(),
+            sandbox: codex_app_server_sandbox(&fixture.policy),
+            isolated_home: Arc::new(isolated_home),
+        });
+        (spawner, isolated_path, source_auth, executable)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn codex_app_server_isolated_home_is_private_linked_and_cleaned() {
         use std::os::unix::fs::MetadataExt;
@@ -2799,6 +3535,99 @@ mod tests {
             std::fs::read_to_string(source_auth).expect("source auth survives cleanup"),
             r#"{"tokens":{"access_token":"test"}}"#
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_spawner_keeps_private_home_until_its_last_child_is_dropped() {
+        let fixture = PolicyFixture::new(SandboxMode::DangerFullAccess, ApprovalPolicy::Never);
+        let (spawner, isolated_path, _, _) = test_persistent_app_server_spawner(
+            &fixture,
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        );
+
+        let SpawnedAppServer {
+            reader,
+            mut writer,
+            mut child,
+        } = spawner.spawn().await.expect("spawn fake app-server");
+        assert!(isolated_path.exists());
+        drop(spawner);
+        assert!(
+            isolated_path.exists(),
+            "the running child must retain its isolated home"
+        );
+
+        writer
+            .shutdown()
+            .await
+            .expect("close fake app-server stdin");
+        child.shutdown().await.expect("reap fake app-server");
+        assert!(
+            isolated_path.exists(),
+            "the child control owns the home until it is dropped"
+        );
+        drop(reader);
+        drop(writer);
+        drop(child);
+        assert!(
+            !isolated_path.exists(),
+            "the last owner must clean the isolated home"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_persistent_child_terminates_its_process_group() {
+        let fixture = PolicyFixture::new(SandboxMode::DangerFullAccess, ApprovalPolicy::Never);
+        let (spawner, _, _, executable) = test_persistent_app_server_spawner(
+            &fixture,
+            "#!/bin/sh\nbase=$(dirname \"$0\")\n(sleep 0.6; printf leaked > \"$base/descendant-leaked\") &\nsleep 30\n",
+        );
+        let marker = executable
+            .parent()
+            .expect("fake executable parent")
+            .join("descendant-leaked");
+
+        let spawned = spawner.spawn().await.expect("spawn fake app-server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(spawned);
+        drop(spawner);
+        tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+        assert!(
+            !marker.exists(),
+            "a descendant must not outlive dropped child ownership"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_spawner_rechecks_executable_and_auth_identity() {
+        let fixture = PolicyFixture::new(SandboxMode::DangerFullAccess, ApprovalPolicy::Never);
+        let (spawner, _, source_auth, executable) = test_persistent_app_server_spawner(
+            &fixture,
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        );
+        std::fs::write(&executable, "#!/bin/sh\nexit 7\n").expect("replace fake Codex bytes");
+        let error = match spawner.spawn().await {
+            Ok(_) => panic!("mutated executable must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("changed after discovery"));
+        drop(spawner);
+
+        let (spawner, _, source_auth_two, _) = test_persistent_app_server_spawner(
+            &fixture,
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        );
+        assert_eq!(source_auth, source_auth_two);
+        std::fs::write(&source_auth_two, "{\"tokens\":{}}\n")
+            .expect("mutate fake subscription auth");
+        let error = match spawner.spawn().await {
+            Ok(_) => panic!("mutated auth must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("authentication changed"));
     }
 
     #[cfg(unix)]
@@ -2886,7 +3715,10 @@ mod tests {
             );
             assert_eq!(params["approvalPolicy"], "never");
             assert_eq!(params["approvalsReviewer"], "user");
-            assert_eq!(params["permissions"], server_contract.profile);
+            assert_eq!(
+                params["permissions"],
+                test_advisory_profile(&server_contract)
+            );
             assert_eq!(params["ephemeral"], true);
             assert_eq!(params["historyMode"], "legacy");
             assert_eq!(
@@ -3272,7 +4104,7 @@ mod tests {
 
         let error = attest_codex_app_server_thread(&result, &contract)
             .expect_err("instruction symlink escape must fail before turn/start");
-        assert!(error.to_string().contains("escaped the advisory workspace"));
+        assert!(error.to_string().contains("escaped the reviewed workspace"));
     }
 
     #[cfg(unix)]

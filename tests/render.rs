@@ -583,7 +583,7 @@ async fn model_picker_distinguishes_cli_and_openrouter_model_contracts() {
     );
     assert!(
         rendered.contains("codex        ● current/default · gpt-5.6-sol")
-            && rendered.contains("subscription sub-agent"),
+            && rendered.contains("persistent solo · stateless team"),
         "{rendered}"
     );
     assert!(
@@ -594,6 +594,20 @@ async fn model_picker_distinguishes_cli_and_openrouter_model_contracts() {
     assert!(
         rendered.contains("openrouter   anthropic/claude-sonnet-4.6")
             && rendered.contains("routed API · pricing varies"),
+        "{rendered}"
+    );
+
+    app.models = vec![ModelEntry {
+        provider: ProviderKind::Codex,
+        id: "codex".into(),
+    }];
+    app.model = app.models.first().cloned();
+    app.open_picker();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let rendered = screen(&terminal);
+    assert!(
+        rendered.contains("codex  ● current · CLI default")
+            && rendered.contains("unpinned · stateless · solo-only"),
         "{rendered}"
     );
 }

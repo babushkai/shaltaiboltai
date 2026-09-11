@@ -13,7 +13,67 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::sync::mpsc::UnboundedSender;
+use std::sync::Arc;
+use tokio::sync::{mpsc::UnboundedSender, Mutex};
+
+/// Provider lifecycle state shared by one [`crate::app::App`]. Ordinary turns
+/// and compaction enter the operation gate directly; advisory batches cross a
+/// process-clean boundary once before their parallel stateless requests.
+#[derive(Clone)]
+pub struct ProviderRuntime {
+    operation_gate: Arc<Mutex<()>>,
+    codex: cli_agent::CodexRuntime,
+}
+
+impl Default for ProviderRuntime {
+    fn default() -> Self {
+        Self {
+            operation_gate: Arc::new(Mutex::new(())),
+            codex: cli_agent::CodexRuntime::default(),
+        }
+    }
+}
+
+impl ProviderRuntime {
+    /// Dispatch an ordinary interactive request. A Codex request only enters
+    /// the persistent runtime when the app supplied a continuity identity;
+    /// requests without one retain the existing stateless CLI behavior.
+    pub async fn stream_chat(
+        &self,
+        config: Config,
+        req: ChatRequest,
+        tx: UnboundedSender<ChatEvent>,
+    ) {
+        let _operation = self.operation_gate.lock().await;
+        let result = if req.model.provider == ProviderKind::Codex && req.continuity_id.is_some() {
+            self.codex.stream_chat(&config, &req, &tx).await
+        } else {
+            match self.codex.prepare_stateless_boundary().await {
+                Ok(()) => stream_chat_inner(&config, &req, &tx).await,
+                Err(error) => Err(error.context(
+                    "could not finish the previous Codex session before starting a stateless request",
+                )),
+            }
+        };
+        if let Err(e) = result {
+            let _ = tx.send(ChatEvent::Error(format!("{e:#}")));
+        }
+    }
+
+    /// Establish a process-clean boundary before a planner or a parallel
+    /// worker batch starts through the stateless provider path.
+    pub async fn prepare_stateless_boundary(&self) -> anyhow::Result<()> {
+        let _operation = self.operation_gate.lock().await;
+        self.codex.prepare_stateless_boundary().await
+    }
+
+    /// Finish any provider process owned by this app. This is idempotent so
+    /// normal exit paths can always attempt it after session persistence.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        let _operation = self.operation_gate.lock().await;
+        self.codex.shutdown().await
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderKind {
@@ -317,6 +377,10 @@ pub enum ChatEvent {
 
 pub struct ChatRequest {
     pub model: ModelEntry,
+    /// Stable identity for ordinary requests that belong to one saved UI
+    /// conversation. `None` is an explicit isolation boundary for planners,
+    /// workers, synthesis, compaction, and other one-shot requests.
+    pub continuity_id: Option<String>,
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
@@ -343,16 +407,24 @@ pub enum RequestPolicy {
 }
 
 pub async fn stream_chat(config: Config, req: ChatRequest, tx: UnboundedSender<ChatEvent>) {
-    let result = match req.model.provider {
-        ProviderKind::Anthropic => anthropic::stream_chat(&config, &req, &tx).await,
-        ProviderKind::OpenAi => openai::stream_chat(&config, &req, &tx).await,
-        ProviderKind::OpenRouter => openrouter::stream_chat(&config, &req, &tx).await,
-        ProviderKind::Ollama => ollama::stream_chat(&config, &req, &tx).await,
-        ProviderKind::ClaudeCode => cli_agent::stream_chat_claude(&config, &req, &tx).await,
-        ProviderKind::Codex => cli_agent::stream_chat_codex(&config, &req, &tx).await,
-    };
+    let result = stream_chat_inner(&config, &req, &tx).await;
     if let Err(e) = result {
         let _ = tx.send(ChatEvent::Error(format!("{e:#}")));
+    }
+}
+
+async fn stream_chat_inner(
+    config: &Config,
+    req: &ChatRequest,
+    tx: &UnboundedSender<ChatEvent>,
+) -> anyhow::Result<()> {
+    match req.model.provider {
+        ProviderKind::Anthropic => anthropic::stream_chat(config, req, tx).await,
+        ProviderKind::OpenAi => openai::stream_chat(config, req, tx).await,
+        ProviderKind::OpenRouter => openrouter::stream_chat(config, req, tx).await,
+        ProviderKind::Ollama => ollama::stream_chat(config, req, tx).await,
+        ProviderKind::ClaudeCode => cli_agent::stream_chat_claude(config, req, tx).await,
+        ProviderKind::Codex => cli_agent::stream_chat_codex(config, req, tx).await,
     }
 }
 

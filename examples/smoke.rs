@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let req = ChatRequest {
             model: model.clone(),
+            continuity_id: None,
             system: "You are a test agent. Use tools when asked.".into(),
             messages: history.clone(),
             tools: tools::definitions(),
