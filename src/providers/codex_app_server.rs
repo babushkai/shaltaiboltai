@@ -19,7 +19,7 @@ pub(super) const THREAD_START_ID: i64 = 1;
 pub(super) const TURN_START_ID: i64 = 2;
 pub(super) const INTERRUPT_ID: i64 = 3;
 
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_INSTRUCTION_SOURCES: usize = 128;
 const MAX_PRE_RESPONSE_NOTIFICATIONS: usize = 256;
 const MAX_PRE_RESPONSE_NOTIFICATION_BYTES: usize = 8 * MAX_FRAME_BYTES;
