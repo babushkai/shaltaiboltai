@@ -1,15 +1,17 @@
 //! Non-interactive smoke test of the provider layer:
 //! `cargo run --example smoke [model_id]`
 //! Discovers models, then runs one agentic round (with a tool nudge) against
-//! the chosen model, auto-approving tool calls.
+//! the chosen model under the default workspace policy.
 
 use shaltaiboltai::config::Config;
+use shaltaiboltai::policy::{ExecutionPolicy, Workspace};
 use shaltaiboltai::providers::{self, ChatEvent, ChatRequest, Message, RequestPolicy};
-use shaltaiboltai::tools;
+use shaltaiboltai::tools::{self, ToolAuthorization};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::load();
+    let execution_policy = ExecutionPolicy::new(Workspace::new(std::env::current_dir()?)?);
     let models = providers::discover_models(config.clone()).await;
     println!("discovered {} models:", models.len());
     for m in &models {
@@ -40,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
             tools: tools::definitions(),
             policy: RequestPolicy::Interactive,
             force_full_handoff: false,
+            execution_policy: execution_policy.clone(),
         };
         tokio::spawn(providers::stream_chat(config.clone(), req, tx));
 
@@ -68,7 +71,8 @@ async fn main() -> anyhow::Result<()> {
         }
         for call in calls {
             println!("[tool] {}", tools::describe(&call));
-            let (content, is_error) = tools::execute(&call).await;
+            let (content, is_error) =
+                tools::execute(&execution_policy, &call, &ToolAuthorization::Default).await;
             println!(
                 "[result, err={is_error}] {}",
                 content.lines().next().unwrap_or("")

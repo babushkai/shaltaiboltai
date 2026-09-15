@@ -81,6 +81,9 @@ mv "$tmp/$BIN" "$INSTALL_DIR/$BIN"
 chmod +x "$INSTALL_DIR/$BIN"
 
 printf '\nInstalled %s to %s\n' "$BIN" "$INSTALL_DIR/$BIN"
+if [ "$os" = "Linux" ] && [ ! -x /usr/bin/bwrap ] && [ ! -x /bin/bwrap ]; then
+	printf 'Warning: install the bubblewrap package before using constrained shell commands.\n' >&2
+fi
 case ":$PATH:" in
 *":$INSTALL_DIR:"*) printf 'Run: %s\n' "$BIN" ;;
 *)

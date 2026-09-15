@@ -1,10 +1,13 @@
 pub mod app;
+pub mod cli;
 pub mod config;
 pub mod images;
 pub mod markdown;
 pub mod mascot;
 pub mod orchestration;
+pub mod policy;
 pub mod providers;
+pub mod sandbox;
 pub mod session;
 pub mod theme;
 pub mod tools;
