@@ -980,6 +980,7 @@ impl TextCollection {
                 }));
             }
             ChatEvent::TextDelta(_)
+            | ChatEvent::ReasoningSummary { .. }
             | ChatEvent::Notice(_)
             | ChatEvent::ToolActivity { .. }
             | ChatEvent::Completed { .. } => {}
@@ -1747,11 +1748,33 @@ mod tests {
         .unwrap_err();
         assert!(abnormal.to_string().contains("length"));
 
-        let empty = collect(vec![ChatEvent::Completed {
-            tool_calls: Vec::new(),
-            stop_reason: Some("stop".into()),
-            usage: None,
-        }])
+        let with_thinking = collect(vec![
+            ChatEvent::ReasoningSummary {
+                id: "item_0".into(),
+                text: "not a worker report".into(),
+            },
+            ChatEvent::TextDelta("actual report".into()),
+            ChatEvent::Completed {
+                tool_calls: Vec::new(),
+                stop_reason: Some("stop".into()),
+                usage: None,
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(with_thinking, "actual report");
+
+        let empty = collect(vec![
+            ChatEvent::ReasoningSummary {
+                id: "item_0".into(),
+                text: "summary alone is not a report".into(),
+            },
+            ChatEvent::Completed {
+                tool_calls: Vec::new(),
+                stop_reason: Some("stop".into()),
+                usage: None,
+            },
+        ])
         .await
         .unwrap_err();
         assert!(empty.to_string().contains("empty report"));

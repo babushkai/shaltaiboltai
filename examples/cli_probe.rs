@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
                 text.push_str(&t);
             }
             ChatEvent::Notice(message) => println!("[note] {message}"),
+            ChatEvent::ReasoningSummary { text, .. } => println!("[thinking] {text}"),
             ChatEvent::ToolActivity { summary, .. } => println!("[activity] {summary}"),
             ChatEvent::Completed { usage, .. } => {
                 println!("\n[completed] usage={usage:?}");

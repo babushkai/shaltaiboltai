@@ -1,5 +1,5 @@
 use ratatui::backend::TestBackend;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use shaltaiboltai::app::{App, AppEvent, Entry, Mode, PermissionOverlay};
 use shaltaiboltai::config::Config;
@@ -277,6 +277,219 @@ async fn codex_style_idle_shell_matches_reviewed_text_snapshot() {
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let actual = text_snapshot(&terminal);
     assert_eq!(actual, include_str!("codex_style_idle_48x11.snap"));
+}
+
+fn thinking_app(selected_theme: theme::Theme) -> App {
+    let mut app = golden_app(selected_theme);
+    app.transcript = vec![
+        Entry::User("Restore thinking summaries.".into()),
+        Entry::Assistant(String::new()),
+    ];
+    app.transcript_rev += 1;
+    app.mode = Mode::Streaming;
+    app
+}
+
+fn reasoning_snapshot(app: &mut App, text: &str) {
+    app.on_event(AppEvent::Chat {
+        gen: 0,
+        event: ChatEvent::ReasoningSummary {
+            id: "item_0".into(),
+            text: text.into(),
+        },
+    });
+}
+
+fn text_position(terminal: &Terminal<TestBackend>, needle: &str) -> (u16, u16) {
+    screen(terminal)
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| {
+            line.find(needle)
+                .map(|byte| (line[..byte].chars().count() as u16, y as u16))
+        })
+        .unwrap_or_else(|| panic!("missing {needle:?}\n{}", screen(terminal)))
+}
+
+const THINKING_SUMMARY: &str =
+    "**Inspecting events**\n\nReasoning stays separate from the final answer.";
+
+#[tokio::test]
+async fn codex_thinking_summary_matches_reviewed_text_snapshot() {
+    let mut app = thinking_app(theme::INK);
+    reasoning_snapshot(&mut app, THINKING_SUMMARY);
+    let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    assert_eq!(
+        text_snapshot(&terminal),
+        include_str!("codex_thinking_48x18.snap")
+    );
+}
+
+#[tokio::test]
+async fn reasoning_is_visible_and_distinct_from_answers_in_both_themes_and_narrow_frames() {
+    for selected_theme in [theme::INK, theme::PAPER] {
+        for (width, height) in [(80, 24), (48, 18), (24, 18)] {
+            let mut app = thinking_app(selected_theme);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            reasoning_snapshot(&mut app, THINKING_SUMMARY);
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+            let rendered = screen(&terminal);
+            assert!(rendered.contains("• Inspecting events"), "{rendered}");
+            assert!(rendered.contains("  Reasoning stays"), "{rendered}");
+            assert!(!rendered.contains("thinking…"), "{rendered}");
+            let interrupt_hint = if width >= 28 {
+                " (esc to interrupt)"
+            } else {
+                " (esc)"
+            };
+            assert!(rendered.contains(interrupt_hint), "{rendered}");
+            assert_eq!(app.reasoning_status(), Some("Inspecting events"));
+
+            let body_position = text_position(&terminal, "Reasoning stays");
+            let body_cell = &terminal.backend().buffer()[body_position];
+            assert_eq!(body_cell.fg, selected_theme.dim);
+            assert!(body_cell.modifier.contains(Modifier::ITALIC));
+            let heading_position = text_position(&terminal, "Inspecting events");
+            let heading_cell = &terminal.backend().buffer()[heading_position];
+            assert!(heading_cell.modifier.contains(Modifier::BOLD));
+            assert!(heading_cell.modifier.contains(Modifier::ITALIC));
+
+            app.on_event(AppEvent::Chat {
+                gen: 0,
+                event: ChatEvent::TextDelta("Implemented the fix.".into()),
+            });
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            assert_eq!(app.reasoning_status(), None);
+            let answer_position = text_position(&terminal, "Implemented");
+            let answer_cell = &terminal.backend().buffer()[answer_position];
+            assert_eq!(answer_cell.fg, selected_theme.fg);
+            assert!(!answer_cell.modifier.contains(Modifier::ITALIC));
+            assert!(screen(&terminal).contains("• Working"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_snapshots_replace_the_same_visible_block_without_duplicate_rows() {
+    let mut app = thinking_app(theme::INK);
+    let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
+    reasoning_snapshot(&mut app, "**Inspecting events**\n\nFirst fragment.");
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+    let updated = "**Inspecting events**\n\nFirst fragment extended with new evidence.";
+    reasoning_snapshot(&mut app, updated);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let updated_screen = text_snapshot(&terminal);
+    assert!(updated_screen.contains("First fragment extended"));
+    assert!(!updated_screen.contains("First fragment."));
+
+    reasoning_snapshot(&mut app, updated);
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert_eq!(text_snapshot(&terminal), updated_screen);
+    assert_eq!(
+        app.transcript
+            .iter()
+            .filter(|entry| matches!(entry, Entry::ReasoningSummary(_)))
+            .count(),
+        1
+    );
+    assert_eq!(app.render_cache.len(), app.transcript.len());
+    assert!(app.transcript_dirty_from.is_none());
+}
+
+#[tokio::test]
+async fn coalesced_reasoning_tool_and_answer_updates_match_a_fresh_render() {
+    for selected_theme in [theme::INK, theme::PAPER] {
+        let mut app = thinking_app(selected_theme);
+        let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
+        reasoning_snapshot(&mut app, "**Inspecting events**\n\nInitial summary.");
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+
+        reasoning_snapshot(
+            &mut app,
+            "**Inspecting events**\n\nUpdated evidence is visible.",
+        );
+        app.on_event(AppEvent::Chat {
+            gen: 0,
+            event: ChatEvent::ToolActivity {
+                summary: "checked provider events".into(),
+                is_error: false,
+            },
+        });
+        app.on_event(AppEvent::Chat {
+            gen: 0,
+            event: ChatEvent::TextDelta("Implemented the fix.".into()),
+        });
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(
+            rendered.contains("Updated evidence is visible."),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Initial summary."), "{rendered}");
+        assert!(rendered.contains("checked provider events"), "{rendered}");
+        assert!(rendered.contains("Implemented the fix."), "{rendered}");
+        assert_eq!(app.reasoning_status(), None);
+
+        // A late completed snapshot may update an earlier block, but cannot
+        // revive its activity title over the answer that followed it.
+        reasoning_snapshot(
+            &mut app,
+            "**Inspecting events**\n\nFinal evidence is visible.",
+        );
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.reasoning_status(), None);
+        assert!(screen(&terminal).contains("Final evidence is visible."));
+        let cached = terminal.backend().buffer().clone();
+        app.transcript_rev += 1;
+        let mut fresh = Terminal::new(TestBackend::new(48, 18)).unwrap();
+        fresh.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(&cached, fresh.backend().buffer());
+    }
+}
+
+#[tokio::test]
+async fn terminal_outcomes_remove_reasoning_activity_but_keep_the_summary() {
+    for outcome in ["cancel", "error", "complete"] {
+        let mut app = thinking_app(theme::INK);
+        let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
+        reasoning_snapshot(&mut app, THINKING_SUMMARY);
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains(" (esc to interrupt)"));
+
+        match outcome {
+            "cancel" => app.cancel_request(),
+            "error" => app.on_event(AppEvent::Chat {
+                gen: 0,
+                event: ChatEvent::Error("provider unavailable".into()),
+            }),
+            "complete" => app.on_event(AppEvent::Chat {
+                gen: 0,
+                event: ChatEvent::Completed {
+                    tool_calls: Vec::new(),
+                    stop_reason: Some("stop".into()),
+                    usage: None,
+                },
+            }),
+            _ => unreachable!(),
+        }
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert_eq!(app.reasoning_status(), None, "{outcome}");
+        assert!(
+            !rendered.contains(" (esc to interrupt)"),
+            "{outcome}\n{rendered}"
+        );
+        assert!(!rendered.contains("• Working"), "{outcome}\n{rendered}");
+        assert!(
+            rendered.contains("Reasoning stays separate"),
+            "{outcome}\n{rendered}"
+        );
+    }
 }
 
 #[tokio::test]

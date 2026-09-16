@@ -55,6 +55,8 @@ Headless children cannot route an inner approval prompt back into this TUI, so t
 
 Each CLI request starts an ephemeral fresh process with an explicit handoff of this app's conversation history. That avoids attaching to an unrelated “last” CLI session in the same directory or duplicating the handoff in CLI session storage. Images are represented in the handoff but their binary contents aren't forwarded to these providers yet (they work with the API providers).
 
+Codex thinking summaries appear as muted, italic Markdown blocks, separate from the answer. A summary's bold heading also labels the activity line until the next answer or tool event. Summaries remain visible in saved sessions but are never sent back as assistant messages, included in context compaction, or used as team reports. All exposed summaries are visible here, including plain summaries that Codex's own TUI reserves for its expanded transcript. The current `codex exec --json` transport delivers each summary when its reasoning item completes; it does not expose the live summary deltas used by Codex's native interface. Models that supply no summary keep the ordinary Working indicator.
+
 ## Startup policy
 
 The default is workspace-write with on-request approvals. Startup options expose a supported Codex-style subset:

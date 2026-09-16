@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
                     text.push_str(&t);
                 }
                 ChatEvent::Notice(message) => println!("[note] {message}"),
+                ChatEvent::ReasoningSummary { text, .. } => println!("[thinking] {text}"),
                 ChatEvent::ToolActivity { summary, .. } => println!("[tool] {summary}"),
                 ChatEvent::Completed { tool_calls, .. } => calls = tool_calls,
                 ChatEvent::Error(e) => anyhow::bail!("provider error: {e}"),

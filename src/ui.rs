@@ -92,12 +92,12 @@ fn draw_frame(frame: &mut Frame, app: &mut App, native_mascot: Option<&mascot::N
     }
 }
 
-fn active_status(app: &App) -> Option<&'static str> {
+fn active_status(app: &App) -> Option<&str> {
     if app.compacting {
         Some("Compacting context")
     } else {
         match app.mode {
-            Mode::Streaming => Some("Working"),
+            Mode::Streaming => Some(app.reasoning_status().unwrap_or("Working")),
             Mode::RunningTool => Some("Running tool"),
             Mode::Orchestrating => Some("Coordinating team"),
             _ => None,
@@ -113,11 +113,22 @@ fn draw_activity(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let y = area.y.saturating_add(area.height.saturating_sub(1) / 2);
+    let interrupt = if area.width >= 28 {
+        " (esc to interrupt)"
+    } else if area.width >= 12 {
+        " (esc)"
+    } else {
+        ""
+    };
+    let status = truncate_width(
+        status,
+        (area.width as usize).saturating_sub(2 + interrupt.len()),
+    );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("• ", Style::new().fg(app.theme.accent)),
             Span::styled(status, Style::new().fg(app.theme.fg)),
-            Span::styled(" (esc to interrupt)", Style::new().fg(app.theme.dim)),
+            Span::styled(interrupt, Style::new().fg(app.theme.dim)),
         ])),
         Rect::new(area.x, y, area.width, 1),
     );
@@ -750,7 +761,8 @@ fn render_entry(
                 Style::new().fg(theme.fg),
             );
         }
-        Entry::Assistant(text) => {
+        Entry::Assistant(text) | Entry::ReasoningSummary(text) => {
+            let reasoning = matches!(entry, Entry::ReasoningSummary(_));
             if !text.is_empty() {
                 for (index, line) in markdown::render(text, width.saturating_sub(2), theme)
                     .into_iter()
@@ -758,11 +770,19 @@ fn render_entry(
                 {
                     let mut spans = Vec::with_capacity(line.spans.len() + 1);
                     spans.push(if index == 0 {
-                        Span::styled("• ", Style::new().fg(theme.accent))
+                        Span::styled(
+                            "• ",
+                            Style::new().fg(if reasoning { theme.dim } else { theme.accent }),
+                        )
                     } else {
                         Span::raw("  ")
                     });
-                    spans.extend(line.spans);
+                    spans.extend(line.spans.into_iter().map(|mut span| {
+                        if reasoning {
+                            span.style = span.style.fg(theme.dim).add_modifier(Modifier::ITALIC);
+                        }
+                        span
+                    }));
                     lines.push(Line::from(spans));
                 }
             }

@@ -15,7 +15,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::Read;
 use tokio::sync::mpsc::UnboundedSender;
@@ -397,6 +397,9 @@ pub enum Entry {
     },
     User(String),
     Assistant(String),
+    /// Provider-exposed thinking summary, saved for display only. Never part
+    /// of the conversation history sent back to a model.
+    ReasoningSummary(String),
     Tool {
         summary: String,
         result: String,
@@ -515,6 +518,9 @@ pub struct App {
 
     gen: u64,
     streaming_text: String,
+    /// Item IDs are scoped to a provider request (Codex restarts at item_0).
+    reasoning_entries: HashMap<String, usize>,
+    reasoning_status: Option<String>,
     pending_calls: VecDeque<ToolCall>,
     /// Explicit grants for narrowly scoped paths/searches/commands. These are
     /// intentionally conversation-local and never persisted.
@@ -624,6 +630,8 @@ impl App {
             animation_tick: 0,
             gen: 0,
             streaming_text: String::new(),
+            reasoning_entries: HashMap::new(),
+            reasoning_status: None,
             pending_calls: VecDeque::new(),
             approved_scopes: HashSet::new(),
             agent_turns: 0,
@@ -1144,8 +1152,10 @@ impl App {
 
     fn on_chat_event(&mut self, event: ChatEvent) {
         match event {
+            ChatEvent::ReasoningSummary { id, text } => self.on_reasoning_summary(id, text),
             ChatEvent::TextDelta(text) => {
                 if !text.is_empty() {
+                    self.reasoning_status = None;
                     if let Some(active) = self.active_root_prompt.as_mut() {
                         active.observed_activity = true;
                     }
@@ -1179,6 +1189,7 @@ impl App {
                 }
             }
             ChatEvent::ToolActivity { summary, is_error } => {
+                self.reasoning_status = None;
                 if let Some(active) = self.active_root_prompt.as_mut() {
                     active.observed_activity = true;
                 }
@@ -1207,6 +1218,7 @@ impl App {
                 stop_reason,
                 usage,
             } => {
+                self.clear_reasoning_state();
                 if let Some(active) = self.active_root_prompt.as_mut() {
                     active.observed_activity = true;
                 }
@@ -1266,6 +1278,7 @@ impl App {
                 self.advance_tools();
             }
             ChatEvent::Error(message) => {
+                self.clear_reasoning_state();
                 let rollback_team_root = self.team_coordinator_has_no_activity();
                 if let Some(task) = self.request_task.take() {
                     task.abort();
@@ -1347,9 +1360,59 @@ impl App {
         }
     }
 
+    pub fn reasoning_status(&self) -> Option<&str> {
+        (self.mode == Mode::Streaming)
+            .then_some(self.reasoning_status.as_deref())
+            .flatten()
+    }
+
+    fn clear_reasoning_state(&mut self) {
+        self.reasoning_entries.clear();
+        self.reasoning_status = None;
+    }
+
+    fn on_reasoning_summary(&mut self, id: String, text: String) {
+        if id.trim().is_empty() || text.trim().is_empty() {
+            return;
+        }
+        if let Some(active) = self.active_root_prompt.as_mut() {
+            active.observed_activity = true;
+        }
+        let changed = if let Some(&index) = self.reasoning_entries.get(&id) {
+            let Some(Entry::ReasoningSummary(previous)) = self.transcript.get_mut(index) else {
+                return;
+            };
+            if *previous == text {
+                return; // Completed events can repeat the last update verbatim.
+            }
+            *previous = text;
+            index
+        } else {
+            if matches!(self.transcript.last(), Some(Entry::Assistant(t)) if t.is_empty()) {
+                self.transcript.pop();
+            }
+            let index = self.transcript.len();
+            self.transcript.push(Entry::ReasoningSummary(text));
+            self.reasoning_entries.insert(id, index);
+            index
+        };
+        // A late reconciliation of an earlier item must not replace the
+        // status of a tool or answer that has already followed it.
+        if changed + 1 == self.transcript.len() {
+            if let Entry::ReasoningSummary(text) = &self.transcript[changed] {
+                self.reasoning_status = Some(reasoning_heading(text));
+            }
+        }
+        self.transcript_dirty_from = Some(
+            self.transcript_dirty_from
+                .map_or(changed, |earlier| earlier.min(changed)),
+        );
+    }
+
     /// A user turn finished with a final answer: persist, and compact the
     /// context in the background if it has grown past the threshold.
     fn end_turn(&mut self) {
+        self.clear_reasoning_state();
         // A root turn is closed before another can start. Any provider events
         // already buffered with the old generation are ignored.
         self.gen += 1;
@@ -1993,6 +2056,7 @@ impl App {
     }
 
     fn fail_orchestration_root(&mut self, message: &str) {
+        self.clear_reasoning_state();
         // This path is used both before coordinator launch and for a
         // coordinator that failed before producing canonical output. Own and
         // fence every task here so callers cannot accidentally leave a late
@@ -2777,6 +2841,7 @@ impl App {
     }
 
     fn start_request(&mut self) {
+        self.clear_reasoning_state();
         let Some(model) = self
             .active_turn_model
             .clone()
@@ -2842,6 +2907,7 @@ impl App {
     }
 
     fn cancel_request_inner(&mut self, restore_queue: bool) {
+        self.clear_reasoning_state();
         let rollback_team_root = self.team_coordinator_has_no_activity();
         // Invalidate in-flight work; late events from old generations are dropped.
         self.gen += 1;
@@ -3152,6 +3218,7 @@ impl App {
         self.abort_orchestration();
         self.gen += 1;
         self.session_id = session::new_id();
+        self.clear_reasoning_state();
         self.history.clear();
         self.history_chars_cache.set(None);
         self.transcript.clear();
@@ -3211,6 +3278,7 @@ impl App {
                 self.abort_orchestration();
                 self.gen += 1;
                 self.session_id = loaded.id;
+                self.clear_reasoning_state();
                 self.history = loaded.history;
                 self.history_chars_cache.set(None);
                 self.transcript = loaded.transcript;
@@ -3517,6 +3585,26 @@ where
     }
 }
 
+/// Codex summaries commonly lead with a bold action heading. Keep that
+/// short status separate from the full display-only Markdown block.
+fn reasoning_heading(text: &str) -> String {
+    let heading = text
+        .split_once("**")
+        .and_then(|(_, rest)| rest.split_once("**"))
+        .map(|(heading, _)| heading)
+        .unwrap_or("");
+    let title: String = heading
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(120)
+        .collect();
+    if title.trim().is_empty() {
+        "Thinking".into()
+    } else {
+        title.trim().to_owned()
+    }
+}
+
 fn stage_compaction_event(
     event: ChatEvent,
     text: &mut String,
@@ -3548,6 +3636,7 @@ fn stage_compaction_event(
             );
         }
         ChatEvent::TextDelta(_)
+        | ChatEvent::ReasoningSummary { .. }
         | ChatEvent::Notice(_)
         | ChatEvent::ToolActivity { .. }
         | ChatEvent::Completed { .. } => {}
@@ -3625,13 +3714,17 @@ fn forward_or_hold_chat_event(
         ChatEvent::Completed { .. } if !matches!(terminal.as_ref(), Some(ChatEvent::Error(_))) => {
             *terminal = Some(event);
         }
-        ChatEvent::TextDelta(_) | ChatEvent::Notice(_) | ChatEvent::ToolActivity { .. }
+        ChatEvent::TextDelta(_)
+        | ChatEvent::ReasoningSummary { .. }
+        | ChatEvent::Notice(_)
+        | ChatEvent::ToolActivity { .. }
             if terminal.is_none() =>
         {
             return tx.send(AppEvent::Chat { gen, event }).is_ok();
         }
         ChatEvent::Completed { .. }
         | ChatEvent::TextDelta(_)
+        | ChatEvent::ReasoningSummary { .. }
         | ChatEvent::Notice(_)
         | ChatEvent::ToolActivity { .. } => {}
     }
@@ -3909,6 +4002,85 @@ fn project_instructions(cwd: &std::path::Path) -> ProjectInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_heading_requires_a_complete_nonempty_bold_span() {
+        assert_eq!(
+            reasoning_heading("**Inspecting the parser**\nNext step."),
+            "Inspecting the parser"
+        );
+        for text in ["plain summary", "**unfinished", "****", "**  **"] {
+            assert_eq!(reasoning_heading(text), "Thinking");
+        }
+        assert_eq!(reasoning_heading("**検証中\n**"), "検証中");
+        assert_eq!(
+            reasoning_heading(&format!("**{}**", "界".repeat(200)))
+                .chars()
+                .count(),
+            120
+        );
+    }
+
+    #[test]
+    fn reasoning_is_forwarded_only_before_the_terminal_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let summary = || ChatEvent::ReasoningSummary {
+            id: "item_0".into(),
+            text: "**Checking**\nInspecting the parser.".into(),
+        };
+        let mut terminal = None;
+        assert!(forward_or_hold_chat_event(7, summary(), &tx, &mut terminal));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::Chat {
+                gen: 7,
+                event: ChatEvent::ReasoningSummary { .. }
+            }
+        ));
+        assert!(forward_or_hold_chat_event(
+            7,
+            ChatEvent::Completed {
+                tool_calls: Vec::new(),
+                stop_reason: Some("stop".into()),
+                usage: None
+            },
+            &tx,
+            &mut terminal
+        ));
+        assert!(forward_or_hold_chat_event(7, summary(), &tx, &mut terminal));
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(terminal, Some(ChatEvent::Completed { .. })));
+    }
+
+    #[test]
+    fn compaction_uses_answer_text_and_ignores_thinking_summaries() {
+        let mut text = String::new();
+        let mut terminal = None;
+        stage_compaction_event(
+            ChatEvent::ReasoningSummary {
+                id: "item_0".into(),
+                text: "display-only summary".into(),
+            },
+            &mut text,
+            &mut terminal,
+        );
+        assert!(text.is_empty());
+        stage_compaction_event(
+            ChatEvent::TextDelta("canonical summary".into()),
+            &mut text,
+            &mut terminal,
+        );
+        stage_compaction_event(
+            ChatEvent::Completed {
+                tool_calls: Vec::new(),
+                stop_reason: Some("stop".into()),
+                usage: None,
+            },
+            &mut text,
+            &mut terminal,
+        );
+        assert_eq!(terminal, Some(Ok("canonical summary".into())));
+    }
 
     fn offline_config() -> Config {
         Config {

@@ -1,4 +1,4 @@
-use shaltaiboltai::app::{App, AppEvent, Mode};
+use shaltaiboltai::app::{App, AppEvent, Entry, Mode};
 use shaltaiboltai::config::Config;
 use shaltaiboltai::policy::{ExecutionPolicy, PermissionPreset, Workspace};
 use shaltaiboltai::providers::{
@@ -689,6 +689,291 @@ async fn mid_stream_errors_keep_partial_text_in_history() {
         "text the user saw must stay in the conversation"
     );
     assert_eq!(app.mode, Mode::Input);
+}
+
+#[tokio::test]
+async fn reasoning_summary_reconciles_and_persists_without_entering_provider_history() {
+    use shaltaiboltai::session;
+
+    let (mut app, _rx) = test_app();
+    enable_test_model(&mut app);
+    let prompt = format!("reasoning-session-{}", session::new_id());
+    app.textarea.insert_str(&prompt);
+    app.submit_input();
+    let gen = app.event_generation();
+
+    app.on_event(AppEvent::Chat {
+        gen,
+        event: ChatEvent::ReasoningSummary {
+            id: "reasoning-1".into(),
+            text: "**Inspecting the request**".into(),
+        },
+    });
+    let summary_index = app.transcript.len() - 1;
+    assert_eq!(app.reasoning_status(), Some("Inspecting the request"));
+
+    app.transcript_dirty_from = None;
+    let summary =
+        "**Inspecting the request**\nThe supplied examples identify the missing behavior.";
+    app.on_event(AppEvent::Chat {
+        gen,
+        event: ChatEvent::ReasoningSummary {
+            id: "reasoning-1".into(),
+            text: summary.into(),
+        },
+    });
+    assert_eq!(app.transcript.len(), summary_index + 1);
+    assert_eq!(app.transcript_dirty_from, Some(summary_index));
+    assert!(matches!(
+        &app.transcript[summary_index],
+        Entry::ReasoningSummary(text) if text == summary
+    ));
+    assert!(matches!(
+        app.history.as_slice(),
+        [Message::User(user)] if user.text() == prompt
+    ));
+
+    app.on_event(AppEvent::Chat {
+        gen,
+        event: ChatEvent::TextDelta("Here is the answer.".into()),
+    });
+    assert_eq!(app.reasoning_status(), None);
+    app.on_event(AppEvent::Chat {
+        gen,
+        event: completed(Vec::new()),
+    });
+    assert_eq!(app.mode, Mode::Input);
+    assert_eq!(app.reasoning_status(), None);
+    assert!(matches!(
+        app.history.as_slice(),
+        [Message::User(user), Message::Assistant { text, tool_calls }]
+            if user.text() == prompt && text == "Here is the answer." && tool_calls.is_empty()
+    ));
+
+    let saved = session::list()
+        .into_iter()
+        .find(|saved| saved.title == prompt)
+        .expect("completed turns save their transcript");
+    let loaded = session::load(&saved.path).unwrap();
+    assert!(matches!(
+        &loaded.transcript[summary_index],
+        Entry::ReasoningSummary(text) if text == summary
+    ));
+    assert_eq!(
+        serde_json::to_value(&loaded.history).unwrap(),
+        serde_json::to_value(&app.history).unwrap(),
+        "resuming must never send the display-only summary back to a provider"
+    );
+    let round_trip: session::Session =
+        serde_json::from_slice(&serde_json::to_vec(&loaded).unwrap()).unwrap();
+    assert!(matches!(
+        &round_trip.transcript[summary_index],
+        Entry::ReasoningSummary(text) if text == summary
+    ));
+}
+
+#[tokio::test]
+async fn reasoning_replays_and_late_updates_do_not_revive_status_after_output_or_tools() {
+    for tool_activity in [false, true] {
+        let (mut app, _rx) = test_app();
+        enable_test_model(&mut app);
+        app.textarea.insert_str("inspect the project");
+        app.submit_input();
+        let gen = app.event_generation();
+        app.on_event(AppEvent::Chat {
+            gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reasoning-1".into(),
+                text: "**Inspecting the project**".into(),
+            },
+        });
+        let summary_index = app.transcript.len() - 1;
+        assert_eq!(app.reasoning_status(), Some("Inspecting the project"));
+
+        app.on_event(AppEvent::Chat {
+            gen,
+            event: if tool_activity {
+                ChatEvent::ToolActivity {
+                    summary: "Read Cargo.toml".into(),
+                    is_error: false,
+                }
+            } else {
+                ChatEvent::TextDelta("The project uses Rust.".into())
+            },
+        });
+        assert_eq!(app.reasoning_status(), None);
+        let transcript_before_replay = serde_json::to_value(&app.transcript).unwrap();
+        app.transcript_dirty_from = None;
+        app.on_event(AppEvent::Chat {
+            gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reasoning-1".into(),
+                text: "**Inspecting the project**".into(),
+            },
+        });
+        assert_eq!(app.reasoning_status(), None);
+        assert_eq!(app.transcript_dirty_from, None);
+        assert_eq!(
+            serde_json::to_value(&app.transcript).unwrap(),
+            transcript_before_replay,
+            "item completion can repeat a summary without adding another transcript entry"
+        );
+
+        app.on_event(AppEvent::Chat {
+            gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reasoning-1".into(),
+                text: "**Inspecting the project**\nThe manifest confirms Rust.".into(),
+            },
+        });
+        assert_eq!(app.reasoning_status(), None);
+        assert_eq!(app.transcript_dirty_from, Some(summary_index));
+        assert_eq!(app.transcript.len(), summary_index + 2);
+        assert!(matches!(
+            &app.transcript[summary_index],
+            Entry::ReasoningSummary(text) if text.ends_with("The manifest confirms Rust.")
+        ));
+        if tool_activity {
+            assert!(matches!(app.transcript.last(), Some(Entry::Tool { .. })));
+        } else {
+            assert!(matches!(
+                app.transcript.last(),
+                Some(Entry::Assistant(text)) if text == "The project uses Rust."
+            ));
+        }
+        app.cancel_request();
+    }
+}
+
+#[tokio::test]
+async fn reasoning_activity_survives_error_or_cancel_without_rolling_back_the_prompt() {
+    for cancel in [false, true] {
+        let (mut app, _rx) = test_app();
+        enable_test_model(&mut app);
+        app.textarea.insert_str("preserve this observed request");
+        app.submit_input();
+        let gen = app.event_generation();
+        app.on_event(AppEvent::Chat {
+            gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reasoning-1".into(),
+                text: "Checking the supplied examples".into(),
+            },
+        });
+        if cancel {
+            app.cancel_request();
+        } else {
+            app.on_event(AppEvent::Chat {
+                gen,
+                event: ChatEvent::Error("connection interrupted".into()),
+            });
+        }
+
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.reasoning_status(), None);
+        assert!(
+            app.input_is_empty(),
+            "observed activity must not restore the prompt"
+        );
+        assert!(matches!(
+            app.history.as_slice(),
+            [Message::User(user)] if user.text() == "preserve this observed request"
+        ));
+        assert!(app.transcript.iter().any(|entry| matches!(
+            entry,
+            Entry::User(text) if text == "preserve this observed request"
+        )));
+        assert!(app.transcript.iter().any(|entry| matches!(
+            entry,
+            Entry::ReasoningSummary(text) if text == "Checking the supplied examples"
+        )));
+        assert!(!app
+            .transcript
+            .iter()
+            .any(|entry| matches!(entry, Entry::Assistant(_))));
+
+        let preserved = serde_json::to_value(&app.transcript).unwrap();
+        app.on_event(AppEvent::Chat {
+            gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reasoning-1".into(),
+                text: "Late update from the interrupted request".into(),
+            },
+        });
+        assert_eq!(serde_json::to_value(&app.transcript).unwrap(), preserved);
+        assert_eq!(app.reasoning_status(), None);
+    }
+}
+
+#[tokio::test]
+async fn reasoning_ids_are_scoped_to_each_request_and_stale_events_cannot_change_a_new_turn() {
+    for terminal in ["completed", "error", "cancelled"] {
+        let (mut app, _rx) = test_app();
+        enable_test_model(&mut app);
+        app.textarea.insert_str("first request");
+        app.submit_input();
+        let first_gen = app.event_generation();
+        app.on_event(AppEvent::Chat {
+            gen: first_gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reused-id".into(),
+                text: "**First request summary**".into(),
+            },
+        });
+        match terminal {
+            "completed" => app.on_event(AppEvent::Chat {
+                gen: first_gen,
+                event: completed(Vec::new()),
+            }),
+            "error" => app.on_event(AppEvent::Chat {
+                gen: first_gen,
+                event: ChatEvent::Error("connection interrupted".into()),
+            }),
+            _ => app.cancel_request(),
+        }
+        assert_eq!(app.reasoning_status(), None);
+
+        app.textarea.insert_str("second request");
+        app.submit_input();
+        let second_gen = app.event_generation();
+        assert_ne!(first_gen, second_gen);
+        assert_eq!(app.reasoning_status(), None);
+        app.on_event(AppEvent::Chat {
+            gen: second_gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reused-id".into(),
+                text: "**Second request summary**".into(),
+            },
+        });
+        assert_eq!(app.reasoning_status(), Some("Second request summary"));
+        let summaries: Vec<&str> = app
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::ReasoningSummary(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            summaries,
+            ["**First request summary**", "**Second request summary**"]
+        );
+
+        let transcript = serde_json::to_value(&app.transcript).unwrap();
+        let history = serde_json::to_value(&app.history).unwrap();
+        app.on_event(AppEvent::Chat {
+            gen: first_gen,
+            event: ChatEvent::ReasoningSummary {
+                id: "reused-id".into(),
+                text: "**Stale first request summary**".into(),
+            },
+        });
+        assert_eq!(serde_json::to_value(&app.transcript).unwrap(), transcript);
+        assert_eq!(serde_json::to_value(&app.history).unwrap(), history);
+        assert_eq!(app.mode, Mode::Streaming);
+        assert_eq!(app.reasoning_status(), Some("Second request summary"));
+        app.cancel_request();
+    }
 }
 
 #[tokio::test]
