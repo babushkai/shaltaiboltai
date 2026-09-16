@@ -255,6 +255,13 @@ pub struct Usage {
 #[derive(Debug)]
 pub enum ChatEvent {
     TextDelta(String),
+    /// Display-only snapshot of a provider-exposed reasoning summary. Replaces
+    /// the previous snapshot with this item id; never append it to assistant
+    /// content or include it in conversation history sent to a provider.
+    ReasoningSummary {
+        id: String,
+        text: String,
+    },
     /// Local provider note that did not come from model output and therefore
     /// must not make an otherwise rejected prompt look consumed.
     Notice(String),

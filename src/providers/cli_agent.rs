@@ -976,21 +976,35 @@ fn cli_model_override<'a>(
 /// Translate one `codex exec --json` event. Returns true on `turn.completed`
 /// (the terminal event).
 fn handle_codex_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
-    match event["type"].as_str().unwrap_or("") {
-        "item.completed" | "item.updated" => {
+    let event_type = event["type"].as_str().unwrap_or("");
+    match event_type {
+        "item.started" | "item.completed" | "item.updated" => {
             let item = &event["item"];
             match item["type"].as_str().unwrap_or("") {
                 // Only emit finished assistant messages, so item.updated deltas
                 // (if any) don't double up with the completed text.
-                "agent_message" if event["type"] == "item.completed" => {
+                "agent_message" if event_type == "item.completed" => {
                     if let Some(text) = item["text"].as_str() {
                         if !text.is_empty() {
                             let _ = tx.send(ChatEvent::TextDelta(text.to_owned()));
                         }
                     }
                 }
-                "reasoning" | "agent_message" | "todo_list" => {}
-                "error" => {
+                "reasoning" => {
+                    // Exec emits the public summary as a full item snapshot,
+                    // not a delta. Only this explicit text field is displayable;
+                    // raw reasoning content is never inspected or forwarded.
+                    if let (Some(id), Some(text)) = (item["id"].as_str(), item["text"].as_str()) {
+                        if !id.trim().is_empty() && !text.trim().is_empty() {
+                            let _ = tx.send(ChatEvent::ReasoningSummary {
+                                id: id.to_owned(),
+                                text: text.to_owned(),
+                            });
+                        }
+                    }
+                }
+                "agent_message" | "todo_list" => {}
+                "error" if event_type != "item.started" => {
                     let msg = item["message"].as_str().or_else(|| item["text"].as_str());
                     // Codex can emit recoverable warnings (for example, an
                     // unstable-feature warning) as an item-level `error` and
@@ -1000,7 +1014,7 @@ fn handle_codex_event(event: &Value, tx: &UnboundedSender<ChatEvent>) -> bool {
                         msg.unwrap_or("codex reported an error").to_owned(),
                     ));
                 }
-                _ if event["type"] == "item.completed" => {
+                _ if event_type == "item.completed" => {
                     let _ = tx.send(ChatEvent::ToolActivity {
                         summary: summarize_codex_item(item),
                         is_error: item["exit_code"].as_i64().is_some_and(|c| c != 0),
@@ -1997,12 +2011,132 @@ sleep 30"#,
     }
 
     #[test]
-    fn codex_reasoning_items_are_silent() {
+    fn codex_reasoning_lifecycle_emits_full_summary_snapshots() {
         let (tx, mut rx) = unbounded_channel();
-        handle_codex_event(
-            &json!({"type": "item.completed", "item": {"type": "reasoning", "text": "thinking hard"}}),
-            &tx,
-        );
+        let snapshots = [
+            ("item.started", "Inspecting"),
+            ("item.updated", "Inspecting the renderer"),
+            (
+                "item.completed",
+                "**表示を確認**\nThe renderer needs an update. 🛠️",
+            ),
+        ];
+        for (event_type, text) in snapshots {
+            assert!(!handle_codex_event(
+                &json!({
+                    "type": event_type,
+                    "item": {"id": "item_0", "type": "reasoning", "text": text}
+                }),
+                &tx,
+            ));
+        }
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), snapshots.len());
+        for (event, (_, snapshot)) in events.iter().zip(snapshots) {
+            assert!(matches!(
+                event,
+                ChatEvent::ReasoningSummary { id, text } if id == "item_0" && text == snapshot
+            ));
+        }
+    }
+
+    #[test]
+    fn codex_reasoning_ignores_malformed_or_empty_summaries_and_raw_content() {
+        let (tx, mut rx) = unbounded_channel();
+        let malformed = [
+            json!({"type": "reasoning", "text": "missing id"}),
+            json!({"id": "", "type": "reasoning", "text": "empty id"}),
+            json!({"id": " \n", "type": "reasoning", "text": "blank id"}),
+            json!({"id": 1, "type": "reasoning", "text": "numeric id"}),
+            json!({"id": null, "type": "reasoning", "text": "null id"}),
+            json!({"id": "item_0", "type": "reasoning"}),
+            json!({"id": "item_0", "type": "reasoning", "text": ""}),
+            json!({"id": "item_0", "type": "reasoning", "text": " \n\t"}),
+            json!({"id": "item_0", "type": "reasoning", "text": null}),
+            json!({"id": "item_0", "type": "reasoning", "text": 7}),
+            json!({"id": "item_0", "type": "reasoning", "text": ["invalid text"]}),
+            json!({"id": "item_0", "type": "reasoning", "content": "private raw content"}),
+            json!({"id": "item_0", "type": "reasoning", "text": {"content": "private raw content"}}),
+        ];
+        for event_type in ["item.started", "item.updated", "item.completed"] {
+            for item in &malformed {
+                assert!(!handle_codex_event(
+                    &json!({"type": event_type, "item": item}),
+                    &tx,
+                ));
+            }
+        }
         assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn codex_reasoning_summary_never_forwards_raw_content() {
+        let (tx, mut rx) = unbounded_channel();
+        assert!(!handle_codex_event(
+            &json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "item_1",
+                    "type": "reasoning",
+                    "text": "Checking the provided example.",
+                    "content": ["private raw content"],
+                    "raw_content": "other private content"
+                }
+            }),
+            &tx,
+        ));
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ChatEvent::ReasoningSummary { id, text }
+                if id == "item_1" && text == "Checking the provided example."
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_driver_streams_reasoning_summary_before_final_answer() {
+        let fixture = PolicyFixture::new(SandboxMode::ReadOnly, ApprovalPolicy::OnRequest);
+        let release = fixture.base.join("release-final-answer");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .env("SHALTAIBOLTAI_TEST_RELEASE", &release)
+            .arg("-c")
+            .arg(
+                r#"while IFS= read -r line || [ -n "$line" ]; do :; done
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"Checking the example."}}'
+while [ ! -e "$SHALTAIBOLTAI_TEST_RELEASE" ]; do sleep 0.01; done
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"The answer is ready."}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":6}}'"#,
+            );
+        let (tx, mut rx) = unbounded_channel();
+        let driver = drive(command, "fake-codex", "prompt", &tx, handle_codex_event);
+        tokio::pin!(driver);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let first = tokio::select! {
+                result = &mut driver => panic!("driver finished before the final answer was released: {result:?}"),
+                event = rx.recv() => event.expect("reasoning summary event"),
+            };
+            assert!(matches!(
+                first,
+                ChatEvent::ReasoningSummary { id, text }
+                    if id == "item_0" && text == "Checking the example."
+            ));
+            assert!(rx.try_recv().is_err(), "final answer is still gated");
+            std::fs::write(&release, b"ready").expect("release fake CLI final answer");
+            driver.await.expect("completed fake turn");
+
+            let events = drain(&mut rx);
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], ChatEvent::TextDelta(text) if text == "The answer is ready.")
+            );
+            assert!(matches!(&events[1], ChatEvent::Completed { .. }));
+        })
+        .await
+        .expect("reasoning summary must stream without waiting for the final answer");
     }
 }
