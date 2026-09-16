@@ -3,10 +3,12 @@ use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use shaltaiboltai::app::{App, AppEvent, Entry, Mode, PermissionOverlay};
 use shaltaiboltai::config::Config;
+use shaltaiboltai::orchestration::PlannedTask;
 use shaltaiboltai::policy::{ExecutionPolicy, PermissionPreset, Workspace};
 use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
 use shaltaiboltai::{theme, ui};
 use tokio::sync::mpsc::unbounded_channel;
+use unicode_width::UnicodeWidthStr;
 
 /// Tests must never read or write the user's real data dir (persisted theme,
 /// sessions, input history).
@@ -14,12 +16,13 @@ fn isolate_data_dir() {
     let tmp = std::env::temp_dir().join(format!("shaltai-render-{}", std::process::id()));
     std::env::set_var("SHALTAIBOLTAI_DATA_DIR", tmp);
 }
-
 fn offline_config() -> Config {
     Config {
         anthropic_api_key: None,
         openai_api_key: None,
         openai_base_url: "http://127.0.0.1:9".into(),
+        openrouter_api_key: None,
+        openrouter_base_url: "http://127.0.0.1:9".into(),
         ollama_host: "http://127.0.0.1:9".into(),
         default_model: None,
         compact_threshold_chars: 80_000,
@@ -122,6 +125,94 @@ fn golden_app(selected_theme: theme::Theme) -> App {
     app.model = Some(ModelEntry {
         provider: ProviderKind::OpenAi,
         id: "gpt-golden".into(),
+    });
+    app
+}
+
+fn mixed_team_confirmation_app() -> App {
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "team-test".into(),
+    });
+    app.textarea.insert_str("/team 2");
+    app.submit_input();
+    app.textarea
+        .insert_str("coordinate this mixed-provider change");
+    app.submit_input();
+    let run_id = app.orchestration_run_id().expect("orchestration run");
+    app.on_event(AppEvent::OrchestrationPlanned {
+        run_id,
+        result: Ok(vec![
+            PlannedTask {
+                id: 1,
+                title: "inspect with Codex".into(),
+                instructions: "read the relevant code".into(),
+                model: ModelEntry {
+                    provider: ProviderKind::Codex,
+                    id: "codex:gpt-5.6-sol".into(),
+                },
+            },
+            PlannedTask {
+                id: 2,
+                title: "review independently".into(),
+                instructions: "check the provider boundary".into(),
+                model: ModelEntry {
+                    provider: ProviderKind::OpenRouter,
+                    id: "openai/gpt-5.4".into(),
+                },
+            },
+        ]),
+    });
+    app
+}
+
+fn max_worker_confirmation_app(workers: usize) -> App {
+    let (tx, _rx) = unbounded_channel();
+    let mut app = App::new(offline_config(), tx);
+    app.discovering = false;
+    app.model = Some(ModelEntry {
+        provider: ProviderKind::Ollama,
+        id: "team-test".into(),
+    });
+    app.textarea.insert_str(format!("/team {workers}"));
+    app.submit_input();
+    app.textarea
+        .insert_str("coordinate the maximum worker review");
+    app.submit_input();
+    let run_id = app.orchestration_run_id().expect("orchestration run");
+    let titles = [
+        "inspect parser",
+        "review routing",
+        "audit cancellation",
+        "trace transport",
+    ];
+    let tasks = titles
+        .into_iter()
+        .take(workers)
+        .enumerate()
+        .map(|(index, title)| PlannedTask {
+            id: index + 1,
+            title: title.into(),
+            instructions: format!("inspect task {} completely", index + 1),
+            model: if index % 2 == 0 {
+                ModelEntry {
+                    provider: ProviderKind::Codex,
+                    id: "codex:gpt-5.6-sol".into(),
+                }
+            } else {
+                ModelEntry {
+                    provider: ProviderKind::OpenRouter,
+                    id: "openai/gpt-5.4".into(),
+                }
+            },
+        })
+        .collect();
+    app.on_event(AppEvent::OrchestrationPlanned {
+        run_id,
+        result: Ok(tasks),
     });
     app
 }
@@ -493,6 +584,117 @@ async fn terminal_outcomes_remove_reasoning_activity_but_keep_the_summary() {
 }
 
 #[tokio::test]
+async fn mixed_team_confirmation_pages_match_reviewed_constrained_snapshots() {
+    isolate_data_dir();
+    for (width, height, review_snapshot, tasks_snapshot) in [
+        (
+            40,
+            12,
+            include_str!("codex_style_team_confirmation_40x12_review.snap"),
+            include_str!("codex_style_team_confirmation_40x12_tasks.snap"),
+        ),
+        (
+            40,
+            15,
+            include_str!("codex_style_team_confirmation_40x15_review.snap"),
+            include_str!("codex_style_team_confirmation_40x15_tasks.snap"),
+        ),
+        (
+            80,
+            12,
+            include_str!("codex_style_team_confirmation_80x12_review.snap"),
+            include_str!("codex_style_team_confirmation_80x12_tasks.snap"),
+        ),
+    ] {
+        let mut app = mixed_team_confirmation_app();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let review_screen = screen(&terminal);
+        assert_eq!(review_screen.lines().count(), height as usize);
+        assert!(
+            review_screen
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) == width as usize),
+            "{review_screen}"
+        );
+        assert_eq!(text_snapshot(&terminal), review_snapshot);
+        assert!(!app.orchestration_confirm_can_start());
+
+        app.confirm_orchestration();
+        assert_eq!(app.mode, Mode::OrchestrationConfirm);
+        assert!(!app.orchestration_confirm_focused);
+        app.toggle_orchestration_confirm_focus();
+        assert!(app.orchestration_confirm_focused);
+
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let tasks_screen = screen(&terminal);
+        assert_eq!(tasks_screen.lines().count(), height as usize);
+        assert!(
+            tasks_screen
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) == width as usize),
+            "{tasks_screen}"
+        );
+        assert_eq!(text_snapshot(&terminal), tasks_snapshot);
+        assert!(app.orchestration_confirm_can_start());
+
+        app.toggle_orchestration_confirm_focus();
+        assert!(!app.orchestration_confirm_focused);
+        assert!(!app.orchestration_confirm_can_start());
+    }
+}
+
+#[tokio::test]
+async fn clipped_team_confirmation_cannot_start() {
+    isolate_data_dir();
+    let mut app = mixed_team_confirmation_app();
+    let mut terminal = Terminal::new(TestBackend::new(80, 11)).unwrap();
+
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(text_snapshot(&terminal).contains("resize to review disclosures"));
+    app.toggle_orchestration_confirm_focus();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    assert!(text_snapshot(&terminal).contains("resize to review full plan"));
+    assert!(!app.orchestration_confirm_can_start());
+
+    app.confirm_orchestration();
+    assert_eq!(app.mode, Mode::OrchestrationConfirm);
+}
+
+#[tokio::test]
+async fn narrow_three_and_four_worker_pages_keep_titles_and_exact_models() {
+    isolate_data_dir();
+    let title_fragments = ["insp", "revi", "audi", "trac"];
+    for workers in [3, 4] {
+        let mut app = max_worker_confirmation_app(workers);
+        app.toggle_orchestration_confirm_focus();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+
+        for (index, title) in title_fragments.iter().take(workers).enumerate() {
+            let id = index + 1;
+            let row = rendered
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("{id} ")))
+                .unwrap_or_else(|| panic!("missing task {id} row:\n{rendered}"));
+            assert!(row.contains(title), "task {id} lost its title:\n{rendered}");
+            let exact_model = if index % 2 == 0 {
+                "gpt-5.6-sol · codex"
+            } else {
+                "openai/gpt-5.4 · openrouter"
+            };
+            assert!(
+                row.contains(exact_model),
+                "task {id} lost its exact model/provider:\n{rendered}"
+            );
+        }
+        assert!(app.orchestration_confirm_can_start(), "{rendered}");
+    }
+}
+
+#[tokio::test]
 async fn theme_switch_restyles_the_frame() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
@@ -544,7 +746,7 @@ async fn slash_input_opens_the_command_menu() {
 }
 
 #[tokio::test]
-async fn model_picker_distinguishes_cli_defaults_aliases_and_exact_models() {
+async fn model_picker_distinguishes_cli_and_openrouter_model_contracts() {
     isolate_data_dir();
     let (tx, _rx) = unbounded_channel();
     let mut app = App::new(offline_config(), tx);
@@ -561,20 +763,50 @@ async fn model_picker_distinguishes_cli_defaults_aliases_and_exact_models() {
             provider: ProviderKind::Codex,
             id: "codex:gpt-5.6-sol".into(),
         },
+        ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: "openrouter/auto".into(),
+        },
+        ModelEntry {
+            provider: ProviderKind::OpenRouter,
+            id: "anthropic/claude-sonnet-4.6".into(),
+        },
     ];
+    app.config.default_model = Some("codex:gpt-5.6-sol".into());
+    app.model = app
+        .models
+        .iter()
+        .find(|model| model.id == "codex:gpt-5.6-sol")
+        .cloned();
     app.open_picker();
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
 
     terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
     let rendered = screen(&terminal);
 
-    assert!(rendered.contains("claude-code  CLI default"), "{rendered}");
     assert!(
-        rendered.contains("claude-code  sonnet · latest alias · subscription sub-agent"),
+        rendered.contains("claude-code  CLI default")
+            && rendered.contains("unpinned · solo-only · subscription sub-agent"),
         "{rendered}"
     );
     assert!(
-        rendered.contains("codex        gpt-5.6-sol · subscription sub-agent"),
+        rendered.contains("claude-code  sonnet")
+            && rendered.contains("latest alias · subscription sub-agent"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("codex        ● current/default · gpt-5.6-sol")
+            && rendered.contains("subscription sub-agent"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("openrouter   openrouter/auto")
+            && rendered.contains("variable route · solo-only · pricing varies"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("openrouter   anthropic/claude-sonnet-4.6")
+            && rendered.contains("routed API · pricing varies"),
         "{rendered}"
     );
 }

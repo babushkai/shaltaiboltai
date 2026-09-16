@@ -12,6 +12,39 @@ use crossterm::execute;
 use futures_util::StreamExt;
 use policy::{ApprovalPolicy, ExecutionPolicy, SandboxMode, Workspace};
 use std::path::{Path, PathBuf};
+use tokio::time::Instant;
+
+/// Coalesce provider, input, and animation updates without allowing a dense
+/// event stream to drive the terminal faster than 120 frames per second.
+const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(8_333_334);
+
+#[derive(Debug)]
+struct FrameLimiter {
+    next_draw_at: Instant,
+    redraw_pending: bool,
+}
+
+impl FrameLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_draw_at: now,
+            redraw_pending: true,
+        }
+    }
+
+    fn request_redraw(&mut self) {
+        self.redraw_pending = true;
+    }
+
+    fn is_ready(&self, now: Instant) -> bool {
+        self.redraw_pending && now >= self.next_draw_at
+    }
+
+    fn mark_drawn(&mut self, started_at: Instant) {
+        self.redraw_pending = false;
+        self.next_draw_at = started_at + MIN_FRAME_INTERVAL;
+    }
+}
 
 const HELP: &str = "\
 shaltaiboltai — a multi-provider agentic coding TUI
@@ -34,8 +67,9 @@ OPTIONS:
     -V, --version                     Print version and exit
 
 With no options it launches the interactive TUI. Configure providers via
-ANTHROPIC_API_KEY / OPENAI_API_KEY / a running Ollama, or a logged-in
-`claude` / `codex` CLI for subscription use on Unix. See the README for details.";
+ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / a running Ollama,
+or a logged-in `claude` / `codex` CLI for subscription use on Unix. See the
+README for details.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalDecision {
@@ -244,18 +278,28 @@ async fn run(
     // new working state starts at the first authored mascot pose.
     animation.tick().await;
     environment.tick().await;
+    let mut frames = FrameLimiter::new(Instant::now());
 
     while !app.should_quit {
         submit_initial_prompt_when_ready(&mut app, &mut pending_initial_prompt);
-        terminal.draw(|frame| {
-            if let Some(native_mascot) = native_mascot {
-                ui::draw_with_native_mascot(frame, &mut app, native_mascot);
-            } else {
-                ui::draw(frame, &mut app);
-            }
-        })?;
+        let now = Instant::now();
+        if frames.is_ready(now) {
+            terminal.draw(|frame| {
+                if let Some(native_mascot) = native_mascot {
+                    ui::draw_with_native_mascot(frame, &mut app, native_mascot);
+                } else {
+                    ui::draw(frame, &mut app);
+                }
+            })?;
+            frames.mark_drawn(now);
+        }
+
+        let redraw_deadline = frames.next_draw_at;
 
         tokio::select! {
+            // A pending draw that was coalesced during the frame interval gets
+            // one precise wake-up even when no further terminal event arrives.
+            _ = tokio::time::sleep_until(redraw_deadline), if frames.redraw_pending => {}
             Some(event) = rx.recv() => {
                 app.on_event(event);
                 // Coalesce a bounded burst into one redraw, then yield back to
@@ -272,6 +316,7 @@ async fn run(
                 Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
                 Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 Event::Paste(text) => app.paste(&text),
+                Event::Resize(_, _) => app.invalidate_orchestration_confirm_layout(),
                 _ => {}
             },
             // A persistent clock keeps the mascot moving even during dense
@@ -283,6 +328,7 @@ async fn run(
                 app.refresh_environment();
             }
         }
+        frames.request_redraw();
     }
     app.save_session_for_exit()?;
     Ok(())
@@ -373,7 +419,7 @@ fn handle_orchestration_confirm_key(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Tab => app.toggle_orchestration_confirm_focus(),
-        KeyCode::Enter | KeyCode::Char('y') if app.orchestration_confirm_focused => {
+        KeyCode::Enter | KeyCode::Char('y') if app.orchestration_confirm_can_start() => {
             app.confirm_orchestration();
         }
         _ => {}
@@ -652,9 +698,25 @@ fn handle_session_picker_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
     use shaltaiboltai::orchestration::PlannedTask;
     use shaltaiboltai::providers::{ChatEvent, ImageData, ModelEntry, ProviderKind, ToolCall};
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn frame_limiter_coalesces_requests_at_120_fps() {
+        let started_at = Instant::now();
+        let mut frames = FrameLimiter::new(started_at);
+
+        assert!(frames.is_ready(started_at));
+        frames.mark_drawn(started_at);
+        assert!(!frames.is_ready(started_at + MIN_FRAME_INTERVAL));
+
+        frames.request_redraw();
+        frames.request_redraw();
+        assert!(!frames.is_ready(started_at + std::time::Duration::from_millis(8)));
+        assert!(frames.is_ready(started_at + MIN_FRAME_INTERVAL));
+    }
 
     fn test_app() -> App {
         let data_dir = std::env::temp_dir().join(format!("shaltai-main-{}", std::process::id()));
@@ -663,6 +725,8 @@ mod tests {
             anthropic_api_key: None,
             openai_api_key: None,
             openai_base_url: "http://127.0.0.1:9".into(),
+            openrouter_api_key: None,
+            openrouter_base_url: "http://127.0.0.1:9".into(),
             ollama_host: "http://127.0.0.1:9".into(),
             default_model: None,
             compact_threshold_chars: 80_000,
@@ -790,6 +854,12 @@ mod tests {
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.orchestration_confirm_focused);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::OrchestrationConfirm);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert!(app.orchestration_confirm_can_start());
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Orchestrating);
 

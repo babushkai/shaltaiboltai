@@ -36,7 +36,9 @@ pub async fn stream_chat(
     // Not every local model supports tool calling; degrade to plain chat
     // rather than failing the whole turn.
     if response.status() == reqwest::StatusCode::BAD_REQUEST {
-        let text = response.text().await.unwrap_or_default();
+        let text = sse::read_error_body(response)
+            .await
+            .context("Ollama 400 response body could not be read")?;
         if text.contains("does not support tools") {
             body.as_object_mut().unwrap().remove("tools");
             response = sse::send_retrying(client.post(&url).json(&body)).await?;
@@ -122,7 +124,7 @@ pub async fn list_models(config: &Config) -> Result<Vec<String>> {
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await?;
-    let body: Value = sse::check_status(response).await?.json().await?;
+    let body: Value = sse::read_json_response(sse::check_status(response).await?).await?;
 
     let mut ids: Vec<String> = body["models"]
         .as_array()

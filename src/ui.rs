@@ -1,6 +1,7 @@
 use crate::app::{App, Entry, Mode, PermissionOverlay, PERMISSION_PRESETS};
 use crate::markdown;
 use crate::mascot;
+use crate::providers::{self, ProviderKind};
 use crate::session;
 use crate::theme::{self, Theme};
 use crate::tools;
@@ -17,6 +18,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 6;
 const MAX_INPUT_LINES: u16 = 8;
+const MIN_CONFIRM_TASK_TITLE_WIDTH: usize = 4;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_frame(frame, app, None);
@@ -1084,6 +1086,46 @@ fn truncate_width(text: &str, max: usize) -> String {
     out
 }
 
+fn compact_model_identity(id: &str, provider: &str, max: usize) -> String {
+    let full = format!("{id} · {provider}");
+    if UnicodeWidthStr::width(full.as_str()) <= max {
+        return full;
+    }
+    let provider_width = UnicodeWidthStr::width(provider);
+    let separator = " · ";
+    let separator_width = UnicodeWidthStr::width(separator);
+    if max <= provider_width + separator_width {
+        return truncate_width(provider, max);
+    }
+    let id_budget = max - provider_width - separator_width;
+    format!(
+        "{}{}{}",
+        truncate_left_width(id, id_budget),
+        separator,
+        provider
+    )
+}
+
+fn truncate_left_width(text: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut reversed = String::new();
+    let mut width = 0;
+    for ch in text.chars().rev() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + 1 > max {
+            break;
+        }
+        reversed.push(ch);
+        width += ch_width;
+    }
+    format!("…{}", reversed.chars().rev().collect::<String>())
+}
+
 fn selection_style(theme: &Theme) -> Style {
     let mut style = Style::new().fg(theme.fg).add_modifier(Modifier::BOLD);
     if let Some(selection) = theme.hover.or(theme.elevated).or(theme.surface) {
@@ -1207,35 +1249,101 @@ fn draw_slash_menu(frame: &mut Frame, app: &App, input_area: Rect) {
 fn draw_model_picker(frame: &mut Frame, app: &App) {
     let theme = app.theme;
     let models = app.filtered_models();
+    let configured_default = app.config.default_model.as_deref().and_then(|selector| {
+        providers::qualified_model_selector(selector).or_else(|| {
+            app.models
+                .iter()
+                .find(|model| model.id == selector)
+                .cloned()
+        })
+    });
     let provider_width = models
         .iter()
         .map(|model| UnicodeWidthStr::width(model.provider.label()))
         .max()
         .unwrap_or(0);
+    let row_width = frame.area().width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = models
         .iter()
         .enumerate()
         .map(|(index, m)| {
+            let is_default = configured_default
+                .as_ref()
+                .is_some_and(|default| default.provider == m.provider && default.id == m.id);
+            let is_current = app
+                .model
+                .as_ref()
+                .is_some_and(|current| current.provider == m.provider && current.id == m.id);
+            let marker = match (is_current, is_default) {
+                (true, true) => "● current/default · ",
+                (true, false) => "● current · ",
+                (false, true) => "◇ default · ",
+                (false, false) => "",
+            };
+            let number = format!("{}. ", index + 1);
+            let number_width = UnicodeWidthStr::width(number.as_str());
+            let id_budget = row_width
+                .saturating_sub(number_width + provider_width + 2 + UnicodeWidthStr::width(marker));
             let mut spans = vec![
-                Span::styled(format!("{}. ", index + 1), Style::new().fg(theme.dim)),
+                Span::styled(number, Style::new().fg(theme.dim)),
                 Span::styled(
                     format!("{:<provider_width$}  ", m.provider.label()),
                     Style::new().fg(theme.accent2),
                 ),
-                Span::styled(m.display_id().to_owned(), Style::new().fg(theme.fg)),
+                Span::styled(
+                    marker,
+                    Style::new()
+                        .fg(if is_current { theme.accent } else { theme.dim })
+                        .add_modifier(if is_current {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    truncate_width(m.display_id(), id_budget),
+                    Style::new().fg(theme.fg),
+                ),
             ];
-            if m.provider.is_sub_agent() {
-                let detail = if m.is_claude_alias() {
-                    " · latest alias · subscription sub-agent"
+            let detail = if m.provider.is_sub_agent() {
+                Some(if providers::is_cli_default_model(m) {
+                    "unpinned · solo-only · subscription sub-agent"
+                } else if m.is_claude_alias() {
+                    "latest alias · subscription sub-agent"
                 } else {
-                    " · subscription sub-agent"
-                };
-                spans.push(Span::styled(detail, Style::new().fg(theme.dim)));
+                    "subscription sub-agent"
+                })
+            } else if m.provider == ProviderKind::OpenRouter {
+                Some(if crate::providers::openrouter::is_variable_model(&m.id) {
+                    "variable route · solo-only · pricing varies"
+                } else {
+                    "routed API · pricing varies"
+                })
+            } else {
+                None
+            };
+            let mut lines = vec![Line::from(std::mem::take(&mut spans))];
+            if let Some(detail) = detail {
+                let indent = number_width + provider_width + 2;
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(
+                        truncate_width(detail, row_width.saturating_sub(indent)),
+                        Style::new().fg(theme.dim),
+                    ),
+                ]));
             }
-            ListItem::new(Line::from(spans))
+            ListItem::new(lines)
         })
         .collect();
-    let preferred_height = (models.len() as u16).saturating_add(6).clamp(8, 16);
+    let item_rows = models
+        .iter()
+        .map(|model| {
+            usize::from(model.provider.is_sub_agent() || model.provider == ProviderKind::OpenRouter)
+                + 1
+        })
+        .sum::<usize>() as u16;
+    let preferred_height = item_rows.saturating_add(6).clamp(8, 16);
     let height = preferred_height.min(frame.area().height);
     let area = Rect::new(
         frame.area().x,
@@ -1294,7 +1402,6 @@ fn draw_model_picker(frame: &mut Frame, app: &App) {
         footer_area,
     );
 }
-
 fn draw_permissions(frame: &mut Frame, app: &App) {
     let theme = app.theme;
     let root = frame.area();
@@ -1523,10 +1630,22 @@ fn draw_overlay_list(
     items: Vec<ListItem>,
     selected: usize,
 ) {
+    let preferred_height = (items.len() as u16 + 2).clamp(5, 22);
+    draw_overlay_list_sized(frame, theme, title, items, selected, 76, preferred_height);
+}
+
+fn draw_overlay_list_sized(
+    frame: &mut Frame,
+    theme: &Theme,
+    title: String,
+    items: Vec<ListItem>,
+    selected: usize,
+    preferred_width: u16,
+    preferred_height: u16,
+) {
     let root = frame.area();
     draw_modal_scrim(frame, theme, root);
-    let preferred_height = (items.len() as u16 + 2).clamp(5, 22);
-    let area = modal_area(frame.area(), 76, preferred_height);
+    let area = modal_area(frame.area(), preferred_width, preferred_height);
     frame.render_widget(Clear, area);
 
     let empty = items.is_empty();
@@ -1561,21 +1680,87 @@ fn draw_overlay_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
+fn draw_orchestration_confirm(frame: &mut Frame, app: &mut App) {
     let theme = app.theme;
     let root = frame.area();
     draw_modal_scrim(frame, &theme, root);
     let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
-    let tasks = app.orchestration_plan();
-    let workers = tasks.len();
     let focused = app.orchestration_confirm_focused;
-    let detailed_height = (workers as u16).saturating_mul(3).saturating_add(9);
-    let show_instructions =
-        frame.area().width >= 64 && frame.area().height.saturating_sub(2) >= detailed_height;
+    let (workers, uses_metered_api, uses_codex, uses_openrouter) = {
+        let tasks = app.orchestration_plan();
+        (
+            tasks.len(),
+            app.orchestration_planner()
+                .is_some_and(|model| model.provider.is_metered_api())
+                || tasks
+                    .iter()
+                    .any(|task| task.model.provider.is_metered_api()),
+            app.orchestration_planner()
+                .is_some_and(|model| model.provider == ProviderKind::Codex)
+                || tasks
+                    .iter()
+                    .any(|task| task.model.provider == ProviderKind::Codex),
+            app.orchestration_planner()
+                .is_some_and(|model| model.provider == ProviderKind::OpenRouter)
+                || tasks
+                    .iter()
+                    .any(|task| task.model.provider == ProviderKind::OpenRouter),
+        )
+    };
+    // USED, START, RULE, and SHARE are always present. Each conditional risk
+    // receives its own row so a long mixed-provider sentence cannot hide the
+    // billing or data-boundary disclosure through horizontal truncation.
+    let header_line_count = 4_u16
+        + u16::from(uses_metered_api)
+        + u16::from(uses_codex)
+        + 2 * u16::from(uses_openrouter);
+    let extra_header_lines = header_line_count.saturating_sub(3);
+    let detailed_height = (workers as u16)
+        .saturating_mul(3)
+        .saturating_add(9)
+        .saturating_add(extra_header_lines);
+    let show_instructions = root.width >= 64 && root.height.saturating_sub(2) >= detailed_height;
+    let maximum_modal = modal_area(root, 92, u16::MAX);
+    let maximum_inner = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .inner(maximum_modal);
+    let action_rows =
+        orchestration_confirm_action_lines(false, maximum_inner.width as usize, &theme)
+            .len()
+            .max(
+                orchestration_confirm_action_lines(true, maximum_inner.width as usize, &theme)
+                    .len(),
+            ) as u16;
+    let required_compact_rows = header_line_count
+        .saturating_add(1)
+        .saturating_add(workers as u16)
+        .saturating_add(action_rows);
+    let disclosures_fit_width = compact_orchestration_disclosures_fit_width(
+        app.orchestration_planner(),
+        workers,
+        uses_metered_api,
+        uses_codex,
+        uses_openrouter,
+        show_instructions,
+        maximum_inner.width as usize,
+    );
+    let compact_tasks_fit_width = app.orchestration_plan().iter().all(|task| {
+        let prefix_width = format!("{}  ", task.id).width();
+        orchestration_task_row_required_width(task, prefix_width) <= maximum_inner.width as usize
+    });
+    if maximum_inner.height < required_compact_rows
+        || !disclosures_fit_width
+        || !compact_tasks_fit_width
+    {
+        draw_paged_orchestration_confirm(frame, app, uses_metered_api, uses_codex, uses_openrouter);
+        return;
+    }
+    let tasks = app.orchestration_plan();
     let preferred_height = if show_instructions {
         detailed_height
     } else {
-        (workers as u16 + 8).clamp(8, 16)
+        (workers as u16 + 8 + extra_header_lines).clamp(8, 20)
     };
     let area = modal_area(frame.area(), 92, preferred_height);
     frame.render_widget(Clear, area);
@@ -1599,15 +1784,19 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
+        app.set_orchestration_confirm_layout_ready(false);
         return;
     }
 
     let actions = orchestration_confirm_action_lines(focused, inner.width as usize, &theme);
     let action_height = (actions.len() as u16).min(inner.height);
-    let desired_header_height = 3;
+    // Preserve a heading and at least one exact-model row on very short
+    // terminals; risk rows are priority ordered below for the remaining room.
+    let minimum_task_height = u16::from(!tasks.is_empty()) * 2;
+    let desired_header_height = header_line_count;
     let header_height = inner
         .height
-        .saturating_sub(action_height)
+        .saturating_sub(action_height.saturating_add(minimum_task_height))
         .min(desired_header_height);
     let [header_area, tasks_area, action_area] = Layout::vertical([
         Constraint::Length(header_height),
@@ -1631,36 +1820,70 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
             )
         },
     );
-    let header_lines = vec![
+    let value_width = inner.width.saturating_sub(7) as usize;
+    let header_line = |label: &'static str, value: String, style: Style| {
         Line::from(vec![
-            Span::styled("USED   ", Style::new().fg(theme.dim)),
-            Span::styled(
-                truncate_width(&planner_line, inner.width.saturating_sub(7) as usize),
-                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("START  ", Style::new().fg(theme.dim)),
-            Span::styled(
-                truncate_width(&start_line, inner.width.saturating_sub(7) as usize),
-                Style::new().fg(theme.warning),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("SCOPE  ", Style::new().fg(theme.dim)),
-            Span::styled(
-                truncate_width(
-                    if show_instructions {
-                        "text → listed providers · workers read-only · only lead may edit"
-                    } else {
-                        "text shared · read-only"
-                    },
-                    inner.width.saturating_sub(7) as usize,
-                ),
-                Style::new().fg(theme.accent2),
-            ),
-        ]),
-    ];
+            Span::styled(label, Style::new().fg(theme.dim)),
+            Span::styled(truncate_width(&value, value_width), style),
+        ])
+    };
+    let mut header_lines = vec![header_line(
+        "USED   ",
+        planner_line,
+        Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+    )];
+    if uses_metered_api {
+        header_lines.push(header_line(
+            "BILL   ",
+            "metered API calls may bill".into(),
+            Style::new().fg(theme.warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    header_lines.push(header_line(
+        "RULE   ",
+        "workers are read-only".into(),
+        Style::new().fg(theme.accent2),
+    ));
+    header_lines.push(header_line(
+        "START  ",
+        start_line,
+        Style::new().fg(theme.warning),
+    ));
+    header_lines.push(header_line(
+        "SHARE  ",
+        "text sent to task-listed services".into(),
+        Style::new().fg(theme.accent2),
+    ));
+    if uses_codex {
+        header_lines.push(header_line(
+            "CODEX  ",
+            "global Codex rules excluded".into(),
+            Style::new().fg(theme.accent2),
+        ));
+    }
+    if uses_openrouter {
+        header_lines.push(header_line(
+            "ROUTE  ",
+            "OpenRouter picks endpoints".into(),
+            Style::new().fg(theme.accent2),
+        ));
+        header_lines.push(header_line(
+            "PRIV   ",
+            "privacy settings apply".into(),
+            Style::new().fg(theme.accent2),
+        ));
+    }
+    debug_assert_eq!(header_lines.len(), header_line_count as usize);
+    let all_headers_visible = header_lines.len() <= header_area.height as usize
+        && compact_orchestration_disclosures_fit_width(
+            app.orchestration_planner(),
+            workers,
+            uses_metered_api,
+            uses_codex,
+            uses_openrouter,
+            show_instructions,
+            inner.width as usize,
+        );
     frame.render_widget(
         Paragraph::new(
             header_lines
@@ -1680,25 +1903,29 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
         },
         Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
     )];
+    let mut all_task_details_visible = true;
     for task in tasks {
         let id = format!("{}  ", task.id);
-        let mut model = format!(
-            "{} · {}",
-            task.model.display_id(),
-            task.model.provider.label()
-        );
+        let required_title_width = recognizable_task_title_width(&task.title);
         let model_budget = row_width
-            .saturating_sub(id.width() + 4)
-            .min(if show_instructions { 32 } else { 22 });
-        model = truncate_width(&model, model_budget);
-        let title_budget = row_width
-            .saturating_sub(id.width() + UnicodeWidthStr::width(model.as_str()) + 3)
-            .max(1);
+            .saturating_sub(id.width())
+            .saturating_sub(required_title_width)
+            .saturating_sub(1);
+        let exact_model = exact_model_identity(task);
+        let model = compact_model_identity(
+            task.model.display_id(),
+            task.model.provider.label(),
+            model_budget,
+        );
+        let title_budget =
+            row_width.saturating_sub(id.width() + UnicodeWidthStr::width(model.as_str()) + 1);
         let title = truncate_width(&task.title, title_budget);
+        all_task_details_visible &=
+            model == exact_model && UnicodeWidthStr::width(title.as_str()) >= required_title_width;
         let used = id.width()
             + UnicodeWidthStr::width(title.as_str())
             + UnicodeWidthStr::width(model.as_str());
-        let gap = " ".repeat(row_width.saturating_sub(used).max(1));
+        let gap = " ".repeat(row_width.saturating_sub(used));
         task_lines.push(Line::from(vec![
             Span::styled(
                 id,
@@ -1726,9 +1953,377 @@ fn draw_orchestration_confirm(frame: &mut Frame, app: &App) {
             }
         }
     }
+    let all_tasks_visible = task_lines.len() <= tasks_area.height as usize;
+    let all_actions_visible = actions.len() <= action_area.height as usize;
     task_lines.truncate(tasks_area.height as usize);
     frame.render_widget(Paragraph::new(task_lines), tasks_area);
     frame.render_widget(Paragraph::new(actions), action_area);
+    app.set_orchestration_confirm_layout_ready(
+        all_headers_visible && all_tasks_visible && all_task_details_visible && all_actions_visible,
+    );
+}
+
+fn draw_paged_orchestration_confirm(
+    frame: &mut Frame,
+    app: &mut App,
+    uses_metered_api: bool,
+    uses_codex: bool,
+    uses_openrouter: bool,
+) {
+    let theme = app.theme;
+    let area = frame.area();
+    let width = area.width as usize;
+    let workers = app.orchestration_plan().len();
+    let warning = semantic_foreground(theme.warning, theme.surface, theme.fg);
+    let success = semantic_foreground(theme.success, theme.surface, theme.fg);
+    let error = semantic_foreground(theme.error, theme.surface, theme.fg);
+    app.set_orchestration_confirm_layout_ready(false);
+
+    frame.render_widget(Clear, area);
+    if let Some(surface) = theme.surface {
+        frame.render_widget(
+            Block::default().style(Style::new().bg(surface).fg(theme.fg)),
+            area,
+        );
+    }
+
+    if !app.orchestration_confirm_focused {
+        let [top_pad, title_area, risk_area, action_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .areas(area);
+        let _ = top_pad;
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  Team plan · review 1/2",
+                Style::new().fg(warning).add_modifier(Modifier::BOLD),
+            )),
+            title_area,
+        );
+
+        let mut risks = paged_orchestration_disclosure_lines(
+            workers,
+            uses_metered_api,
+            uses_codex,
+            uses_openrouter,
+            &theme,
+            warning,
+        );
+        let disclosures_fit = risks.len() <= risk_area.height as usize
+            && risks
+                .iter()
+                .all(|line| line.width() <= risk_area.width as usize);
+        risks.truncate(risk_area.height as usize);
+        frame.render_widget(Paragraph::new(risks), risk_area);
+        frame.render_widget(
+            Paragraph::new(if disclosures_fit {
+                vec![
+                    Line::from(vec![
+                        Span::styled("› ", Style::new().fg(theme.accent)),
+                        key_span("Tab", theme.accent),
+                        Span::styled(" review tasks", Style::new().fg(theme.fg)),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  "),
+                        key_span("n / Esc", error),
+                        Span::styled(" cancel", Style::new().fg(theme.fg)),
+                    ]),
+                ]
+            } else {
+                vec![
+                    Line::styled("› resize to review disclosures", Style::new().fg(warning)),
+                    Line::from(vec![
+                        Span::raw("  "),
+                        key_span("n / Esc", error),
+                        Span::styled(" cancel", Style::new().fg(theme.fg)),
+                    ]),
+                ]
+            }),
+            action_area,
+        );
+        return;
+    }
+
+    let [top_pad, title_area, tasks_area, gap_area, action_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    let _ = (top_pad, gap_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "  Team plan · tasks 2/2",
+            Style::new().fg(warning).add_modifier(Modifier::BOLD),
+        )),
+        title_area,
+    );
+
+    let disclosure_lines = paged_orchestration_disclosure_lines(
+        workers,
+        uses_metered_api,
+        uses_codex,
+        uses_openrouter,
+        &theme,
+        warning,
+    );
+    let disclosures_fit = disclosure_lines.len() <= area.height.saturating_sub(4) as usize
+        && disclosure_lines
+            .iter()
+            .all(|line| line.width() <= area.width as usize);
+    let tasks = app.orchestration_plan();
+    let mut task_lines = Vec::new();
+    let mut all_task_details_visible = true;
+    let required_task_rows;
+    if tasks.len() <= 2 {
+        required_task_rows = tasks.len().saturating_mul(3);
+        for task in tasks {
+            let title_prefix = format!("  {} ", task.id);
+            all_task_details_visible &= title_prefix
+                .width()
+                .saturating_add(recognizable_task_title_width(&task.title))
+                <= width;
+            task_lines.push(Line::styled(
+                truncate_width(&format!("{title_prefix}{}", task.title), width),
+                Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ));
+            let exact_model = exact_model_identity(task);
+            all_task_details_visible &= exact_model.width() <= width.saturating_sub(4);
+            task_lines.push(Line::styled(
+                format!(
+                    "    {}",
+                    truncate_width(&exact_model, width.saturating_sub(4))
+                ),
+                Style::new().fg(theme.dim),
+            ));
+            let instruction = instruction_preview(&task.instructions, width.saturating_sub(4), 1)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            task_lines.push(Line::styled(
+                format!("    {instruction}"),
+                Style::new().fg(theme.dim),
+            ));
+        }
+    } else {
+        required_task_rows = tasks.len();
+        for task in tasks {
+            let (line, task_details_visible) = compact_task_and_model_line(task, width, &theme);
+            all_task_details_visible &= task_details_visible;
+            task_lines.push(line);
+        }
+        if task_lines.len() < tasks_area.height as usize {
+            task_lines.push(Line::styled(
+                "  resize to review task instructions",
+                Style::new().fg(theme.dim),
+            ));
+        }
+    }
+    let all_tasks_visible = required_task_rows <= tasks_area.height as usize;
+    task_lines.truncate(tasks_area.height as usize);
+    frame.render_widget(Paragraph::new(task_lines), tasks_area);
+    let can_start =
+        disclosures_fit && all_tasks_visible && all_task_details_visible && action_area.height >= 3;
+    frame.render_widget(
+        Paragraph::new(if can_start {
+            vec![
+                Line::from(vec![
+                    Span::styled("› ", Style::new().fg(success)),
+                    key_span("y / Enter", success),
+                    Span::styled(" start", Style::new().fg(theme.fg)),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    key_span("Tab", theme.accent),
+                    Span::styled(" back", Style::new().fg(theme.fg)),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    key_span("n / Esc", error),
+                    Span::styled(" cancel", Style::new().fg(theme.fg)),
+                ]),
+            ]
+        } else {
+            vec![
+                Line::styled("› resize to review full plan", Style::new().fg(warning)),
+                Line::from(vec![
+                    Span::raw("  "),
+                    key_span("Tab", theme.accent),
+                    Span::styled(" back", Style::new().fg(theme.fg)),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    key_span("n / Esc", error),
+                    Span::styled(" cancel", Style::new().fg(theme.fg)),
+                ]),
+            ]
+        }),
+        action_area,
+    );
+    app.set_orchestration_confirm_layout_ready(can_start);
+}
+
+fn paged_orchestration_disclosure_lines(
+    workers: usize,
+    uses_metered_api: bool,
+    uses_codex: bool,
+    uses_openrouter: bool,
+    theme: &Theme,
+    warning: Color,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled(
+        "  USED  1 planner call already ran",
+        Style::new().fg(theme.fg),
+    )];
+    if uses_metered_api {
+        lines.push(Line::styled(
+            "  BILL  metered API calls may bill",
+            Style::new().fg(warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::styled(
+        "  RULE  workers are read-only",
+        Style::new().fg(theme.accent2),
+    ));
+    lines.push(Line::styled(
+        format!("  START ≥{workers} worker calls → synthesis"),
+        Style::new().fg(warning),
+    ));
+    lines.push(Line::styled(
+        "  SHARE text sent to listed services",
+        Style::new().fg(theme.accent2),
+    ));
+    if uses_codex {
+        lines.push(Line::styled(
+            "  CODEX global rules excluded",
+            Style::new().fg(theme.accent2),
+        ));
+    }
+    if uses_openrouter {
+        lines.push(Line::styled(
+            "  ROUTE OpenRouter picks endpoints",
+            Style::new().fg(theme.accent2),
+        ));
+        lines.push(Line::styled(
+            "  PRIV  privacy settings apply",
+            Style::new().fg(theme.accent2),
+        ));
+    }
+    lines
+}
+
+fn compact_orchestration_disclosures_fit_width(
+    planner: Option<&providers::ModelEntry>,
+    workers: usize,
+    uses_metered_api: bool,
+    uses_codex: bool,
+    uses_openrouter: bool,
+    show_instructions: bool,
+    width: usize,
+) -> bool {
+    let value_width = width.saturating_sub(7);
+    let planner_line = planner.map_or_else(
+        || "1 planner call already ran".to_owned(),
+        |model| {
+            format!(
+                "1 planner call already ran · {} · {}",
+                model.display_id(),
+                model.provider.label()
+            )
+        },
+    );
+    let start_line = if show_instructions {
+        format!("at least {workers} worker calls → 1 synthesis call")
+    } else {
+        format!("≥{workers} worker calls → synthesis")
+    };
+    let mut values = vec![
+        planner_line,
+        "workers are read-only".to_owned(),
+        start_line,
+        "text sent to task-listed services".to_owned(),
+    ];
+    if uses_metered_api {
+        values.push("metered API calls may bill".to_owned());
+    }
+    if uses_codex {
+        values.push("global Codex rules excluded".to_owned());
+    }
+    if uses_openrouter {
+        values.push("OpenRouter picks endpoints".to_owned());
+        values.push("privacy settings apply".to_owned());
+    }
+    width >= 7 && values.iter().all(|value| value.width() <= value_width)
+}
+
+fn exact_model_identity(task: &crate::orchestration::PlannedTask) -> String {
+    format!(
+        "{} · {}",
+        task.model.display_id(),
+        task.model.provider.label()
+    )
+}
+
+fn recognizable_task_title_width(title: &str) -> usize {
+    title.width().clamp(1, MIN_CONFIRM_TASK_TITLE_WIDTH)
+}
+
+fn orchestration_task_row_required_width(
+    task: &crate::orchestration::PlannedTask,
+    prefix_width: usize,
+) -> usize {
+    prefix_width
+        .saturating_add(recognizable_task_title_width(&task.title))
+        .saturating_add(1)
+        .saturating_add(exact_model_identity(task).width())
+}
+
+fn compact_task_and_model_line(
+    task: &crate::orchestration::PlannedTask,
+    width: usize,
+    theme: &Theme,
+) -> (Line<'static>, bool) {
+    let prefix = format!("  {} ", task.id);
+    let prefix_width = prefix.width();
+    let available = width.saturating_sub(prefix_width);
+    let required_title_width = recognizable_task_title_width(&task.title);
+    let exact_model = exact_model_identity(task);
+    let details_visible = orchestration_task_row_required_width(task, prefix_width) <= width;
+    let model_budget = available
+        .saturating_sub(required_title_width)
+        .saturating_sub(1);
+    let model = compact_model_identity(
+        task.model.display_id(),
+        task.model.provider.label(),
+        model_budget,
+    );
+    let title_budget = available.saturating_sub(model.width()).saturating_sub(1);
+    let title = truncate_width(&task.title, title_budget);
+    let rendered_details_visible = details_visible
+        && exact_model.width() <= model_budget
+        && title.width() >= required_title_width;
+    let gap = " ".repeat(
+        available
+            .saturating_sub(title.width())
+            .saturating_sub(model.width()),
+    );
+    (
+        Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(title, Style::new().fg(theme.fg)),
+            Span::raw(gap),
+            Span::styled(model, Style::new().fg(theme.dim)),
+        ]),
+        rendered_details_visible,
+    )
 }
 
 fn instruction_preview(text: &str, width: usize, max_lines: usize) -> Vec<String> {
@@ -2339,6 +2934,8 @@ mod tests {
             anthropic_api_key: None,
             openai_api_key: None,
             openai_base_url: "http://127.0.0.1:9".into(),
+            openrouter_api_key: None,
+            openrouter_base_url: "http://127.0.0.1:9".into(),
             ollama_host: "http://127.0.0.1:9".into(),
             default_model: None,
             compact_threshold_chars: 80_000,
@@ -2907,8 +3504,8 @@ mod tests {
         );
         assert!(rendered.contains("2 worker calls"), "{rendered}");
         assert!(rendered.contains("1 synthesis call"), "{rendered}");
-        assert!(rendered.contains("listed providers"), "{rendered}");
-        assert!(rendered.contains("workers read-only"), "{rendered}");
+        assert!(rendered.contains("task-listed services"), "{rendered}");
+        assert!(rendered.contains("workers are read-only"), "{rendered}");
         assert!(
             rendered.contains("TASK SUMMARIES · EXACT MODELS"),
             "{rendered}"
@@ -2924,17 +3521,96 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("team plan ready"), "{rendered}");
+        assert!(rendered.contains("Team plan · review 1/2"), "{rendered}");
         assert!(
             rendered.contains("1 planner call already ran"),
             "{rendered}"
         );
         assert!(rendered.contains("2 worker calls"), "{rendered}");
         assert!(rendered.contains("synthesis"), "{rendered}");
-        assert!(rendered.contains("text shared · read-only"), "{rendered}");
-        assert!(rendered.contains("TASKS · EXACT MODELS"), "{rendered}");
+        assert!(rendered.contains("workers are read-only"), "{rendered}");
+        assert!(
+            rendered.contains("text sent to listed services"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Tab review tasks"), "{rendered}");
+        assert!(!rendered.contains("team-test · ollama"), "{rendered}");
+        assert!(rendered.contains("n / Esc"), "{rendered}");
+
+        app.toggle_orchestration_confirm_focus();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("Team plan · tasks 2/2"), "{rendered}");
         assert!(rendered.contains("team-test · ollama"), "{rendered}");
         assert!(rendered.contains("Tab"), "{rendered}");
+        assert!(rendered.contains("y / Enter start"), "{rendered}");
         assert!(rendered.contains("n / Esc"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn mixed_team_confirmation_keeps_cost_and_routing_boundaries_visible() {
+        let _data_dir_guard = session::TEST_DATA_DIR_ENV_LOCK.lock().await;
+        let mut app = test_app();
+        app.textarea.insert_str("/team 2");
+        app.submit_input();
+        app.textarea
+            .insert_str("coordinate this mixed-provider change");
+        app.submit_input();
+        let run_id = app.orchestration_run_id().expect("orchestration run");
+        app.on_event(AppEvent::OrchestrationPlanned {
+            run_id,
+            result: Ok(vec![
+                PlannedTask {
+                    id: 1,
+                    title: "inspect with Codex".into(),
+                    instructions: "read the relevant code".into(),
+                    model: ModelEntry {
+                        provider: ProviderKind::Codex,
+                        id: "codex:gpt-5.6-sol".into(),
+                    },
+                },
+                PlannedTask {
+                    id: 2,
+                    title: "review independently".into(),
+                    instructions: "check the provider boundary".into(),
+                    model: ModelEntry {
+                        provider: ProviderKind::OpenRouter,
+                        id: "openai/gpt-5.4".into(),
+                    },
+                },
+            ]),
+        });
+
+        for width in [40, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let rendered = screen(&terminal);
+            assert!(
+                rendered.contains("metered API calls may bill"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("workers are read-only"), "{rendered}");
+            assert!(
+                rendered.contains("global Codex rules excluded")
+                    || rendered.contains("CODEX global rules excluded"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("OpenRouter picks endpoints"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("privacy settings apply"), "{rendered}");
+
+            app.toggle_orchestration_confirm_focus();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let rendered = screen(&terminal);
+            assert!(rendered.contains("gpt-5.6-sol · codex"), "{rendered}");
+            assert!(
+                rendered.contains("openai/gpt-5.4 · openrouter"),
+                "{rendered}"
+            );
+            assert!(app.orchestration_confirm_can_start(), "{rendered}");
+            app.toggle_orchestration_confirm_focus();
+        }
     }
 }

@@ -19,11 +19,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let want = std::env::args().nth(1);
-    let Some(model) = models
-        .iter()
-        .find(|m| want.as_deref().is_none_or(|w| m.id == w))
-        .cloned()
-    else {
+    let selected = want
+        .as_deref()
+        .and_then(|selector| providers::custom_qualified_model(selector, &models))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| want.as_deref().is_none_or(|wanted| model.id == wanted))
+                .cloned()
+        });
+    let Some(model) = selected else {
         println!("no matching model; done.");
         return Ok(());
     };
